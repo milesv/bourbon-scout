@@ -3,4 +3,6 @@ node_modules/
 state.json
 stores.json
 debug/
+coverage/
+preview-embeds.html
 .claude/

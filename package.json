@@ -6,7 +6,9 @@
   "main": "scraper.js",
   "scripts": {
     "start": "node scraper.js",
-    "dev": "node --watch scraper.js"
+    "dev": "node --watch scraper.js",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "cheerio": "^1.0.0",
@@ -16,5 +18,9 @@
     "playwright": "^1.58.2",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.0.18",
+    "vitest": "^4.0.18"
   }
 }

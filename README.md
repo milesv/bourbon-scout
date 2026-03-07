@@ -1,6 +1,6 @@
 # Bourbon Scout
 
-Automated inventory tracker for allocated and rare bourbon. Monitors 5 major retailers near your zip code and sends real-time Discord alerts when bottles are spotted.
+Automated inventory tracker for allocated and rare bourbon. Monitors 5 major retailers near your zip code and sends real-time Discord alerts with SKU/item numbers, store details, and stock status changes when bottles are spotted or go out of stock.
 
 ## Tracked Bottles (25)
 
@@ -20,7 +20,8 @@ Blanton's (Gold, Straight from the Barrel, Special Reserve, Red), Weller (Specia
 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
 2. **Inventory Scanning** — Scans all stores concurrently (limit 4) using 11 broad search queries that cover all 25 bottles. Prefers structured JSON extraction over CSS selectors for reliability.
-3. **Discord Alerts** — When bottles are found, sends an `@everyone` urgent alert with product URLs, prices, and fulfillment info. A quiet summary posts after every scan. Store addresses link to Google Maps.
+3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
+4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@everyone` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 
 ## Setup
 
@@ -47,6 +48,7 @@ ZIP_CODE=85283
 SEARCH_RADIUS_MILES=15
 MAX_STORES_PER_RETAILER=5
 POLL_INTERVAL=*/15 * * * *
+REALERT_EVERY_N_SCANS=4
 KROGER_CLIENT_ID=
 KROGER_CLIENT_SECRET=
 SAFEWAY_API_KEY=
@@ -59,6 +61,7 @@ SAFEWAY_API_KEY=
 | `SEARCH_RADIUS_MILES` | No | Search radius in miles (default: 15) |
 | `MAX_STORES_PER_RETAILER` | No | Max stores per retailer chain (default: 5) |
 | `POLL_INTERVAL` | No | Cron expression for poll frequency (default: every 15 min) |
+| `REALERT_EVERY_N_SCANS` | No | Re-alert interval for bottles still in stock (default: 4, meaning every ~1hr at 15-min polls) |
 | `KROGER_CLIENT_ID` | No | Kroger API client ID (get from [developer.kroger.com](https://developer.kroger.com)) |
 | `KROGER_CLIENT_SECRET` | No | Kroger API client secret |
 | `SAFEWAY_API_KEY` | No | Safeway product search API key |
@@ -85,21 +88,36 @@ Manual trigger: `gh workflow run "Bourbon Scout"`
 
 ## Discord Alerts
 
-**When bottles are found:**
-- `@everyone` ping with urgent embed
-- Clickable product URLs and prices
-- Fulfillment info (e.g., "Pickup today")
-- Store name, distance, and Google Maps link
+Four types of color-coded embeds with per-retailer SKU/item numbers and rich store info:
 
-**After every scan:**
-- Quiet summary embed with store count, retailer count, and scan duration
+**🟢 New Find** (green, `@everyone` ping)
+- Triggered when a bottle is spotted for the first time at a store
+- Shows product name with link, price, SKU/item number, bottle size, and fulfillment
+- Lists any bottles still in stock from previous scans
+
+**🟠 Stock Lost** (orange, quiet)
+- Triggered when a previously in-stock bottle is no longer found
+- Shows which bottles went OOS, their last known price, and how long they were in stock
+
+**🔵 Still Available** (blue, quiet)
+- Re-alert for bottles that remain in stock across multiple scans
+- Sent every N scans (configurable via `REALERT_EVERY_N_SCANS`, default 4)
+
+**🟣 Scan Summary** (purple, quiet)
+- Posted after every scan with counts: new finds, still in stock, went OOS, nothing found
+- Shows total stores, retailers, and scan duration
+
+Each embed includes:
+- Store name, number, city/state, and distance
+- Google Maps link to store address
+- Retailer-specific SKU labels (Item # for Costco/Total Wine/Walmart, SKU for Kroger, UPC for Safeway)
 
 ## Generated Files
 
 | File | Purpose | Safe to Delete? |
 |------|---------|-----------------|
 | `stores.json` | Cached store discovery results | Yes — triggers re-discovery on next startup |
-| `state.json` | Last known stock state per store | Yes — sends full report for all stores on next poll |
+| `state.json` | Per-store stock state with timestamps and scan counts | Yes — treats all bottles as new finds on next poll |
 | `debug/` | Screenshots and HTML from store locator pages | Yes — regenerate with `node debug-locators.js` |
 
 ## Debugging Store Locators

@@ -55,6 +55,7 @@ jobs:
           SEARCH_RADIUS_MILES: "15"
           MAX_STORES_PER_RETAILER: "5"
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REALERT_EVERY_N_SCANS: "4"
           KROGER_CLIENT_ID: ${{ secrets.KROGER_CLIENT_ID }}
           KROGER_CLIENT_SECRET: ${{ secrets.KROGER_CLIENT_SECRET }}
           SAFEWAY_API_KEY: ${{ secrets.SAFEWAY_API_KEY }}
