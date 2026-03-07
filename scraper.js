@@ -273,72 +273,55 @@ async function scrapeCostcoOnce(page) {
   return dedupFound(found);
 }
 
-// Try fetching Total Wine search HTML directly (no browser needed).
-// Returns { name, url, price }[] on success, null if blocked.
-async function scrapeTotalWineViaFetch(store) {
+// Total Wine uses PerimeterX — no fetch path possible. Browser required.
+// Product data is in window.INITIAL_STATE.search.results.products (structured JSON).
+// This is far more reliable than CSS selectors (won't break when class names change).
+async function scrapeTotalWineStore(store, page) {
   const found = [];
+  // Use storeId URL param (more reliable than cookie)
   for (const query of SEARCH_QUERIES) {
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
-    try {
-      const res = await fetch(url, { headers: FETCH_HEADERS, timeout: 15000 });
-      if (!res.ok) return null;
-      const html = await res.text();
-      // Look for product JSON in SSR data
-      const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-      if (!match) return null;
-      const nextData = JSON.parse(match[1]);
-      const products = nextData?.props?.pageProps?.pageData?.productResults?.products || [];
-      for (const p of products) {
-        const title = p.name || p.title || "";
-        const inStock = p.addToCartEnabled || p.inStock;
-        if (inStock) {
-          for (const bottle of TARGET_BOTTLES) {
-            if (matchesBottle(title, bottle)) {
-              found.push({
-                name: bottle.name,
-                url: p.url ? `https://www.totalwine.com${p.url}` : "",
-                price: p.price || p.displayPrice || "",
-              });
-            }
-          }
-        }
-      }
-    } catch {
-      return null;
-    }
-    await sleep(500);
-  }
-  return dedupFound(found);
-}
-
-// Browser-based Total Wine scraper (fallback). Accepts a shared page.
-async function scrapeTotalWineViaBrowser(store, page) {
-  const found = [];
-  await page.context().addCookies([
-    { name: "TWM_STORE_ID", value: store.storeId, domain: ".totalwine.com", path: "/" },
-  ]);
-
-  for (const query of SEARCH_QUERIES) {
-    const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(2000);
 
-      const products = await page.$$eval(
+      // Extract structured product data from INITIAL_STATE (SSR React state)
+      const products = await page.evaluate(() => {
+        try {
+          const state = window.INITIAL_STATE;
+          if (!state?.search?.results?.products) return [];
+          return state.search.results.products.map((p) => ({
+            name: p.name || "",
+            url: p.productUrl || "",
+            price: p.price?.[0]?.price ? `$${p.price[0].price}` : "",
+            inStock: (p.stockLevel?.[0]?.stock > 0) ||
+                     p.transactional === true ||
+                     p.shoppingOptions?.some((o) => o.eligible),
+          }));
+        } catch { return []; }
+      });
+
+      // Fallback: if INITIAL_STATE isn't available, try CSS selectors
+      const items = products.length > 0 ? products : await page.$$eval(
         '[class*="productCard"], [data-testid="product-card"], .product-card',
         (cards) =>
           cards.map((el) => ({
-            title: (el.querySelector('[class*="title"], [class*="name"], h2, a') || {}).textContent || "",
-            hasAddToCart: !!el.querySelector('button[class*="addToCart"], button[class*="Add"], [data-testid*="add"]'),
+            name: (el.querySelector('[class*="title"], [class*="name"], h2, a') || {}).textContent || "",
+            inStock: !!el.querySelector('button[class*="addToCart"], button[class*="Add"], [data-testid*="add"]'),
             url: (el.querySelector('a[href*="/spirits/"], a[href*="/wine/"], a') || {}).href || "",
             price: (el.querySelector('[class*="price"], [data-testid*="price"]') || {}).textContent?.trim() || "",
           }))
       );
 
-      for (const p of products) {
+      for (const p of items) {
+        if (!p.inStock) continue;
         for (const bottle of TARGET_BOTTLES) {
-          if (matchesBottle(p.title, bottle) && p.hasAddToCart) {
-            found.push({ name: bottle.name, url: p.url, price: p.price });
+          if (matchesBottle(p.name, bottle)) {
+            found.push({
+              name: bottle.name,
+              url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.totalwine.com${p.url}`) : "",
+              price: p.price,
+            });
           }
         }
       }
@@ -348,16 +331,6 @@ async function scrapeTotalWineViaBrowser(store, page) {
     await sleep(1500);
   }
   return dedupFound(found);
-}
-
-async function scrapeTotalWineStore(store, page) {
-  const fetchResult = await scrapeTotalWineViaFetch(store);
-  if (fetchResult !== null) {
-    console.log(`[totalwine:${store.storeId}] Used fast fetch mode`);
-    return fetchResult;
-  }
-  console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser`);
-  return scrapeTotalWineViaBrowser(store, page);
 }
 
 // ─── Walmart: fetch-first with browser fallback ─────────────────────────────
