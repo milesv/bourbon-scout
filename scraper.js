@@ -236,87 +236,128 @@ async function newPage() {
 // ─── Retailer Scrapers ───────────────────────────────────────────────────────
 // Each scraper accepts a store object and returns an array of { name, url, price }.
 
-async function scrapeCostcoStore(store) {
+// Costco search has no store filter — results are identical across warehouses.
+// Scrape once and the poll loop copies results to all stores.
+async function scrapeCostcoOnce(page) {
   const found = [];
-  const page = await newPage();
-  try {
-    for (const query of SEARCH_QUERIES) {
-      const url = `https://www.costco.com/CatalogSearch?dept=All&keyword=${encodeURIComponent(query)}`;
-      try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForTimeout(2000);
+  for (const query of SEARCH_QUERIES) {
+    const url = `https://www.costco.com/CatalogSearch?dept=All&keyword=${encodeURIComponent(query)}`;
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(2000);
 
-        const products = await page.$$eval(
-          ".product-tile, [automation-id='productList'] .product",
-          (tiles) =>
-            tiles
-              .filter((el) => !el.querySelector(".out-of-stock, .oos-overlay"))
-              .map((el) => ({
-                title: (el.querySelector(".description, .product-title, a[automation-id]") || {}).textContent || "",
-                url: (el.querySelector("a.product-tile-link, a[automation-id], .description a, a") || {}).href || "",
-                price: (el.querySelector(".price, [class*='price'], [automation-id*='price']") || {}).textContent?.trim() || "",
-              }))
-        );
+      const products = await page.$$eval(
+        ".product-tile, [automation-id='productList'] .product",
+        (tiles) =>
+          tiles
+            .filter((el) => !el.querySelector(".out-of-stock, .oos-overlay"))
+            .map((el) => ({
+              title: (el.querySelector(".description, .product-title, a[automation-id]") || {}).textContent || "",
+              url: (el.querySelector("a.product-tile-link, a[automation-id], .description a, a") || {}).href || "",
+              price: (el.querySelector(".price, [class*='price'], [automation-id*='price']") || {}).textContent?.trim() || "",
+            }))
+      );
 
-        for (const p of products) {
-          for (const bottle of TARGET_BOTTLES) {
-            if (matchesBottle(p.title, bottle)) {
-              found.push({ name: bottle.name, url: p.url, price: p.price });
-            }
+      for (const p of products) {
+        for (const bottle of TARGET_BOTTLES) {
+          if (matchesBottle(p.title, bottle)) {
+            found.push({ name: bottle.name, url: p.url, price: p.price });
           }
         }
-      } catch (err) {
-        console.error(`[costco:${store.storeId}] Error searching "${query}": ${err.message}`);
       }
-      await sleep(1500);
+    } catch (err) {
+      console.error(`[costco] Error searching "${query}": ${err.message}`);
     }
-  } finally {
-    await page.context().close();
+    await sleep(1500);
   }
   return dedupFound(found);
 }
 
-async function scrapeTotalWineStore(store) {
+// Try fetching Total Wine search HTML directly (no browser needed).
+// Returns { name, url, price }[] on success, null if blocked.
+async function scrapeTotalWineViaFetch(store) {
   const found = [];
-  const page = await newPage();
-  try {
-    await page.context().addCookies([
-      { name: "TWM_STORE_ID", value: store.storeId, domain: ".totalwine.com", path: "/" },
-    ]);
-
-    for (const query of SEARCH_QUERIES) {
-      const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}`;
-      try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForTimeout(2000);
-
-        const products = await page.$$eval(
-          '[class*="productCard"], [data-testid="product-card"], .product-card',
-          (cards) =>
-            cards.map((el) => ({
-              title: (el.querySelector('[class*="title"], [class*="name"], h2, a') || {}).textContent || "",
-              hasAddToCart: !!el.querySelector('button[class*="addToCart"], button[class*="Add"], [data-testid*="add"]'),
-              url: (el.querySelector('a[href*="/spirits/"], a[href*="/wine/"], a') || {}).href || "",
-              price: (el.querySelector('[class*="price"], [data-testid*="price"]') || {}).textContent?.trim() || "",
-            }))
-        );
-
-        for (const p of products) {
+  for (const query of SEARCH_QUERIES) {
+    const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
+    try {
+      const res = await fetch(url, { headers: FETCH_HEADERS, timeout: 15000 });
+      if (!res.ok) return null;
+      const html = await res.text();
+      // Look for product JSON in SSR data
+      const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+      if (!match) return null;
+      const nextData = JSON.parse(match[1]);
+      const products = nextData?.props?.pageProps?.pageData?.productResults?.products || [];
+      for (const p of products) {
+        const title = p.name || p.title || "";
+        const inStock = p.addToCartEnabled || p.inStock;
+        if (inStock) {
           for (const bottle of TARGET_BOTTLES) {
-            if (matchesBottle(p.title, bottle) && p.hasAddToCart) {
-              found.push({ name: bottle.name, url: p.url, price: p.price });
+            if (matchesBottle(title, bottle)) {
+              found.push({
+                name: bottle.name,
+                url: p.url ? `https://www.totalwine.com${p.url}` : "",
+                price: p.price || p.displayPrice || "",
+              });
             }
           }
         }
-      } catch (err) {
-        console.error(`[totalwine:${store.storeId}] Error searching "${query}": ${err.message}`);
       }
-      await sleep(1500);
+    } catch {
+      return null;
     }
-  } finally {
-    await page.context().close();
+    await sleep(500);
   }
   return dedupFound(found);
+}
+
+// Browser-based Total Wine scraper (fallback). Accepts a shared page.
+async function scrapeTotalWineViaBrowser(store, page) {
+  const found = [];
+  await page.context().addCookies([
+    { name: "TWM_STORE_ID", value: store.storeId, domain: ".totalwine.com", path: "/" },
+  ]);
+
+  for (const query of SEARCH_QUERIES) {
+    const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}`;
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(2000);
+
+      const products = await page.$$eval(
+        '[class*="productCard"], [data-testid="product-card"], .product-card',
+        (cards) =>
+          cards.map((el) => ({
+            title: (el.querySelector('[class*="title"], [class*="name"], h2, a') || {}).textContent || "",
+            hasAddToCart: !!el.querySelector('button[class*="addToCart"], button[class*="Add"], [data-testid*="add"]'),
+            url: (el.querySelector('a[href*="/spirits/"], a[href*="/wine/"], a') || {}).href || "",
+            price: (el.querySelector('[class*="price"], [data-testid*="price"]') || {}).textContent?.trim() || "",
+          }))
+      );
+
+      for (const p of products) {
+        for (const bottle of TARGET_BOTTLES) {
+          if (matchesBottle(p.title, bottle) && p.hasAddToCart) {
+            found.push({ name: bottle.name, url: p.url, price: p.price });
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[totalwine:${store.storeId}] Error searching "${query}": ${err.message}`);
+    }
+    await sleep(1500);
+  }
+  return dedupFound(found);
+}
+
+async function scrapeTotalWineStore(store, page) {
+  const fetchResult = await scrapeTotalWineViaFetch(store);
+  if (fetchResult !== null) {
+    console.log(`[totalwine:${store.storeId}] Used fast fetch mode`);
+    return fetchResult;
+  }
+  console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser`);
+  return scrapeTotalWineViaBrowser(store, page);
 }
 
 // ─── Walmart: fetch-first with browser fallback ─────────────────────────────
@@ -358,68 +399,63 @@ async function scrapeWalmartViaFetch(store) {
   return dedupFound(found);
 }
 
-// Browser-based Walmart scraper (fallback when fetch is blocked)
-async function scrapeWalmartViaBrowser(store) {
+// Browser-based Walmart scraper (fallback). Accepts a shared page.
+async function scrapeWalmartViaBrowser(store, page) {
   const found = [];
-  const page = await newPage();
-  try {
-    for (const query of SEARCH_QUERIES) {
-      const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&cat_id=976759&store_id=${store.storeId}`;
-      try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForTimeout(2000);
+  for (const query of SEARCH_QUERIES) {
+    const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&cat_id=976759&store_id=${store.storeId}`;
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(2000);
 
-        const nextData = await page.evaluate(() => {
-          const el = document.querySelector("script#__NEXT_DATA__");
-          if (el) try { return JSON.parse(el.textContent); } catch {}
-          return null;
-        });
+      const nextData = await page.evaluate(() => {
+        const el = document.querySelector("script#__NEXT_DATA__");
+        if (el) try { return JSON.parse(el.textContent); } catch {}
+        return null;
+      });
 
-        if (nextData) {
-          const items =
-            nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks?.[0]?.items || [];
-          for (const item of items) {
-            const available =
-              item.availabilityStatusV2?.value === "IN_STOCK" || item.canAddToCart === true;
-            if (available && item.name) {
-              for (const bottle of TARGET_BOTTLES) {
-                if (matchesBottle(item.name, bottle)) {
-                  found.push({
-                    name: bottle.name,
-                    url: item.canonicalUrl ? `https://www.walmart.com${item.canonicalUrl}` : "",
-                    price: item.priceInfo?.currentPrice?.priceString || "",
-                  });
-                }
-              }
-            }
-          }
-        } else {
-          const products = await page.$$eval(
-            '[data-testid="list-view"] [data-item-id], .search-result-gridview-item',
-            (items) =>
-              items
-                .filter((el) => !el.querySelector('[data-testid="out-of-stock"], .out-of-stock'))
-                .map((el) => ({
-                  title: (el.querySelector('[data-automation-id="product-title"], .product-title-link span') || {}).textContent || "",
-                  url: (el.querySelector('a[href*="/ip/"]') || {}).href || "",
-                  price: (el.querySelector('[data-automation-id="product-price"], [class*="price"]') || {}).textContent?.trim() || "",
-                }))
-          );
-          for (const p of products) {
+      if (nextData) {
+        const items =
+          nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks?.[0]?.items || [];
+        for (const item of items) {
+          const available =
+            item.availabilityStatusV2?.value === "IN_STOCK" || item.canAddToCart === true;
+          if (available && item.name) {
             for (const bottle of TARGET_BOTTLES) {
-              if (matchesBottle(p.title, bottle)) {
-                found.push({ name: bottle.name, url: p.url, price: p.price });
+              if (matchesBottle(item.name, bottle)) {
+                found.push({
+                  name: bottle.name,
+                  url: item.canonicalUrl ? `https://www.walmart.com${item.canonicalUrl}` : "",
+                  price: item.priceInfo?.currentPrice?.priceString || "",
+                });
               }
             }
           }
         }
-      } catch (err) {
-        console.error(`[walmart:${store.storeId}] Error searching "${query}": ${err.message}`);
+      } else {
+        const products = await page.$$eval(
+          '[data-testid="list-view"] [data-item-id], .search-result-gridview-item',
+          (items) =>
+            items
+              .filter((el) => !el.querySelector('[data-testid="out-of-stock"], .out-of-stock'))
+              .map((el) => ({
+                title: (el.querySelector('[data-automation-id="product-title"], .product-title-link span') || {}).textContent || "",
+                url: (el.querySelector('a[href*="/ip/"]') || {}).href || "",
+                price: (el.querySelector('[data-automation-id="product-price"], [class*="price"]') || {}).textContent?.trim() || "",
+              }))
+        );
+        for (const p of products) {
+          for (const bottle of TARGET_BOTTLES) {
+            if (matchesBottle(p.title, bottle)) {
+              found.push({ name: bottle.name, url: p.url, price: p.price });
+            }
+          }
+        }
       }
-      await sleep(1500);
+    } catch (err) {
+      console.error(`[walmart:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
-  } finally {
-    await page.context().close();
+    await sleep(1500);
   }
   return dedupFound(found);
 }
@@ -431,10 +467,31 @@ async function scrapeWalmartStore(store) {
     return fetchResult;
   }
   console.log(`[walmart:${store.storeId}] Fetch blocked, using browser`);
-  return scrapeWalmartViaBrowser(store);
+  const page = await newPage();
+  try {
+    return await scrapeWalmartViaBrowser(store, page);
+  } finally {
+    await page.context().close();
+  }
 }
 
 // ─── API-based scrapers ─────────────────────────────────────────────────────
+
+// Fetch Kroger OAuth token once, shared across all store scrapers
+let krogerToken = null;
+async function getKrogerToken() {
+  if (krogerToken) return krogerToken;
+  if (!KROGER_CLIENT_ID || !KROGER_CLIENT_SECRET) return null;
+  const authHeader = Buffer.from(`${KROGER_CLIENT_ID}:${KROGER_CLIENT_SECRET}`).toString("base64");
+  const res = await fetch("https://api.kroger.com/v1/connect/oauth2/token", {
+    method: "POST",
+    headers: { Authorization: `Basic ${authHeader}`, "Content-Type": "application/x-www-form-urlencoded" },
+    body: "grant_type=client_credentials&scope=product.compact",
+  });
+  if (!res.ok) throw new Error(`OAuth HTTP ${res.status}`);
+  krogerToken = (await res.json()).access_token;
+  return krogerToken;
+}
 
 async function scrapeKrogerStore(store) {
   if (!KROGER_CLIENT_ID || !KROGER_CLIENT_SECRET) {
@@ -444,28 +501,16 @@ async function scrapeKrogerStore(store) {
 
   let token;
   try {
-    const authHeader = Buffer.from(
-      `${KROGER_CLIENT_ID}:${KROGER_CLIENT_SECRET}`
-    ).toString("base64");
-    const tokenRes = await fetch("https://api.kroger.com/v1/connect/oauth2/token", {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${authHeader}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: "grant_type=client_credentials&scope=product.compact",
-    });
-    if (!tokenRes.ok) throw new Error(`HTTP ${tokenRes.status}`);
-    token = (await tokenRes.json()).access_token;
+    token = await getKrogerToken();
   } catch (err) {
     console.error(`[kroger:${store.storeId}] OAuth failed: ${err.message}`);
     return [];
   }
 
+  // Use broad SEARCH_QUERIES (11) instead of per-bottle (25) to cut API calls ~60%
   const found = [];
-  for (const bottle of TARGET_BOTTLES) {
-    const query = encodeURIComponent(bottle.searchTerms[0]);
-    const url = `https://api.kroger.com/v1/products?filter.term=${query}&filter.locationId=${store.storeId}&filter.limit=5`;
+  for (const query of SEARCH_QUERIES) {
+    const url = `https://api.kroger.com/v1/products?filter.term=${encodeURIComponent(query)}&filter.locationId=${store.storeId}&filter.limit=20`;
     try {
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
@@ -479,17 +524,20 @@ async function scrapeKrogerStore(store) {
             i.fulfillment?.inStore === true &&
             i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
         );
-        if (matchesBottle(title, bottle) && inStock) {
-          const price = product.items?.[0]?.price?.regular;
-          found.push({
-            name: bottle.name,
-            url: product.productId ? `https://www.kroger.com/p/${product.productId}` : "",
-            price: price != null ? `$${price.toFixed(2)}` : "",
-          });
+        if (!inStock) continue;
+        for (const bottle of TARGET_BOTTLES) {
+          if (matchesBottle(title, bottle)) {
+            const price = product.items?.[0]?.price?.regular;
+            found.push({
+              name: bottle.name,
+              url: product.productId ? `https://www.kroger.com/p/${product.productId}` : "",
+              price: price != null ? `$${price.toFixed(2)}` : "",
+            });
+          }
         }
       }
     } catch (err) {
-      console.error(`[kroger:${store.storeId}] Error searching "${bottle.name}": ${err.message}`);
+      console.error(`[kroger:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
     await sleep(500);
   }
@@ -502,12 +550,12 @@ async function scrapeSafewayStore(store) {
     return [];
   }
 
+  // Use broad SEARCH_QUERIES (11) instead of per-bottle (25) to cut API calls ~60%
   const found = [];
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
 
-  for (const bottle of TARGET_BOTTLES) {
-    const query = encodeURIComponent(bottle.searchTerms[0]);
-    const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${query}&rows=10&start=0&storeid=${store.storeId}`;
+  for (const query of SEARCH_QUERIES) {
+    const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=20&start=0&storeid=${store.storeId}`;
     try {
       const res = await fetch(url, {
         headers: {
@@ -520,71 +568,38 @@ async function scrapeSafewayStore(store) {
       const products = data?.primaryProducts?.response?.docs || [];
       for (const product of products) {
         const title = product.name || product.productTitle || "";
-        if (matchesBottle(title, bottle) && product.inStock !== false) {
-          found.push({
-            name: bottle.name,
-            url: product.url ? `https://www.safeway.com${product.url}` : "",
-            price: product.price != null ? `$${product.price}` : "",
-          });
+        if (product.inStock === false) continue;
+        for (const bottle of TARGET_BOTTLES) {
+          if (matchesBottle(title, bottle)) {
+            found.push({
+              name: bottle.name,
+              url: product.url ? `https://www.safeway.com${product.url}` : "",
+              price: product.price != null ? `$${product.price}` : "",
+            });
+          }
         }
       }
     } catch (err) {
-      console.error(`[safeway:${store.storeId}] Error searching "${bottle.name}": ${err.message}`);
+      console.error(`[safeway:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
     await sleep(750);
   }
   return dedupFound(found);
 }
 
-async function scrapeBevMoStore(store) {
-  const found = [];
-  const page = await newPage();
-  try {
-    for (const query of SEARCH_QUERIES) {
-      const url = `https://www.bevmo.com/search?q=${encodeURIComponent(query)}`;
-      try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForTimeout(2000);
-
-        const products = await page.$$eval(
-          '.product-tile, [data-component="product-tile"], .product, .grid-tile',
-          (tiles) =>
-            tiles
-              .filter((el) => !el.querySelector(".out-of-stock, .sold-out, [class*='outOfStock'], .unavailable"))
-              .map((el) => ({
-                title: (el.querySelector(".product-name, .pdp-link a, .product-title, [class*='productName']") || {}).textContent || "",
-                url: (el.querySelector("a.product-link, .pdp-link a, a[href*='/product'], a") || {}).href || "",
-                price: (el.querySelector(".product-sales-price, [class*='price'], .price-sales") || {}).textContent?.trim() || "",
-              }))
-        );
-
-        for (const p of products) {
-          for (const bottle of TARGET_BOTTLES) {
-            if (matchesBottle(p.title, bottle)) {
-              found.push({ name: bottle.name, url: p.url, price: p.price });
-            }
-          }
-        }
-      } catch (err) {
-        console.error(`[bevmo:${store.storeId}] Error searching "${query}": ${err.message}`);
-      }
-      await sleep(1500);
-    }
-  } finally {
-    await page.context().close();
-  }
-  return dedupFound(found);
-}
-
 // ─── Retailer Registry ───────────────────────────────────────────────────────
+// scrapeOnce: results are identical across stores (no store-specific URL/cookie).
+//   Scrape once and broadcast results to all stores.
+// needsPage: scraper accepts a shared Playwright page as second arg (browser-based).
+//   If false, scraper is API/fetch-based and doesn't need a browser page.
 
 const RETAILERS = [
-  { key: "costco",    name: "Costco",     scraper: scrapeCostcoStore },
-  { key: "totalwine", name: "Total Wine", scraper: scrapeTotalWineStore },
-  { key: "walmart",   name: "Walmart",    scraper: scrapeWalmartStore },
-  { key: "kroger",    name: "Kroger",     scraper: scrapeKrogerStore },
-  { key: "safeway",   name: "Safeway",    scraper: scrapeSafewayStore },
-  { key: "bevmo",     name: "BevMo",      scraper: scrapeBevMoStore },
+  { key: "costco",    name: "Costco",     scrapeOnce: true,  needsPage: true  },
+  { key: "totalwine", name: "Total Wine", scrapeOnce: false, needsPage: true,  scraper: scrapeTotalWineStore },
+  { key: "walmart",   name: "Walmart",    scrapeOnce: false, needsPage: false, scraper: scrapeWalmartStore },
+  { key: "kroger",    name: "Kroger",     scrapeOnce: false, needsPage: false, scraper: scrapeKrogerStore },
+  { key: "safeway",   name: "Safeway",    scrapeOnce: false, needsPage: false, scraper: scrapeSafewayStore },
+  // BevMo omitted — no AZ locations
 ];
 
 // ─── Orchestrator ────────────────────────────────────────────────────────────
@@ -606,37 +621,73 @@ async function poll() {
   let totalFound = 0;
   const retailersSeen = new Set();
 
-  // Launch browser once (shared by all browser-based scrapers running concurrently)
+  // Reset per-poll state
+  krogerToken = null;
+
   await launchBrowser();
 
-  // Build task list for all stores across all retailers
+  // Helper to record results for a store and send alerts
+  function recordResult(retailer, store, inStock) {
+    if (!state[retailer.key]) state[retailer.key] = {};
+    state[retailer.key][store.storeId] = inStock.map((b) => b.name);
+    storesScanned++;
+    if (inStock.length > 0) {
+      totalFound += inStock.length;
+      console.log(`[${retailer.key}:${store.storeId}] 🟢 Found: ${inStock.map((b) => b.name).join(", ")}`);
+      return sendUrgentAlert([buildStoreEmbed(retailer.name, store, inStock)]);
+    }
+    console.log(`[${retailer.key}:${store.storeId}] Nothing found`);
+  }
+
   const tasks = [];
   for (const retailer of RETAILERS) {
     const stores = storeCache.retailers[retailer.key] || [];
     if (stores.length === 0) continue;
     retailersSeen.add(retailer.key);
 
-    for (const store of stores) {
+    if (retailer.scrapeOnce) {
+      // Costco: scrape once, broadcast results to all stores
       tasks.push(async () => {
         try {
-          console.log(`[poll] Checking ${retailer.name} — ${store.name}...`);
-          const inStock = await retailer.scraper(store);
-          if (!state[retailer.key]) state[retailer.key] = {};
-          state[retailer.key][store.storeId] = inStock.map((b) => b.name);
-          storesScanned++;
-
-          if (inStock.length > 0) {
-            totalFound += inStock.length;
-            console.log(`[${retailer.key}:${store.storeId}] 🟢 Found: ${inStock.map((b) => b.name).join(", ")}`);
-            const embed = buildStoreEmbed(retailer.name, store, inStock);
-            await sendUrgentAlert([embed]);
-          } else {
-            console.log(`[${retailer.key}:${store.storeId}] Nothing found`);
+          console.log(`[poll] Checking ${retailer.name} (once for ${stores.length} stores)...`);
+          const page = await newPage();
+          const inStock = await scrapeCostcoOnce(page);
+          await page.context().close();
+          for (const store of stores) {
+            await recordResult(retailer, store, inStock);
           }
         } catch (err) {
-          console.error(`[poll] ${retailer.name} (${store.name}) crashed: ${err.message}`);
+          console.error(`[poll] ${retailer.name} crashed: ${err.message}`);
         }
       });
+    } else if (retailer.needsPage) {
+      // Browser-based per-store scrapers: share one context per retailer
+      for (const store of stores) {
+        tasks.push(async () => {
+          try {
+            console.log(`[poll] Checking ${retailer.name} — ${store.name}...`);
+            const page = await newPage();
+            const inStock = await retailer.scraper(store, page);
+            await page.context().close();
+            await recordResult(retailer, store, inStock);
+          } catch (err) {
+            console.error(`[poll] ${retailer.name} (${store.name}) crashed: ${err.message}`);
+          }
+        });
+      }
+    } else {
+      // API/fetch-based scrapers: no browser page needed
+      for (const store of stores) {
+        tasks.push(async () => {
+          try {
+            console.log(`[poll] Checking ${retailer.name} — ${store.name}...`);
+            const inStock = await retailer.scraper(store);
+            await recordResult(retailer, store, inStock);
+          } catch (err) {
+            console.error(`[poll] ${retailer.name} (${store.name}) crashed: ${err.message}`);
+          }
+        });
+      }
     }
   }
 
