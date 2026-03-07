@@ -238,24 +238,30 @@ async function newPage() {
 
 // Costco search has no store filter — results are identical across warehouses.
 // Scrape once and the poll loop copies results to all stores.
+// Uses stable MUI data-testid attributes instead of fragile CSS classes.
 async function scrapeCostcoOnce(page) {
   const found = [];
   for (const query of SEARCH_QUERIES) {
-    const url = `https://www.costco.com/CatalogSearch?dept=All&keyword=${encodeURIComponent(query)}`;
+    const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(2000);
+      // Wait for product tiles or timeout (page may have no results)
+      await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 8000 }).catch(() => {});
 
       const products = await page.$$eval(
-        ".product-tile, [automation-id='productList'] .product",
+        '[data-testid^="ProductTile_"]',
         (tiles) =>
-          tiles
-            .filter((el) => !el.querySelector(".out-of-stock, .oos-overlay"))
-            .map((el) => ({
-              title: (el.querySelector(".description, .product-title, a[automation-id]") || {}).textContent || "",
-              url: (el.querySelector("a.product-tile-link, a[automation-id], .description a, a") || {}).href || "",
-              price: (el.querySelector(".price, [class*='price'], [automation-id*='price']") || {}).textContent?.trim() || "",
-            }))
+          tiles.map((tile) => {
+            const id = tile.getAttribute("data-testid").replace("ProductTile_", "");
+            const titleEl = tile.querySelector(`[data-testid="Text_ProductTile_${id}_title"], h3`);
+            const priceEl = tile.querySelector(`[data-testid="Text_Price_${id}"], [data-testid^="Text_Price_"]`);
+            const linkEl = tile.querySelector('a[href*=".product."]');
+            return {
+              title: titleEl?.textContent?.trim() || "",
+              url: linkEl?.href || "",
+              price: priceEl?.textContent?.trim() || "",
+            };
+          })
       );
 
       for (const p of products) {
@@ -335,6 +341,39 @@ async function scrapeTotalWineStore(store, page) {
 
 // ─── Walmart: fetch-first with browser fallback ─────────────────────────────
 
+// Extract matched bottles from Walmart __NEXT_DATA__ JSON.
+// Iterates ALL itemStacks (not just [0]), filters to actual products only,
+// excludes third-party marketplace sellers, and checks fulfillment.
+function matchWalmartNextData(nextData) {
+  const found = [];
+  const allStacks = nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks || [];
+  const items = allStacks.flatMap((stack) => stack.items || []);
+
+  for (const item of items) {
+    // Skip non-product entries (ads, recommendations, editorial)
+    if (item.__typename !== "Product") continue;
+    // Skip third-party marketplace sellers (inflated prices, unreliable stock)
+    if (item.sellerName && item.sellerName !== "Walmart.com") continue;
+
+    const available = item.availabilityStatusV2?.value === "IN_STOCK" || item.canAddToCart === true;
+    if (!available || !item.name) continue;
+
+    for (const bottle of TARGET_BOTTLES) {
+      if (matchesBottle(item.name, bottle)) {
+        const pickup = item.fulfillmentBadge || "";
+        let price = item.priceInfo?.currentPrice?.priceString || "";
+        if (pickup) price = price ? `${price} · ${pickup}` : pickup;
+        found.push({
+          name: bottle.name,
+          url: item.canonicalUrl ? `https://www.walmart.com${item.canonicalUrl}` : "",
+          price,
+        });
+      }
+    }
+  }
+  return found;
+}
+
 // Try fetching Walmart search HTML directly and parsing __NEXT_DATA__ (no browser needed).
 // Returns { name, url, price }[] on success, null if blocked/unavailable.
 async function scrapeWalmartViaFetch(store) {
@@ -346,26 +385,10 @@ async function scrapeWalmartViaFetch(store) {
       if (!res.ok) return null;
       const html = await res.text();
       const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-      if (!match) return null; // Bot detection or different page structure
-
-      const nextData = JSON.parse(match[1]);
-      const items = nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks?.[0]?.items || [];
-      for (const item of items) {
-        const available = item.availabilityStatusV2?.value === "IN_STOCK" || item.canAddToCart === true;
-        if (available && item.name) {
-          for (const bottle of TARGET_BOTTLES) {
-            if (matchesBottle(item.name, bottle)) {
-              found.push({
-                name: bottle.name,
-                url: item.canonicalUrl ? `https://www.walmart.com${item.canonicalUrl}` : "",
-                price: item.priceInfo?.currentPrice?.priceString || "",
-              });
-            }
-          }
-        }
-      }
+      if (!match) return null;
+      found.push(...matchWalmartNextData(JSON.parse(match[1])));
     } catch {
-      return null; // Any error → fall back to browser
+      return null;
     }
     await sleep(500);
   }
@@ -388,24 +411,9 @@ async function scrapeWalmartViaBrowser(store, page) {
       });
 
       if (nextData) {
-        const items =
-          nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks?.[0]?.items || [];
-        for (const item of items) {
-          const available =
-            item.availabilityStatusV2?.value === "IN_STOCK" || item.canAddToCart === true;
-          if (available && item.name) {
-            for (const bottle of TARGET_BOTTLES) {
-              if (matchesBottle(item.name, bottle)) {
-                found.push({
-                  name: bottle.name,
-                  url: item.canonicalUrl ? `https://www.walmart.com${item.canonicalUrl}` : "",
-                  price: item.priceInfo?.currentPrice?.priceString || "",
-                });
-              }
-            }
-          }
-        }
+        found.push(...matchWalmartNextData(nextData));
       } else {
+        // DOM fallback if __NEXT_DATA__ is unavailable
         const products = await page.$$eval(
           '[data-testid="list-view"] [data-item-id], .search-result-gridview-item',
           (items) =>
