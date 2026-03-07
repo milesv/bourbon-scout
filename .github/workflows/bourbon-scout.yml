@@ -1,0 +1,60 @@
+name: Bourbon Scout
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub Actions cron can be delayed 5-30 min during peak.
+    # Offset from :00 to avoid the busiest time (top of hour).
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch: {} # Manual trigger from GitHub UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Cache Playwright Chromium binary (~150MB) across runs
+      - uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('package-lock.json') }}
+
+      # Full install on cache miss, just system deps on cache hit
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+
+      - name: Install Playwright system deps (cached browser)
+        run: npx playwright install-deps chromium
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+
+      # Restore state.json + stores.json from previous runs
+      - uses: actions/cache@v4
+        with:
+          path: |
+            state.json
+            stores.json
+          key: bourbon-state-${{ github.run_id }}
+          restore-keys: bourbon-state-
+
+      - name: Run scan
+        run: node scraper.js
+        env:
+          RUN_ONCE: "true"
+          ZIP_CODE: "85283"
+          SEARCH_RADIUS_MILES: "15"
+          MAX_STORES_PER_RETAILER: "5"
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          KROGER_CLIENT_ID: ${{ secrets.KROGER_CLIENT_ID }}
+          KROGER_CLIENT_SECRET: ${{ secrets.KROGER_CLIENT_SECRET }}
+          SAFEWAY_API_KEY: ${{ secrets.SAFEWAY_API_KEY }}
