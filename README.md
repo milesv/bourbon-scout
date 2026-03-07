@@ -1,6 +1,6 @@
 # Bourbon Scout
 
-Automated inventory tracker for allocated and rare bourbon. Monitors 6 major retailers near your zip code and sends real-time Discord reports as each store is scanned.
+Automated inventory tracker for allocated and rare bourbon. Monitors 5 major retailers near your zip code and sends real-time Discord alerts when bottles are spotted.
 
 ## Tracked Bottles (25)
 
@@ -8,13 +8,19 @@ Blanton's (Gold, Straight from the Barrel, Special Reserve, Red), Weller (Specia
 
 ## Supported Retailers
 
-Costco, Total Wine, Walmart, Kroger (including Fry's, Ralph's, etc.), Safeway, BevMo.
+| Retailer | Method | Data Source |
+|----------|--------|-------------|
+| Costco | Browser (Playwright) | MUI `data-testid` attributes |
+| Total Wine | Browser (Playwright) | `window.INITIAL_STATE` JSON |
+| Walmart | Fetch-first, browser fallback | `__NEXT_DATA__` JSON |
+| Kroger | REST API | Structured JSON |
+| Safeway | REST API | Structured JSON |
 
 ## How It Works
 
-1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days.
-2. **Inventory Polling** — Every 15 minutes (configurable), scrapes each discovered store for the target bottles.
-3. **Real-Time Discord Reports** — Each store's results are sent to Discord immediately after scanning, showing in-stock and out-of-stock bottles with store name, address, and distance.
+1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
+2. **Inventory Scanning** — Scans all stores concurrently (limit 4) using 11 broad search queries that cover all 25 bottles. Prefers structured JSON extraction over CSS selectors for reliability.
+3. **Discord Alerts** — When bottles are found, sends an `@everyone` urgent alert with product URLs, prices, and fulfillment info. A quiet summary posts after every scan. Store addresses link to Google Maps.
 
 ## Setup
 
@@ -33,7 +39,7 @@ npx playwright install chromium
 
 ### Configure
 
-Copy `.env` and fill in your values:
+Create a `.env` file:
 
 ```env
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
@@ -62,43 +68,31 @@ Kroger and Safeway scrapers are skipped if their API keys aren't provided. All o
 ### Run
 
 ```sh
-npm start
+npm start        # Discover stores + start polling
+npm run dev      # Same with --watch for auto-restart
 ```
 
-On first run you'll see store discovery then polling output:
+### GitHub Actions (CI)
 
-```
-Bourbon Scout 🥃 starting up...
-[discover] Discovering stores near 85283 within 15 miles...
-[discover] Zip 85283 → 33.3665, -111.9312
-[discover] Locating costco stores...
-[discover] Found 5 costco store(s)
-[discover] Locating totalwine stores...
-[discover] Found 5 totalwine store(s)
-[discover] Locating walmart stores...
-[discover] Found 5 walmart store(s)
-...
-[discover] Discovery complete — 20 stores cached to stores.json
-Tracking 25 bottles across 20 stores
-Poll schedule: */15 * * * *
+The included workflow runs every 15 minutes via GitHub Actions cron. It uses `RUN_ONCE=true` for single-run mode and caches Playwright browsers and state files between runs.
 
-[poll] Starting scan at 2026-03-07T02:44:52.608Z
-[poll] Checking Costco — Costco Chandler...
-[costco:736] In stock: none
-[poll] Checking Costco — Costco Gilbert...
-```
+Set these repository secrets:
+- `DISCORD_WEBHOOK_URL` (required)
+- `KROGER_CLIENT_ID`, `KROGER_CLIENT_SECRET` (optional)
+- `SAFEWAY_API_KEY` (optional)
 
-Each store result is sent to Discord immediately as it completes — you'll see embeds stream in during the poll. Subsequent runs reuse the cached `stores.json` until the cache expires (7 days) or your zip/radius changes.
+Manual trigger: `gh workflow run "Bourbon Scout"`
 
-## Discord Reports
+## Discord Alerts
 
-Each poll sends one Discord embed per store showing:
-- Store name and distance from your zip
-- Store address
-- In-stock bottles (highlighted individually)
-- Out-of-stock bottles (compact comma-separated list)
+**When bottles are found:**
+- `@everyone` ping with urgent embed
+- Clickable product URLs and prices
+- Fulfillment info (e.g., "Pickup today")
+- Store name, distance, and Google Maps link
 
-Embeds are color-coded: green if anything is in stock, gray if nothing found.
+**After every scan:**
+- Quiet summary embed with store count, retailer count, and scan duration
 
 ## Generated Files
 
@@ -108,18 +102,12 @@ Embeds are color-coded: green if anything is in stock, gray if nothing found.
 | `state.json` | Last known stock state per store | Yes — sends full report for all stores on next poll |
 | `debug/` | Screenshots and HTML from store locator pages | Yes — regenerate with `node debug-locators.js` |
 
-## Development
+## Debugging Store Locators
 
-```sh
-npm run dev    # Runs with --watch for auto-restart on file changes
-```
-
-### Debugging Store Locators
-
-If a retailer stops finding stores, the CSS selectors likely need updating:
+If a retailer stops finding stores, the selectors likely need updating:
 
 ```sh
 node debug-locators.js
 ```
 
-This captures screenshots, full HTML, and CSS selector lists from each retailer's store locator page into `debug/`. Compare against the selectors in `lib/discover-stores.js` and update as needed.
+This captures screenshots, full HTML, and selector lists from each retailer's store locator page into `debug/`. Compare against the selectors in `lib/discover-stores.js` and update as needed.
