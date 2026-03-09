@@ -106,6 +106,7 @@ Four types of color-coded embeds with per-retailer SKU/item numbers and rich sto
 **🟣 Scan Summary** (purple, quiet)
 - Posted after every scan with counts: new finds, still in stock, went OOS, nothing found
 - Shows total stores, retailers, and scan duration
+- When no allocations are found, lists all scanned stores grouped by retailer
 
 Each embed includes:
 - Store name, number, city/state, and distance
