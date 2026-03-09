@@ -42,12 +42,12 @@ vi.mock("../lib/discover-stores.js", () => ({
 
 import {
   SEARCH_QUERIES, TARGET_BOTTLES, RETAILERS, FETCH_HEADERS,
-  parseSize, matchesBottle, dedupFound, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  launchBrowser, closeBrowser, newPage,
+  launchBrowser, closeBrowser, newPage, isBlockedPage,
   scrapeCostcoOnce, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
@@ -62,6 +62,8 @@ function createMockPage() {
     goto: vi.fn().mockResolvedValue(undefined),
     waitForSelector: vi.fn().mockResolvedValue(undefined),
     waitForTimeout: vi.fn().mockResolvedValue(undefined),
+    waitForFunction: vi.fn().mockResolvedValue(undefined),
+    title: vi.fn().mockResolvedValue(""),
     evaluate: vi.fn().mockResolvedValue([]),
     $$eval: vi.fn().mockResolvedValue([]),
     $eval: vi.fn().mockResolvedValue(null),
@@ -108,14 +110,16 @@ async function runWithFakeTimers(fn) {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 describe("constants", () => {
-  it("SEARCH_QUERIES has 11 broad queries", () => {
-    expect(SEARCH_QUERIES).toHaveLength(11);
+  it("SEARCH_QUERIES has 12 broad queries", () => {
+    expect(SEARCH_QUERIES).toHaveLength(12);
     expect(SEARCH_QUERIES).toContain("weller bourbon");
-    expect(SEARCH_QUERIES).toContain("pappy van winkle");
+    expect(SEARCH_QUERIES).toContain("van winkle");
+    expect(SEARCH_QUERIES).toContain("eh taylor");
+    expect(SEARCH_QUERIES).toContain("old forester bourbon");
   });
 
-  it("TARGET_BOTTLES has 25 bottles", () => {
-    expect(TARGET_BOTTLES).toHaveLength(25);
+  it("TARGET_BOTTLES has 40 bottles", () => {
+    expect(TARGET_BOTTLES).toHaveLength(40);
     expect(TARGET_BOTTLES[0]).toHaveProperty("name");
     expect(TARGET_BOTTLES[0]).toHaveProperty("searchTerms");
   });
@@ -137,9 +141,50 @@ describe("constants", () => {
   it("FETCH_HEADERS has a User-Agent", () => {
     expect(FETCH_HEADERS["User-Agent"]).toContain("Mozilla");
   });
+
+  it("FETCH_HEADERS includes anti-bot headers", () => {
+    expect(FETCH_HEADERS["Sec-Fetch-Dest"]).toBe("document");
+    expect(FETCH_HEADERS["Sec-Fetch-Mode"]).toBe("navigate");
+    expect(FETCH_HEADERS["Referer"]).toContain("google.com");
+    expect(FETCH_HEADERS["Upgrade-Insecure-Requests"]).toBe("1");
+  });
+
+  it("FETCH_HEADERS includes Sec-CH-UA Client Hints", () => {
+    expect(FETCH_HEADERS["Sec-CH-UA"]).toContain("Chrome");
+    expect(FETCH_HEADERS["Sec-CH-UA-Mobile"]).toBe("?0");
+    expect(FETCH_HEADERS["Sec-CH-UA-Platform"]).toBe('"Windows"');
+  });
+
+  it("FETCH_HEADERS User-Agent version matches Sec-CH-UA version", () => {
+    const uaMatch = FETCH_HEADERS["User-Agent"].match(/Chrome\/([\d]+)/);
+    const chMatch = FETCH_HEADERS["Sec-CH-UA"].match(/Chrome";v="([\d]+)"/);
+    expect(uaMatch[1]).toBe(chMatch[1]);
+  });
 });
 
 // ─── Pure Utility Functions ───────────────────────────────────────────────────
+
+describe("normalizeText", () => {
+  it("converts unicode right single quote to ASCII apostrophe", () => {
+    expect(normalizeText("Blanton\u2019s Gold")).toBe("blanton's gold");
+  });
+
+  it("converts unicode left single quote to ASCII apostrophe", () => {
+    expect(normalizeText("Blanton\u2018s")).toBe("blanton's");
+  });
+
+  it("converts unicode double quotes", () => {
+    expect(normalizeText("\u201CHello\u201D")).toBe('"hello"');
+  });
+
+  it("lowercases while normalizing", () => {
+    expect(normalizeText("E.H. Taylor\u2019s BOURBON")).toBe("e.h. taylor's bourbon");
+  });
+
+  it("passes through plain ASCII unchanged (except lowercasing)", () => {
+    expect(normalizeText("Weller 12 Year")).toBe("weller 12 year");
+  });
+});
 
 describe("parseSize", () => {
   it("parses ml sizes", () => {
@@ -175,6 +220,145 @@ describe("matchesBottle", () => {
     const taylor = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Small Batch");
     expect(matchesBottle("Colonel E.H. Taylor Small Batch Bourbon 750ml", taylor)).toBe(true);
   });
+
+  it("does not match E.H. Taylor Single Barrel as Small Batch", () => {
+    const taylor = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Small Batch");
+    expect(matchesBottle("E.H. Taylor Single Barrel Bourbon 750ml", taylor)).toBe(false);
+    expect(matchesBottle("E.H. Taylor Barrel Proof Bourbon", taylor)).toBe(false);
+  });
+
+  it("does not match bare 'Old Rip Van Winkle' as Pappy 10", () => {
+    const pappy10 = TARGET_BOTTLES.find((b) => b.name === "Pappy Van Winkle 10 Year");
+    expect(matchesBottle("Old Rip Van Winkle 10 Year 750ml", pappy10)).toBe(true);
+    expect(matchesBottle("Old Rip Van Winkle 12 Year 750ml", pappy10)).toBe(false);
+    expect(matchesBottle("Old Rip Van Winkle Rye Whiskey", pappy10)).toBe(false);
+  });
+
+  it("does not match bare 'Van Winkle Special Reserve' as Pappy 12", () => {
+    const pappy12 = TARGET_BOTTLES.find((b) => b.name === "Pappy Van Winkle 12 Year");
+    expect(matchesBottle("Van Winkle Special Reserve 12 Year", pappy12)).toBe(true);
+    expect(matchesBottle("Van Winkle Special Reserve 10 Year", pappy12)).toBe(false);
+  });
+
+  it("matches William Larue Weller aliases", () => {
+    const wlw = TARGET_BOTTLES.find((b) => b.name === "William Larue Weller");
+    expect(matchesBottle("William Larue Weller Bourbon BTAC 2024", wlw)).toBe(true);
+    expect(matchesBottle("WM Larue Weller 750ml", wlw)).toBe(true);
+    expect(matchesBottle("W.L. Weller BTAC Limited Release", wlw)).toBe(true);
+    expect(matchesBottle("Larue Weller Bourbon", wlw)).toBe(true);
+  });
+
+  it("matches E.H. Taylor variations", () => {
+    const sib = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Single Barrel");
+    expect(matchesBottle("Colonel E.H. Taylor Single Barrel Bourbon 750ml", sib)).toBe(true);
+    expect(matchesBottle("EH Taylor Single Barrel Kentucky Straight", sib)).toBe(true);
+    const bp = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Barrel Proof");
+    expect(matchesBottle("E.H. Taylor Barrel Proof Bourbon 750ml", bp)).toBe(true);
+    const rye = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Straight Rye");
+    expect(matchesBottle("Col. E.H. Taylor Straight Rye Whiskey", rye)).toBe(true);
+    expect(matchesBottle("EH Taylor Rye 750ml", rye)).toBe(true);
+  });
+
+  it("does not cross-match E.H. Taylor variations", () => {
+    const smb = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Small Batch");
+    const sib = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Single Barrel");
+    const bp = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Barrel Proof");
+    // "Single Barrel" should NOT match Small Batch
+    expect(matchesBottle("E.H. Taylor Single Barrel Bourbon", smb)).toBe(false);
+    // "Barrel Proof" should NOT match Single Barrel
+    expect(matchesBottle("E.H. Taylor Barrel Proof Bourbon", sib)).toBe(false);
+    // "Small Batch" should NOT match Barrel Proof
+    expect(matchesBottle("E.H. Taylor Small Batch Bourbon", bp)).toBe(false);
+  });
+
+  it("matches Blanton's Green and Black", () => {
+    const green = TARGET_BOTTLES.find((b) => b.name === "Blanton's Green");
+    expect(matchesBottle("Blanton's Green Label Bourbon 700ml", green)).toBe(true);
+    const black = TARGET_BOTTLES.find((b) => b.name === "Blanton's Black");
+    expect(matchesBottle("Blantons Black Label 750ml", black)).toBe(true);
+  });
+
+  it("Van Winkle Family Reserve Rye does not false-positive on Pappy 15", () => {
+    const rye = TARGET_BOTTLES.find((b) => b.name === "Van Winkle Family Reserve Rye");
+    expect(matchesBottle("Van Winkle Family Reserve Rye 13 Year", rye)).toBe(true);
+    expect(matchesBottle("Van Winkle Rye 13 Year 750ml", rye)).toBe(true);
+    // Must NOT match Pappy 15 (officially "Pappy Van Winkle's Family Reserve")
+    expect(matchesBottle("Pappy Van Winkle's Family Reserve 15 Year", rye)).toBe(false);
+    expect(matchesBottle("Pappy Van Winkle Family Reserve 20 Year", rye)).toBe(false);
+    // Must NOT match unrelated rye products
+    expect(matchesBottle("Jefferson's Family Reserve Rye", rye)).toBe(false);
+  });
+
+  it("matches Old Forester allocated bottles", () => {
+    const birthday = TARGET_BOTTLES.find((b) => b.name === "Old Forester Birthday Bourbon");
+    expect(matchesBottle("Old Forester Birthday Bourbon 2024 Release", birthday)).toBe(true);
+    // "birthday bourbon" alone should NOT match (removed to avoid A. Smith Bowman false positive)
+    expect(matchesBottle("A. Smith Bowman Birthday Bourbon", birthday)).toBe(false);
+    const pc = TARGET_BOTTLES.find((b) => b.name === "Old Forester President's Choice");
+    expect(matchesBottle("Old Forester President's Choice Barrel Strength", pc)).toBe(true);
+    expect(matchesBottle("Old Forester Presidents Choice 750ml", pc)).toBe(true);
+  });
+
+  it("matches George T. Stagg with period after T", () => {
+    const gts = TARGET_BOTTLES.find((b) => b.name === "George T. Stagg");
+    expect(matchesBottle("George T. Stagg Bourbon 750ml", gts)).toBe(true);
+    expect(matchesBottle("George T Stagg Bourbon 750ml", gts)).toBe(true);
+  });
+
+  it("matches Elmer T. Lee with period after T", () => {
+    const etl = TARGET_BOTTLES.find((b) => b.name === "Elmer T. Lee");
+    expect(matchesBottle("Elmer T. Lee Single Barrel Bourbon", etl)).toBe(true);
+    expect(matchesBottle("Elmer T Lee Single Barrel", etl)).toBe(true);
+  });
+
+  it("handles unicode curly apostrophes from retailer sites", () => {
+    const blantons = TARGET_BOTTLES.find((b) => b.name === "Blanton's Gold");
+    // Unicode right single quotation mark (U+2019) — common in retailer HTML
+    expect(matchesBottle("Blanton\u2019s Gold 750ml", blantons)).toBe(true);
+    const pc = TARGET_BOTTLES.find((b) => b.name === "Old Forester President's Choice");
+    expect(matchesBottle("Old Forester President\u2019s Choice", pc)).toBe(true);
+  });
+
+  it("every TARGET_BOTTLE is reachable by at least one SEARCH_QUERY", () => {
+    // Retailer search engines do keyword matching, not substring matching.
+    // A query like "blantons bourbon" returns all products containing "blantons".
+    // So a bottle is reachable if any keyword from any query appears in the
+    // bottle's name or searchTerms.
+    for (const bottle of TARGET_BOTTLES) {
+      const allText = [bottle.name, ...bottle.searchTerms].join(" ").toLowerCase();
+      const reachable = SEARCH_QUERIES.some((query) => {
+        const keywords = query.toLowerCase().split(/\s+/);
+        // The distinctive keyword (not generic words like "bourbon"/"rye") must appear
+        return keywords.some((kw) => kw.length > 3 && allText.includes(kw));
+      });
+      expect(reachable, `${bottle.name} is not reachable by any SEARCH_QUERY`).toBe(true);
+    }
+  });
+});
+
+describe("parsePrice", () => {
+  it("parses dollar-sign prices", () => {
+    expect(parsePrice("$29.99")).toBe(29.99);
+  });
+
+  it("handles commas in large prices", () => {
+    expect(parsePrice("$1,299.99")).toBe(1299.99);
+  });
+
+  it("handles plain numbers", () => {
+    expect(parsePrice("29.99")).toBe(29.99);
+  });
+
+  it("returns 0 for null/undefined/empty", () => {
+    expect(parsePrice(null)).toBe(0);
+    expect(parsePrice(undefined)).toBe(0);
+    expect(parsePrice("")).toBe(0);
+  });
+
+  it("returns 0 for non-numeric strings", () => {
+    expect(parsePrice("N/A")).toBe(0);
+    expect(parsePrice("Price unavailable")).toBe(0);
+  });
 });
 
 describe("dedupFound", () => {
@@ -186,7 +370,37 @@ describe("dedupFound", () => {
     ];
     const result = dedupFound(input);
     expect(result).toHaveLength(2);
-    expect(result[0].url).toBe("/a");
+  });
+
+  it("prefers lowest price on duplicates", () => {
+    const input = [
+      { name: "Weller 12 Year", url: "/expensive", price: "$50" },
+      { name: "Weller 12 Year", url: "/cheap", price: "$30" },
+      { name: "Weller 12 Year", url: "/mid", price: "$40" },
+    ];
+    const result = dedupFound(input);
+    expect(result).toHaveLength(1);
+    expect(result[0].url).toBe("/cheap");
+    expect(result[0].price).toBe("$30");
+  });
+
+  it("keeps first-seen when prices are missing", () => {
+    const input = [
+      { name: "Stagg Jr", url: "/first" },
+      { name: "Stagg Jr", url: "/second" },
+    ];
+    const result = dedupFound(input);
+    expect(result).toHaveLength(1);
+    expect(result[0].url).toBe("/first");
+  });
+
+  it("replaces no-price entry with priced entry", () => {
+    const input = [
+      { name: "Stagg Jr", url: "/no-price" },
+      { name: "Stagg Jr", url: "/has-price", price: "$55" },
+    ];
+    const result = dedupFound(input);
+    expect(result[0].url).toBe("/has-price");
   });
 
   it("returns empty array for empty input", () => {
@@ -834,6 +1048,40 @@ describe("browser management", () => {
   });
 });
 
+// ─── Bot Detection ───────────────────────────────────────────────────────────
+
+describe("isBlockedPage", () => {
+  it("detects Access Denied pages", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Access Denied");
+    expect(await isBlockedPage(page)).toBe(true);
+  });
+
+  it("detects robot/CAPTCHA pages", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Are you a robot?");
+    expect(await isBlockedPage(page)).toBe(true);
+  });
+
+  it("detects challenge pages", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Security Challenge");
+    expect(await isBlockedPage(page)).toBe(true);
+  });
+
+  it("returns false for normal pages", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Search Results - Costco");
+    expect(await isBlockedPage(page)).toBe(false);
+  });
+
+  it("handles title() errors gracefully", async () => {
+    const page = createMockPage();
+    page.title.mockRejectedValue(new Error("page closed"));
+    expect(await isBlockedPage(page)).toBe(false);
+  });
+});
+
 // ─── Costco Scraper ───────────────────────────────────────────────────────────
 
 describe("scrapeCostcoOnce", () => {
@@ -853,6 +1101,18 @@ describe("scrapeCostcoOnce", () => {
     mockPage.waitForSelector.mockRejectedValue(new Error("timeout"));
     const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
     expect(found).toEqual([]);
+  });
+
+  it("skips queries when bot detection page is shown", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mockPage = createMockPage();
+    mockPage.waitForSelector.mockRejectedValue(new Error("timeout"));
+    mockPage.title.mockResolvedValue("Access Denied");
+    mockPage.$$eval.mockResolvedValue([]);
+    const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
+    expect(found).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Bot detection"));
+    warnSpy.mockRestore();
   });
 
   it("handles page errors gracefully", async () => {
@@ -968,19 +1228,51 @@ describe("scrapeWalmartViaFetch", () => {
     expect(found[0].name).toBe("Weller Special Reserve");
   });
 
-  it("returns null when blocked (non-200)", async () => {
-    mocks.fetch.mockResolvedValueOnce({ ok: false, status: 403 });
-    expect(await scrapeWalmartViaFetch(TEST_STORE)).toBeNull();
+  it("continues on partial failures and keeps results", async () => {
+    // First query fails, second succeeds — should return results, not null
+    let callCount = 0;
+    mocks.fetch.mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) return Promise.resolve({ ok: false, status: 403 });
+      return Promise.resolve({
+        ok: true,
+        text: async () => `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(walmartNextData)}</script></html>`,
+      });
+    });
+    const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
+    expect(found).not.toBeNull();
+    expect(found.length).toBeGreaterThan(0);
   });
 
-  it("returns null when __NEXT_DATA__ not found", async () => {
+  it("returns null when more than 3 queries fail", async () => {
+    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
+    expect(found).toBeNull();
+  });
+
+  it("returns null when all queries fail with no results", async () => {
+    // All queries return no __NEXT_DATA__ — failures > 0 && found.length === 0
     mocks.fetch.mockResolvedValue({ ok: true, text: async () => "<html>Blocked</html>" });
-    expect(await scrapeWalmartViaFetch(TEST_STORE)).toBeNull();
+    const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
+    expect(found).toBeNull();
   });
 
-  it("returns null on fetch error", async () => {
+  it("returns null on repeated fetch errors", async () => {
     mocks.fetch.mockRejectedValue(new Error("Network error"));
-    expect(await scrapeWalmartViaFetch(TEST_STORE)).toBeNull();
+    const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
+    expect(found).toBeNull();
+  });
+
+  it("returns null when __NEXT_DATA__ exists but has no searchResult (block page)", async () => {
+    // Simulates Walmart returning a challenge/geo-block page with __NEXT_DATA__ but no real search results
+    const fakeNextData = { props: { pageProps: { initialData: {} } } };
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      text: async () => `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(fakeNextData)}</script></html>`,
+    });
+    const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
+    // Should return null (trigger browser fallback), NOT empty array
+    expect(found).toBeNull();
   });
 });
 
@@ -1018,14 +1310,20 @@ describe("scrapeWalmartViaBrowser", () => {
 });
 
 describe("scrapeWalmartStore", () => {
+  const walmartStoreNextData = { props: { pageProps: { initialData: { searchResult: { itemStacks: [{ items: [{
+    __typename: "Product", name: "Weller Special Reserve",
+    availabilityStatusV2: { value: "IN_STOCK" }, sellerName: "Walmart.com",
+  }] }] } } } } };
+
+  afterEach(() => {
+    delete process.env.CI;
+    delete process.env.GITHUB_ACTIONS;
+  });
+
   it("uses fetch path when successful", async () => {
-    const nextData = { props: { pageProps: { initialData: { searchResult: { itemStacks: [{ items: [{
-      __typename: "Product", name: "Weller Special Reserve",
-      availabilityStatusV2: { value: "IN_STOCK" }, sellerName: "Walmart.com",
-    }] }] } } } } };
     mocks.fetch.mockResolvedValue({
       ok: true,
-      text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(nextData)}</script>`,
+      text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(walmartStoreNextData)}</script>`,
     });
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeWalmartStore(TEST_STORE));
@@ -1035,14 +1333,48 @@ describe("scrapeWalmartStore", () => {
   });
 
   it("falls back to browser when fetch blocked", async () => {
-    mocks.fetch.mockResolvedValueOnce({ ok: false, status: 403 });
+    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
     const { page: mockPage } = setupMockBrowser();
     mockPage.evaluate.mockResolvedValue(null);
     mockPage.$$eval.mockResolvedValue([]);
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await launchBrowser();
     const found = await runWithFakeTimers(() => scrapeWalmartStore(TEST_STORE));
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("browser"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked"));
+    consoleSpy.mockRestore();
+    await closeBrowser();
+  });
+
+  it("skips fetch on CI and goes straight to browser", async () => {
+    process.env.CI = "true";
+    const { page: mockPage } = setupMockBrowser();
+    mockPage.evaluate.mockResolvedValue(null);
+    mockPage.$$eval.mockResolvedValue([]);
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await launchBrowser();
+    await runWithFakeTimers(() => scrapeWalmartStore(TEST_STORE));
+    // Fetch should never be called for Walmart search URLs
+    const walmartFetches = mocks.fetch.mock.calls.filter(([url]) =>
+      typeof url === "string" && url.includes("walmart.com/search")
+    );
+    expect(walmartFetches).toHaveLength(0);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("CI mode"));
+    consoleSpy.mockRestore();
+    await closeBrowser();
+  });
+
+  it("skips fetch when GITHUB_ACTIONS is set", async () => {
+    process.env.GITHUB_ACTIONS = "true";
+    const { page: mockPage } = setupMockBrowser();
+    mockPage.evaluate.mockResolvedValue(null);
+    mockPage.$$eval.mockResolvedValue([]);
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await launchBrowser();
+    await runWithFakeTimers(() => scrapeWalmartStore(TEST_STORE));
+    const walmartFetches = mocks.fetch.mock.calls.filter(([url]) =>
+      typeof url === "string" && url.includes("walmart.com/search")
+    );
+    expect(walmartFetches).toHaveLength(0);
     consoleSpy.mockRestore();
     await closeBrowser();
   });
@@ -1118,6 +1450,40 @@ describe("scrapeKrogerStore", () => {
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     expect(found).toEqual([]);
   });
+
+  it("prefers in-stock item variant for price over items[0]", async () => {
+    _resetKrogerToken();
+    mocks.fetch
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{
+          description: "Weller Special Reserve Bourbon 750ml",
+          productId: "0001234",
+          items: [
+            { fulfillment: { inStore: false, shipToHome: true }, inventory: { stockLevel: "LOW" }, price: { regular: 99.99 }, size: "1.75L" },
+            { fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" },
+          ],
+        }] }),
+      });
+    const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
+    const weller = found.find((f) => f.name === "Weller Special Reserve");
+    expect(weller).toBeTruthy();
+    expect(weller.price).toBe("$29.99");
+    expect(weller.size).toBe("750ml");
+  });
+
+  it("clears cached token on 401 and logs error", async () => {
+    _resetKrogerToken();
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.fetch
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "expired-token" }) })
+      .mockResolvedValue({ ok: false, status: 401 });
+    const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
+    expect(found).toEqual([]);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Token expired"));
+    consoleSpy.mockRestore();
+  });
 });
 
 // ─── Safeway Scraper ──────────────────────────────────────────────────────────
@@ -1146,6 +1512,19 @@ describe("scrapeSafewayStore", () => {
       json: async () => ({ primaryProducts: { response: { docs: [{
         name: "Weller Special Reserve", inStock: false,
       }] } } }),
+    });
+    const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
+    expect(found).toEqual([]);
+  });
+
+  it("filters products with undefined/null/0 inStock", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ primaryProducts: { response: { docs: [
+        { name: "Weller Special Reserve", inStock: undefined },
+        { name: "Blanton's Gold", inStock: null },
+        { name: "Stagg Jr", inStock: 0 },
+      ] } } }),
     });
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     expect(found).toEqual([]);

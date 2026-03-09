@@ -2,9 +2,9 @@
 
 Automated inventory tracker for allocated and rare bourbon. Monitors 5 major retailers near your zip code and sends real-time Discord alerts with SKU/item numbers, store details, and stock status changes when bottles are spotted or go out of stock.
 
-## Tracked Bottles (25)
+## Tracked Bottles (40)
 
-Blanton's (Gold, Straight from the Barrel, Special Reserve, Red), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor Small Batch, Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Elmer T. Lee, Rock Hill Farms, King of Kentucky.
+Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch).
 
 ## Supported Retailers
 
@@ -19,7 +19,7 @@ Blanton's (Gold, Straight from the Barrel, Special Reserve, Red), Weller (Specia
 ## How It Works
 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
-2. **Inventory Scanning** — Scans all stores concurrently (limit 4) using 11 broad search queries that cover all 25 bottles. Prefers structured JSON extraction over CSS selectors for reliability.
+2. **Inventory Scanning** — Scans all stores concurrently (limit 4) using 12 broad search queries that cover all 40 bottles. Prefers structured JSON extraction over CSS selectors for reliability. Detects bot challenge pages and falls back to browser when fetch paths are blocked.
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
 4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@everyone` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 

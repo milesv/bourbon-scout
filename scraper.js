@@ -31,9 +31,9 @@ const STATE_FILE = new URL("./state.json", import.meta.url);
 // Each query should cover at least one TARGET_BOTTLE via matchesBottle.
 const SEARCH_QUERIES = [
   "weller bourbon",           // Weller SR/107/12/FP/SB/CYPB + William Larue Weller
-  "blantons bourbon",          // Blanton's Gold/SFTB/SR/Red
-  "pappy van winkle",          // Pappy 10/12/15/20/23
-  "eh taylor bourbon",         // E.H. Taylor Small Batch
+  "blantons bourbon",          // Blanton's Gold/SFTB/SR/Red/Green/Black
+  "van winkle",                // Pappy 10/12/15/20/23 + Family Reserve Rye 13
+  "eh taylor",                 // All Taylor: SmB/SiB/BP/Rye/Seasoned/4Grain/Amaranth/CuredOak/18yr
   "stagg bourbon",             // Stagg Jr + George T. Stagg
   "eagle rare 17",             // Eagle Rare 17 Year (BTAC)
   "sazerac rye 18",            // Sazerac Rye 18 Year (BTAC)
@@ -41,24 +41,35 @@ const SEARCH_QUERIES = [
   "elmer t lee",               // Elmer T. Lee
   "rock hill farms",           // Rock Hill Farms
   "king of kentucky bourbon",  // King of Kentucky
+  "old forester bourbon",      // Birthday, President's Choice, 150th Anniversary, King Ranch
 ];
 
 const TARGET_BOTTLES = [
   { name: "Blanton's Gold",             searchTerms: ["blanton's gold", "blantons gold"] },
-  { name: "Blanton's Straight from the Barrel", searchTerms: ["blanton's straight from the barrel", "blantons straight from the barrel", "blantons sftb"] },
+  { name: "Blanton's Straight from the Barrel", searchTerms: ["blanton's straight from the barrel", "blantons straight from the barrel", "blantons sftb", "blanton's sftb"] },
   { name: "Blanton's Special Reserve",  searchTerms: ["blanton's special reserve", "blantons special reserve"] },
   { name: "Blanton's Red",              searchTerms: ["blanton's red", "blantons red"] },
-  { name: "Weller Special Reserve",      searchTerms: ["weller special reserve"] },
+  { name: "Blanton's Green",            searchTerms: ["blanton's green", "blantons green"] },
+  { name: "Blanton's Black",            searchTerms: ["blanton's black", "blantons black"] },
+  { name: "Weller Special Reserve",      searchTerms: ["weller special reserve", "weller sr", "w.l. weller special"] },
   { name: "Weller Antique 107",          searchTerms: ["weller antique 107", "old weller antique"] },
-  { name: "Weller 12 Year",             searchTerms: ["weller 12", "w.l. weller 12"] },
+  { name: "Weller 12 Year",             searchTerms: ["weller 12", "w.l. weller 12", "weller 12 year"] },
   { name: "Weller Full Proof",          searchTerms: ["weller full proof"] },
   { name: "Weller Single Barrel",       searchTerms: ["weller single barrel"] },
   { name: "Weller C.Y.P.B.",            searchTerms: ["weller cypb", "weller c.y.p.b", "craft your perfect bourbon"] },
-  { name: "E.H. Taylor Small Batch",    searchTerms: ["eh taylor small batch", "e.h. taylor"] },
+  { name: "E.H. Taylor Small Batch",    searchTerms: ["eh taylor small batch", "e.h. taylor small batch", "colonel e.h. taylor small batch", "col. e.h. taylor small batch", "col e.h. taylor small batch"] },
+  { name: "E.H. Taylor Single Barrel",  searchTerms: ["eh taylor single barrel", "e.h. taylor single barrel", "col. e.h. taylor single barrel", "colonel e.h. taylor single barrel"] },
+  { name: "E.H. Taylor Barrel Proof",   searchTerms: ["eh taylor barrel proof", "e.h. taylor barrel proof", "col. e.h. taylor barrel proof"] },
+  { name: "E.H. Taylor Straight Rye",   searchTerms: ["eh taylor rye", "e.h. taylor rye", "e.h. taylor straight rye", "col. e.h. taylor straight rye"] },
+  { name: "E.H. Taylor Seasoned Wood",  searchTerms: ["eh taylor seasoned wood", "e.h. taylor seasoned wood"] },
+  { name: "E.H. Taylor Four Grain",     searchTerms: ["eh taylor four grain", "e.h. taylor four grain"] },
+  { name: "E.H. Taylor Amaranth",       searchTerms: ["eh taylor amaranth", "e.h. taylor amaranth"] },
+  { name: "E.H. Taylor Cured Oak",      searchTerms: ["eh taylor cured oak", "e.h. taylor cured oak"] },
+  { name: "E.H. Taylor 18 Year Marriage", searchTerms: ["eh taylor 18 year", "e.h. taylor 18 year", "eh taylor 18 year marriage", "e.h. taylor 18 year marriage"] },
   { name: "Stagg Jr",                   searchTerms: ["stagg jr", "stagg junior"] },
-  { name: "George T. Stagg",            searchTerms: ["george t stagg"] },
+  { name: "George T. Stagg",            searchTerms: ["george t. stagg", "george t stagg"] },
   { name: "Eagle Rare 17 Year",         searchTerms: ["eagle rare 17"] },
-  { name: "William Larue Weller",       searchTerms: ["william larue weller", "wm larue weller"] },
+  { name: "William Larue Weller",       searchTerms: ["william larue weller", "wm larue weller", "william l weller", "w.l. weller btac", "larue weller"] },
   { name: "Thomas H. Handy",            searchTerms: ["thomas h. handy", "thomas handy sazerac", "thomas h handy"] },
   { name: "Sazerac Rye 18 Year",        searchTerms: ["sazerac rye 18", "sazerac 18"] },
   { name: "Pappy Van Winkle 10 Year",   searchTerms: ["pappy van winkle 10", "old rip van winkle 10"] },
@@ -66,9 +77,14 @@ const TARGET_BOTTLES = [
   { name: "Pappy Van Winkle 15 Year",   searchTerms: ["pappy van winkle 15"] },
   { name: "Pappy Van Winkle 20 Year",   searchTerms: ["pappy van winkle 20"] },
   { name: "Pappy Van Winkle 23 Year",   searchTerms: ["pappy van winkle 23"] },
-  { name: "Elmer T. Lee",               searchTerms: ["elmer t lee"] },
+  { name: "Van Winkle Family Reserve Rye", searchTerms: ["van winkle family reserve rye", "van winkle rye 13"] },
+  { name: "Elmer T. Lee",               searchTerms: ["elmer t. lee", "elmer t lee"] },
   { name: "Rock Hill Farms",            searchTerms: ["rock hill farms"] },
   { name: "King of Kentucky",           searchTerms: ["king of kentucky"] },
+  { name: "Old Forester Birthday Bourbon", searchTerms: ["old forester birthday"] },
+  { name: "Old Forester President's Choice", searchTerms: ["old forester president's choice", "old forester presidents choice", "president's choice bourbon"] },
+  { name: "Old Forester 150th Anniversary", searchTerms: ["old forester 150th", "old forester 150"] },
+  { name: "Old Forester King Ranch",    searchTerms: ["old forester king ranch"] },
 ];
 
 // ─── State Management ────────────────────────────────────────────────────────
@@ -146,6 +162,7 @@ async function postDiscordWebhook(payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(10000),
     });
     if (res.status === 429) {
       const body = await res.json().catch(() => ({}));
@@ -398,7 +415,11 @@ function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, tot
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Sleep with random jitter (±30%) to avoid anti-bot timing fingerprinting
+const sleep = (ms) => {
+  const jitter = ms * 0.3 * (Math.random() * 2 - 1);
+  return new Promise((r) => setTimeout(r, Math.max(0, Math.round(ms + jitter))));
+};
 
 // Parse bottle size from product title text (e.g., "750ml", "1.75L", "750 ML")
 function parseSize(text) {
@@ -410,37 +431,69 @@ function parseSize(text) {
   return `${num}L`;
 }
 
+// Normalize unicode curly quotes/apostrophes to ASCII before matching.
+// Retailers inconsistently use \u2018/\u2019 ("Blanton\u2019s") vs ASCII ("Blanton's").
+function normalizeText(text) {
+  return text.toLowerCase().replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'").replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"');
+}
+
 function matchesBottle(text, bottle) {
-  const lower = text.toLowerCase();
+  const lower = normalizeText(text);
   return bottle.searchTerms.some((term) => lower.includes(term));
 }
 
-// Dedup found bottles by name (keeps first occurrence with its url/price)
+// Dedup found bottles by name, preferring the entry with the lowest price.
+// Falls back to first occurrence if prices are equal or unparseable.
 function dedupFound(found) {
-  const seen = new Set();
-  return found.filter((f) => {
-    if (seen.has(f.name)) return false;
-    seen.add(f.name);
-    return true;
-  });
+  const byName = new Map();
+  for (const f of found) {
+    const prev = byName.get(f.name);
+    if (!prev) { byName.set(f.name, f); continue; }
+    const prevPrice = parsePrice(prev.price);
+    const currPrice = parsePrice(f.price);
+    if (currPrice > 0 && (prevPrice === 0 || currPrice < prevPrice)) {
+      byName.set(f.name, f);
+    }
+  }
+  return Array.from(byName.values());
+}
+
+// Extract numeric price from strings like "$29.99", "29.99", "$1,299.99"
+function parsePrice(str) {
+  if (!str) return 0;
+  const match = str.replace(/,/g, "").match(/([\d.]+)/);
+  return match ? parseFloat(match[1]) : 0;
 }
 
 // Run async tasks with a concurrency limit
 async function runWithConcurrency(tasks, limit) {
   const executing = new Set();
   for (const task of tasks) {
-    const p = task().finally(() => executing.delete(p));
+    // Structural error isolation: a failing task never aborts remaining tasks,
+    // even if the task wrapper forgets its own try/catch.
+    const p = Promise.resolve().then(task).catch(() => {}).finally(() => executing.delete(p));
     executing.add(p);
     if (executing.size >= limit) await Promise.race(executing);
   }
   await Promise.all(executing);
 }
 
-// Headers for fetch-based scrapers (mimics a real browser)
+// Headers for fetch-based scrapers (mimics a real Chrome 136 browser navigation).
+// Must include Sec-CH-UA Client Hints alongside Sec-Fetch-* — omitting them creates
+// a fingerprint that matches no real browser and trips bot detectors.
 const FETCH_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Referer": "https://www.google.com/",
+  "Sec-CH-UA": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+  "Sec-CH-UA-Mobile": "?0",
+  "Sec-CH-UA-Platform": '"Windows"',
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "cross-site",
+  "Upgrade-Insecure-Requests": "1",
 };
 
 // ─── Browser Management ──────────────────────────────────────────────────────
@@ -461,8 +514,16 @@ async function closeBrowser() {
 
 async function newPage() {
   if (!browser) await launchBrowser();
+  // Randomize viewport to reduce browser fingerprinting
+  const viewports = [
+    { width: 1366, height: 768 },
+    { width: 1440, height: 900 },
+    { width: 1280, height: 720 },
+    { width: 1536, height: 864 },
+  ];
+  const viewport = viewports[Math.floor(Math.random() * viewports.length)];
   const context = await browser.newContext({
-    viewport: { width: 1366, height: 768 },
+    viewport,
     locale: "en-US",
   });
   return context.newPage();
@@ -470,6 +531,16 @@ async function newPage() {
 
 // ─── Retailer Scrapers ───────────────────────────────────────────────────────
 // Each scraper accepts a store object and returns an array of { name, url, price }.
+
+// Detect bot challenge/block pages that return HTTP 200 but no real content.
+// Returns true if the page appears to be a challenge, access denied, or CAPTCHA page.
+async function isBlockedPage(page) {
+  const title = await page.title().catch(() => "");
+  const lower = title.toLowerCase();
+  return lower.includes("access denied") || lower.includes("robot") ||
+    lower.includes("captcha") || lower.includes("challenge") ||
+    lower.includes("blocked") || lower.includes("verify");
+}
 
 // Costco search has no store filter — results are identical across warehouses.
 // Scrape once and the poll loop copies results to all stores.
@@ -481,7 +552,11 @@ async function scrapeCostcoOnce(page) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
       // Wait for product tiles or timeout (page may have no results)
-      await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 8000 }).catch(() => {});
+      const tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 8000 }).then(() => true).catch(() => false);
+      if (!tilesLoaded && await isBlockedPage(page)) {
+        console.warn(`[costco] Bot detection page for query "${query}" — skipping`);
+        continue;
+      }
 
       const products = await page.$$eval(
         '[data-testid^="ProductTile_"]',
@@ -527,7 +602,17 @@ async function scrapeTotalWineStore(store, page) {
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(2000);
+      // Wait for INITIAL_STATE to be populated by JS hydration (more reliable than fixed 2s wait).
+      // Falls back to CSS selectors if hydration doesn't complete within timeout.
+      await page.waitForFunction(
+        () => !!window.INITIAL_STATE?.search?.results,
+        { timeout: 10000 }
+      ).catch(() => {});
+
+      if (await isBlockedPage(page)) {
+        console.warn(`[totalwine:${store.storeId}] Bot detection page for query "${query}" — skipping`);
+        continue;
+      }
 
       // Extract structured product data from INITIAL_STATE (SSR React state)
       const products = await page.evaluate(
@@ -535,8 +620,9 @@ async function scrapeTotalWineStore(store, page) {
         () => {
           try {
             const state = window.INITIAL_STATE;
-            if (!state?.search?.results?.products) return [];
-            return state.search.results.products.map((p) => ({
+            const products = state?.search?.results?.products;
+            if (!Array.isArray(products)) return [];
+            return products.map((p) => ({
               name: p.name || "",
               url: p.productUrl || "",
               price: p.price?.[0]?.price ? `$${p.price[0].price}` : "",
@@ -624,24 +710,35 @@ function matchWalmartNextData(nextData) {
 }
 
 // Try fetching Walmart search HTML directly and parsing __NEXT_DATA__ (no browser needed).
+// Continues on per-query failures; only falls back to browser if majority of queries fail.
 // Returns { name, url, price }[] on success, null if blocked/unavailable.
 async function scrapeWalmartViaFetch(store) {
   const found = [];
+  let failures = 0;
+  let validPages = 0;
   for (const query of SEARCH_QUERIES) {
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&cat_id=976759&store_id=${store.storeId}`;
     try {
-      const res = await fetch(url, { headers: FETCH_HEADERS, timeout: 15000 });
-      if (!res.ok) return null;
+      const res = await fetch(url, { headers: FETCH_HEADERS, signal: AbortSignal.timeout(15000) });
+      if (!res.ok) { failures++; if (failures > 3) return null; continue; }
       const html = await res.text();
       const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-      if (!match) return null;
-      found.push(...matchWalmartNextData(JSON.parse(match[1])));
+      if (!match) { failures++; if (failures > 3) return null; continue; }
+      const nextData = JSON.parse(match[1]);
+      // Verify this is a real search results page, not a challenge/login/geo-block page
+      // that happens to contain __NEXT_DATA__ but with empty or missing searchResult
+      const hasSearchResult = nextData?.props?.pageProps?.initialData?.searchResult != null;
+      if (!hasSearchResult) { failures++; if (failures > 3) return null; continue; }
+      validPages++;
+      found.push(...matchWalmartNextData(nextData));
     } catch {
-      return null;
+      failures++; if (failures > 3) return null; continue;
     }
     await sleep(500);
   }
-  return dedupFound(found);
+  // Fall back to browser if no queries returned a valid search results page
+  if (validPages === 0) return null;
+  return failures > 0 && found.length === 0 ? null : dedupFound(found);
 }
 
 // Browser-based Walmart scraper (fallback). Accepts a shared page.
@@ -652,6 +749,11 @@ async function scrapeWalmartViaBrowser(store, page) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(2000);
+
+      if (await isBlockedPage(page)) {
+        console.warn(`[walmart:${store.storeId}] Bot detection page for query "${query}" — skipping`);
+        continue;
+      }
 
       const nextData = await page.evaluate(
         /* v8 ignore start -- browser-only DOM callback */
@@ -697,12 +799,16 @@ async function scrapeWalmartViaBrowser(store, page) {
 }
 
 async function scrapeWalmartStore(store) {
-  const fetchResult = await scrapeWalmartViaFetch(store);
-  if (fetchResult !== null) {
-    console.log(`[walmart:${store.storeId}] Used fast fetch mode`);
-    return fetchResult;
+  // Skip fetch attempt on CI — datacenter IPs are always blocked by Walmart
+  const isCI = process.env.CI === "true" || process.env.GITHUB_ACTIONS === "true";
+  if (!isCI) {
+    const fetchResult = await scrapeWalmartViaFetch(store);
+    if (fetchResult !== null) {
+      console.log(`[walmart:${store.storeId}] Used fast fetch mode`);
+      return fetchResult;
+    }
   }
-  console.log(`[walmart:${store.storeId}] Fetch blocked, using browser`);
+  console.log(`[walmart:${store.storeId}] ${isCI ? "CI mode, " : "Fetch blocked, "}using browser`);
   const page = await newPage();
   try {
     return await scrapeWalmartViaBrowser(store, page);
@@ -713,21 +819,30 @@ async function scrapeWalmartStore(store) {
 
 // ─── API-based scrapers ─────────────────────────────────────────────────────
 
-// Fetch Kroger OAuth token once, shared across all store scrapers
+// Fetch Kroger OAuth token once, shared across all store scrapers.
+// Uses a singleton promise so concurrent tasks don't race for the same token.
 let krogerToken = null;
+let krogerTokenPromise = null;
 async function getKrogerToken() {
   if (krogerToken) return krogerToken;
   /* v8 ignore next -- env guard */
   if (!KROGER_CLIENT_ID || !KROGER_CLIENT_SECRET) return null;
-  const authHeader = Buffer.from(`${KROGER_CLIENT_ID}:${KROGER_CLIENT_SECRET}`).toString("base64");
-  const res = await fetch("https://api.kroger.com/v1/connect/oauth2/token", {
-    method: "POST",
-    headers: { Authorization: `Basic ${authHeader}`, "Content-Type": "application/x-www-form-urlencoded" },
-    body: "grant_type=client_credentials&scope=product.compact",
-  });
-  if (!res.ok) throw new Error(`OAuth HTTP ${res.status}`);
-  krogerToken = (await res.json()).access_token;
-  return krogerToken;
+  // Singleton: if another task is already fetching, wait for the same promise
+  if (!krogerTokenPromise) {
+    krogerTokenPromise = (async () => {
+      const authHeader = Buffer.from(`${KROGER_CLIENT_ID}:${KROGER_CLIENT_SECRET}`).toString("base64");
+      const res = await fetch("https://api.kroger.com/v1/connect/oauth2/token", {
+        method: "POST",
+        headers: { Authorization: `Basic ${authHeader}`, "Content-Type": "application/x-www-form-urlencoded" },
+        body: "grant_type=client_credentials&scope=product.compact",
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) throw new Error(`OAuth HTTP ${res.status}`);
+      krogerToken = (await res.json()).access_token;
+      return krogerToken;
+    })().finally(() => { krogerTokenPromise = null; });
+  }
+  return krogerTokenPromise;
 }
 
 async function scrapeKrogerStore(store) {
@@ -748,11 +863,14 @@ async function scrapeKrogerStore(store) {
   // Use broad SEARCH_QUERIES (11) instead of per-bottle (25) to cut API calls ~60%
   const found = [];
   for (const query of SEARCH_QUERIES) {
-    const url = `https://api.kroger.com/v1/products?filter.term=${encodeURIComponent(query)}&filter.locationId=${store.storeId}&filter.limit=20`;
+    const url = `https://api.kroger.com/v1/products?filter.term=${encodeURIComponent(query)}&filter.locationId=${store.storeId}&filter.limit=50`;
     try {
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(15000),
       });
+      // Clear cached token on 401 so next call re-authenticates
+      if (res.status === 401) { krogerToken = null; throw new Error("Token expired (401)"); }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       for (const product of data.data || []) {
@@ -765,17 +883,21 @@ async function scrapeKrogerStore(store) {
         if (!inStock) continue;
         for (const bottle of TARGET_BOTTLES) {
           if (matchesBottle(title, bottle)) {
-            const item0 = product.items?.[0];
-            const price = item0?.price?.regular;
+            // Prefer the item variant that is actually in-store, not blindly items[0]
+            // (which may be a different size at a different price)
+            const inStoreItem = product.items?.find(
+              (i) => i.fulfillment?.inStore === true && i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
+            ) || product.items?.[0];
+            const price = inStoreItem?.price?.regular;
             const fulfillmentParts = [];
-            if (item0?.fulfillment?.inStore) fulfillmentParts.push("In-store");
-            if (item0?.fulfillment?.shipToHome) fulfillmentParts.push("Ship to home");
+            if (inStoreItem?.fulfillment?.inStore) fulfillmentParts.push("In-store");
+            if (inStoreItem?.fulfillment?.shipToHome) fulfillmentParts.push("Ship to home");
             found.push({
               name: bottle.name,
               url: product.productId ? `https://www.kroger.com/p/${product.productId}` : "",
               price: price != null ? `$${price.toFixed(2)}` : "",
               sku: product.productId || "",
-              size: item0?.size || "",
+              size: inStoreItem?.size || "",
               fulfillment: fulfillmentParts.join(", "),
             });
           }
@@ -801,20 +923,21 @@ async function scrapeSafewayStore(store) {
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
 
   for (const query of SEARCH_QUERIES) {
-    const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=20&start=0&storeid=${store.storeId}`;
+    const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
     try {
       const res = await fetch(url, {
         headers: {
           "Ocp-Apim-Subscription-Key": SAFEWAY_API_KEY,
           Accept: "application/json",
         },
+        signal: AbortSignal.timeout(15000),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const products = data?.primaryProducts?.response?.docs || [];
       for (const product of products) {
         const title = product.name || product.productTitle || "";
-        if (product.inStock === false) continue;
+        if (!product.inStock) continue;
         for (const bottle of TARGET_BOTTLES) {
           if (matchesBottle(title, bottle)) {
             const fulfillmentParts = [];
@@ -865,6 +988,7 @@ async function poll() {
     return;
   }
   polling = true;
+  try {
   const scanStart = Date.now();
   console.log(`[poll] Starting scan at ${new Date().toISOString()}`);
 
@@ -917,30 +1041,39 @@ async function poll() {
     if (retailer.scrapeOnce) {
       // Costco: scrape once, broadcast results to all stores
       tasks.push(async () => {
+        let page;
         try {
           console.log(`[poll] Checking ${retailer.name} (once for ${stores.length} stores)...`);
-          const page = await newPage();
+          page = await newPage();
           const inStock = await scrapeCostcoOnce(page);
-          await page.context().close();
+          // Per-store try/catch: one Discord failure shouldn't skip remaining stores
           for (const store of stores) {
-            await recordResult(retailer, store, inStock);
+            try {
+              await recordResult(retailer, store, inStock);
+            } catch (storeErr) {
+              console.error(`[poll] ${retailer.name} (${store.name}) recordResult failed: ${storeErr.message}`);
+            }
           }
         } catch (err) {
           console.error(`[poll] ${retailer.name} crashed: ${err.message}`);
+        } finally {
+          if (page) await page.context().close().catch(() => {});
         }
       });
     } else if (retailer.needsPage) {
       // Browser-based per-store scrapers: share one context per retailer
       for (const store of stores) {
         tasks.push(async () => {
+          let page;
           try {
             console.log(`[poll] Checking ${retailer.name} — ${store.name}...`);
-            const page = await newPage();
+            page = await newPage();
             const inStock = await retailer.scraper(store, page);
-            await page.context().close();
             await recordResult(retailer, store, inStock);
           } catch (err) {
             console.error(`[poll] ${retailer.name} (${store.name}) crashed: ${err.message}`);
+          } finally {
+            if (page) await page.context().close().catch(() => {});
           }
         });
       }
@@ -963,28 +1096,30 @@ async function poll() {
   // Run all stores concurrently (limit 4 to manage browser memory)
   await runWithConcurrency(tasks, 4);
 
-  await closeBrowser();
-  await saveState(state);
+  await closeBrowser().catch((err) => console.error(`[poll] closeBrowser failed: ${err.message}`));
+  await saveState(state).catch((err) => console.error(`[poll] saveState failed: ${err.message}`));
 
   // Quiet summary at end of every poll
   const durationSec = Math.round((Date.now() - scanStart) / 1000);
   const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores });
-  await sendDiscordAlert([summary]);
+  await sendDiscordAlert([summary]).catch((err) => console.error(`[poll] Summary send failed: ${err.message}`));
 
-  polling = false;
   console.log(`[poll] Scan complete — ${storesScanned} stores, ${totalNewFinds} new, ${totalStillInStock} still, ${totalGoneOOS} OOS, ${durationSec}s\n`);
+  } finally {
+    polling = false;
+  }
 }
 
 // ─── Exports (for testing) ────────────────────────────────────────────────────
 
 export {
   SEARCH_QUERIES, TARGET_BOTTLES, RETAILERS, FETCH_HEADERS,
-  parseSize, matchesBottle, dedupFound, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  launchBrowser, closeBrowser, newPage,
+  launchBrowser, closeBrowser, newPage, isBlockedPage,
   scrapeCostcoOnce, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
@@ -994,7 +1129,7 @@ export {
 // Test helpers for setting module-level state
 export function _setStoreCache(cache) { storeCache = cache; }
 export function _resetPolling() { polling = false; }
-export function _resetKrogerToken() { krogerToken = null; }
+export function _resetKrogerToken() { krogerToken = null; krogerTokenPromise = null; }
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 

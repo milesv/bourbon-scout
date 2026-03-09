@@ -1,6 +1,6 @@
 # Bourbon Scout
 
-Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 retailers for 25 rare/allocated bottles near a zip code, sends per-store Discord alerts with @everyone pings when bottles are found, plus a quiet summary after each scan.
+Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 retailers for 40 rare/allocated bottles near a zip code, sends per-store Discord alerts with @everyone pings when bottles are found, plus a quiet summary after each scan.
 
 ## Architecture
 
@@ -21,8 +21,13 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 reta
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
 - **Fetch-first with browser fallback** — Walmart tries a plain HTTP fetch + `__NEXT_DATA__` parse before spinning up a browser page. Falls back to Playwright if blocked.
 - **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Scraped once and broadcast to all stores.
-- **Broad search queries** — 11 queries cover all 25 bottles. API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
-- **Shared Kroger OAuth token** — Fetched once per poll, shared across all Kroger stores.
+- **Broad search queries** — 12 queries cover all 40 bottles. API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
+- **Shared Kroger OAuth token** — Fetched once per poll via singleton promise, shared across all Kroger stores. Clears cached token on 401 for automatic re-auth.
+- **Bot detection** — `isBlockedPage()` checks page title for challenge/CAPTCHA/access-denied indicators. Browser scrapers skip queries that hit bot detection instead of recording false "empty" results.
+- **Text normalization** — `normalizeText()` converts Unicode curly quotes/apostrophes to ASCII before matching, preventing silent misses when retailers use `\u2019` in product names.
+- **Fetch sanity checks** — Walmart fetch path validates `__NEXT_DATA__` contains a real `searchResult` structure before trusting results. Prevents challenge pages with valid JSON but no search data from being treated as "nothing in stock."
+- **AbortSignal timeouts** — All fetch calls (Discord 10s, Kroger/Safeway/Walmart 15s) use `AbortSignal.timeout()` to prevent hung requests from blocking concurrency slots.
+- **Error isolation** — `runWithConcurrency` wraps tasks in `.catch()` so one failing task never aborts remaining tasks. Costco broadcast loop has per-store try/catch. `saveState`/`closeBrowser`/summary send are all individually error-handled.
 - **Store discovery is separate from scraping** — `discover-stores.js` handles finding stores, `scraper.js` handles checking inventory
 - **State change tracking** — `computeChanges()` diffs previous and current scan results. `updateStoreState()` persists `firstSeen`, `lastSeen`, `scanCount` per bottle per store. Re-alerts every N scans via `REALERT_EVERY_N_SCANS`.
 - **Color-coded Discord embeds** — Green `@everyone` for new finds, orange for OOS losses, blue re-alerts, purple scan summary. Summary includes scanned store list (grouped by retailer) when nothing is found. 429 rate limit retry with `Retry-After` backoff. Embed descriptions truncated at 4096 chars.
@@ -48,14 +53,14 @@ All config is in `.env`:
 | Costco | Playwright | MUI `data-testid` DOM attrs | Akamai Bot Manager | Scrape-once (no store filter in search). Uses `/s?keyword=` URL. Next.js App Router — no `__NEXT_DATA__`. |
 | Total Wine | Playwright | `window.INITIAL_STATE` JSON | PerimeterX (HUMAN) | Per-store via `storeId` URL param. Bloomreach CMS + React. CSS selector fallback. |
 | Walmart | Fetch-first / Playwright | `__NEXT_DATA__` JSON | Akamai + PerimeterX | Filters `__typename=Product`, excludes marketplace sellers, includes fulfillment badge. `flatMap` across all `itemStacks`. |
-| Kroger | REST API | JSON | None (API key auth) | Shared OAuth token. Broad SEARCH_QUERIES (11) instead of per-bottle (25). |
-| Safeway | REST API | JSON | None (API key auth) | Broad SEARCH_QUERIES. Skips silently if API key not set. |
+| Kroger | REST API | JSON | None (API key auth) | Shared OAuth token (singleton promise). Broad SEARCH_QUERIES (12) instead of per-bottle (40). 401 auto-clears token. `filter.limit=50`. |
+| Safeway | REST API | JSON | None (API key auth) | Broad SEARCH_QUERIES. `rows=50`. Skips silently if API key not set. |
 
 BevMo is omitted from the poll loop — no Arizona locations exist.
 
-## Bottles (25)
+## Bottles (40)
 
-Blanton's (Gold, SFTB, Special Reserve, Red), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor Small Batch, Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Elmer T. Lee, Rock Hill Farms, King of Kentucky.
+Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch).
 
 ## Running
 
@@ -77,7 +82,8 @@ When a retailer's store locator stops finding stores (selectors broke):
 
 - Costco's search URL (`/s?keyword=`) returns identical results regardless of warehouse — that's why we scrape once and broadcast.
 - Total Wine uses PerimeterX (HUMAN Security) — plain HTTP fetch will always get a 403. Browser with stealth plugin is required.
-- Walmart fetch-first gets blocked on CI (datacenter IPs) but works locally. Browser fallback handles CI.
+- Walmart fetch-first gets blocked on CI (datacenter IPs) but works locally. Browser fallback handles CI. Fetch path skips entirely when `CI=true` or `GITHUB_ACTIONS=true`.
+- Walmart fetch validates `__NEXT_DATA__` has a `searchResult` key — challenge pages with valid JSON but empty search data correctly fall back to browser instead of reporting "nothing found."
 - Store locator CSS selectors in `discover-stores.js` break when retailer sites update their DOM. Kroger's API locator is the most stable.
 - Safeway's store locator is at `local.safeway.com/search.html` — NOT `safeway.com/stores/search` (that 404s).
 - Deleting `state.json` is safe but will send a full report for all stores on next poll.
