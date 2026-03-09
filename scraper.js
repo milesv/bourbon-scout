@@ -367,16 +367,31 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   return embeds;
 }
 
-function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec }) {
+function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [] }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
   desc += `🟢 ${totalNewFinds} new finds   🔵 ${totalStillInStock} still in stock\n`;
   desc += `🔴 ${totalGoneOOS} went OOS    💤 ${nothingCount} nothing`;
+
+  // When nothing found, show which stores were actually scanned
+  const noAllocations = totalNewFinds === 0 && totalStillInStock === 0 && totalGoneOOS === 0;
+  if (noAllocations && scannedStores.length > 0) {
+    desc += "\n\n**Stores scanned:**\n";
+    const byRetailer = new Map();
+    for (const s of scannedStores) {
+      if (!byRetailer.has(s.retailerName)) byRetailer.set(s.retailerName, []);
+      byRetailer.get(s.retailerName).push(s);
+    }
+    for (const [retailerName, stores] of byRetailer) {
+      const storeList = stores.map((s) => `#${s.storeId} ${s.storeName}`).join(", ");
+      desc += `> **${retailerName}** — ${storeList}\n`;
+    }
+  }
 
   return {
     title: "📊 Scan Complete",
     description: desc,
     color: COLORS.summary,
-    footer: { text: `Bourbon Scout 🥃 │ ${POLL_INTERVAL}` },
+    footer: { text: "Bourbon Scout 🥃" },
     timestamp: new Date().toISOString(),
   };
 }
@@ -860,6 +875,7 @@ async function poll() {
   let totalGoneOOS = 0;
   let nothingCount = 0;
   const retailersSeen = new Set();
+  const scannedStores = [];
 
   // Reset per-poll state
   krogerToken = null;
@@ -872,6 +888,7 @@ async function poll() {
     const changes = computeChanges(previousStore, inStock);
     updateStoreState(state, retailer.key, store.storeId, inStock);
     storesScanned++;
+    scannedStores.push({ retailerName: retailer.name, storeName: store.name, storeId: store.storeId });
 
     totalNewFinds += changes.newFinds.length;
     totalStillInStock += changes.stillInStock.length;
@@ -951,7 +968,7 @@ async function poll() {
 
   // Quiet summary at end of every poll
   const durationSec = Math.round((Date.now() - scanStart) / 1000);
-  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec });
+  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores });
   await sendDiscordAlert([summary]);
 
   polling = false;

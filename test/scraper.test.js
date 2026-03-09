@@ -562,6 +562,59 @@ describe("buildSummaryEmbed", () => {
     const embed = buildSummaryEmbed({ storesScanned: 5, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0, totalGoneOOS: 0, nothingCount: 5, durationSec: 60 });
     expect(embed.description).toContain("60s");
   });
+
+  it("footer shows brand without cron schedule", () => {
+    const embed = buildSummaryEmbed({ storesScanned: 5, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0, totalGoneOOS: 0, nothingCount: 5, durationSec: 60 });
+    expect(embed.footer.text).toBe("Bourbon Scout 🥃");
+    expect(embed.footer.text).not.toContain("*/15");
+  });
+
+  it("includes store list when nothing found", () => {
+    const scannedStores = [
+      { retailerName: "Costco", storeName: "Tempe", storeId: "736" },
+      { retailerName: "Costco", storeName: "Gilbert", storeId: "1042" },
+      { retailerName: "Walmart", storeName: "Tempe", storeId: "5765" },
+    ];
+    const embed = buildSummaryEmbed({
+      storesScanned: 3, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 3, durationSec: 60, scannedStores,
+    });
+    expect(embed.description).toContain("**Stores scanned:**");
+    expect(embed.description).toContain("**Costco**");
+    expect(embed.description).toContain("#736 Tempe");
+    expect(embed.description).toContain("#1042 Gilbert");
+    expect(embed.description).toContain("**Walmart**");
+    expect(embed.description).toContain("#5765 Tempe");
+  });
+
+  it("omits store list when allocations found", () => {
+    const scannedStores = [
+      { retailerName: "Costco", storeName: "Tempe", storeId: "736" },
+    ];
+    const embed = buildSummaryEmbed({
+      storesScanned: 1, retailersScanned: 1, totalNewFinds: 1, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 0, durationSec: 30, scannedStores,
+    });
+    expect(embed.description).not.toContain("Stores scanned");
+  });
+
+  it("groups stores by retailer in insertion order", () => {
+    const scannedStores = [
+      { retailerName: "Total Wine", storeName: "Mesa", storeId: "105" },
+      { retailerName: "Kroger", storeName: "Fry's Tempe", storeId: "0491" },
+      { retailerName: "Total Wine", storeName: "Tempe", storeId: "116" },
+    ];
+    const embed = buildSummaryEmbed({
+      storesScanned: 3, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 3, durationSec: 45, scannedStores,
+    });
+    // Total Wine should appear before Kroger (insertion order)
+    const twIdx = embed.description.indexOf("**Total Wine**");
+    const krIdx = embed.description.indexOf("**Kroger**");
+    expect(twIdx).toBeLessThan(krIdx);
+    // Both Total Wine stores on same line
+    expect(embed.description).toContain("#105 Mesa, #116 Tempe");
+  });
 });
 
 // ─── State Management ─────────────────────────────────────────────────────────
