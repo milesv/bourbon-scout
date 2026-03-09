@@ -1,5 +1,6 @@
 import "dotenv/config";
 import fetch from "node-fetch";
+import { HttpsProxyAgent } from "https-proxy-agent";
 import { chromium } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import cron from "node-cron";
@@ -22,7 +23,12 @@ const {
   SAFEWAY_API_KEY,
   POLL_INTERVAL = "*/15 * * * *",
   REALERT_EVERY_N_SCANS = "4",
+  PROXY_URL,
 } = process.env;
+
+// Residential proxy agent for fetch-based scrapers (Walmart fetch path, Kroger, Safeway).
+// Only created when PROXY_URL is set. Discord webhook calls intentionally skip the proxy.
+const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
 
 const STATE_FILE = new URL("./state.json", import.meta.url);
 
@@ -421,6 +427,17 @@ const sleep = (ms) => {
   return new Promise((r) => setTimeout(r, Math.max(0, Math.round(ms + jitter))));
 };
 
+// Fisher-Yates shuffle — randomize query order each scrape to avoid
+// predictable access patterns that anti-bot ML models flag.
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 // Parse bottle size from product title text (e.g., "750ml", "1.75L", "750 ML")
 function parseSize(text) {
   if (!text) return "";
@@ -501,7 +518,19 @@ const FETCH_HEADERS = {
 let browser = null;
 
 async function launchBrowser() {
-  browser = await chromium.launch({ headless: true });
+  const launchOpts = {
+    headless: true,
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--disable-dev-shm-usage",
+      "--no-first-run",
+      "--disable-extensions",
+      "--disable-component-update",
+    ],
+    ignoreDefaultArgs: ["--enable-automation"],
+  };
+  if (PROXY_URL) launchOpts.proxy = { server: PROXY_URL };
+  browser = await chromium.launch(launchOpts);
   return browser;
 }
 
@@ -525,6 +554,12 @@ async function newPage() {
   const context = await browser.newContext({
     viewport,
     locale: "en-US",
+    userAgent: FETCH_HEADERS["User-Agent"],
+    extraHTTPHeaders: {
+      "Sec-CH-UA": FETCH_HEADERS["Sec-CH-UA"],
+      "Sec-CH-UA-Mobile": FETCH_HEADERS["Sec-CH-UA-Mobile"],
+      "Sec-CH-UA-Platform": FETCH_HEADERS["Sec-CH-UA-Platform"],
+    },
   });
   return context.newPage();
 }
@@ -547,7 +582,7 @@ async function isBlockedPage(page) {
 // Uses stable MUI data-testid attributes instead of fragile CSS classes.
 async function scrapeCostcoOnce(page) {
   const found = [];
-  for (const query of SEARCH_QUERIES) {
+  for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -598,7 +633,7 @@ async function scrapeCostcoOnce(page) {
 async function scrapeTotalWineStore(store, page) {
   const found = [];
   // Use storeId URL param (more reliable than cookie)
-  for (const query of SEARCH_QUERIES) {
+  for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -716,10 +751,12 @@ async function scrapeWalmartViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  for (const query of SEARCH_QUERIES) {
+  for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&cat_id=976759&store_id=${store.storeId}`;
     try {
-      const res = await fetch(url, { headers: FETCH_HEADERS, signal: AbortSignal.timeout(15000) });
+      const fetchOpts = { headers: FETCH_HEADERS, signal: AbortSignal.timeout(15000) };
+      if (proxyAgent) fetchOpts.agent = proxyAgent;
+      const res = await fetch(url, fetchOpts);
       if (!res.ok) { failures++; if (failures > 3) return null; continue; }
       const html = await res.text();
       const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
@@ -744,7 +781,7 @@ async function scrapeWalmartViaFetch(store) {
 // Browser-based Walmart scraper (fallback). Accepts a shared page.
 async function scrapeWalmartViaBrowser(store, page) {
   const found = [];
-  for (const query of SEARCH_QUERIES) {
+  for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&cat_id=976759&store_id=${store.storeId}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -799,16 +836,16 @@ async function scrapeWalmartViaBrowser(store, page) {
 }
 
 async function scrapeWalmartStore(store) {
-  // Skip fetch attempt on CI — datacenter IPs are always blocked by Walmart
+  // Skip fetch attempt on CI unless a proxy is configured (datacenter IPs are blocked)
   const isCI = process.env.CI === "true" || process.env.GITHUB_ACTIONS === "true";
-  if (!isCI) {
+  if (!isCI || proxyAgent) {
     const fetchResult = await scrapeWalmartViaFetch(store);
     if (fetchResult !== null) {
-      console.log(`[walmart:${store.storeId}] Used fast fetch mode`);
+      console.log(`[walmart:${store.storeId}] Used fast fetch mode${proxyAgent ? " (proxied)" : ""}`);
       return fetchResult;
     }
   }
-  console.log(`[walmart:${store.storeId}] ${isCI ? "CI mode, " : "Fetch blocked, "}using browser`);
+  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser`);
   const page = await newPage();
   try {
     return await scrapeWalmartViaBrowser(store, page);
@@ -831,12 +868,14 @@ async function getKrogerToken() {
   if (!krogerTokenPromise) {
     krogerTokenPromise = (async () => {
       const authHeader = Buffer.from(`${KROGER_CLIENT_ID}:${KROGER_CLIENT_SECRET}`).toString("base64");
-      const res = await fetch("https://api.kroger.com/v1/connect/oauth2/token", {
+      const tokenOpts = {
         method: "POST",
         headers: { Authorization: `Basic ${authHeader}`, "Content-Type": "application/x-www-form-urlencoded" },
         body: "grant_type=client_credentials&scope=product.compact",
         signal: AbortSignal.timeout(15000),
-      });
+      };
+      if (proxyAgent) tokenOpts.agent = proxyAgent;
+      const res = await fetch("https://api.kroger.com/v1/connect/oauth2/token", tokenOpts);
       if (!res.ok) throw new Error(`OAuth HTTP ${res.status}`);
       krogerToken = (await res.json()).access_token;
       return krogerToken;
@@ -860,15 +899,17 @@ async function scrapeKrogerStore(store) {
     return [];
   }
 
-  // Use broad SEARCH_QUERIES (11) instead of per-bottle (25) to cut API calls ~60%
+  // Use broad SEARCH_QUERIES (12) instead of per-bottle (40) to cut API calls ~70%
   const found = [];
-  for (const query of SEARCH_QUERIES) {
+  for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://api.kroger.com/v1/products?filter.term=${encodeURIComponent(query)}&filter.locationId=${store.storeId}&filter.limit=50`;
     try {
-      const res = await fetch(url, {
+      const krogerOpts = {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
         signal: AbortSignal.timeout(15000),
-      });
+      };
+      if (proxyAgent) krogerOpts.agent = proxyAgent;
+      const res = await fetch(url, krogerOpts);
       // Clear cached token on 401 so next call re-authenticates
       if (res.status === 401) { krogerToken = null; throw new Error("Token expired (401)"); }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -918,20 +959,22 @@ async function scrapeSafewayStore(store) {
     return [];
   }
 
-  // Use broad SEARCH_QUERIES (11) instead of per-bottle (25) to cut API calls ~60%
+  // Use broad SEARCH_QUERIES (12) instead of per-bottle (40) to cut API calls ~70%
   const found = [];
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
 
-  for (const query of SEARCH_QUERIES) {
+  for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
     try {
-      const res = await fetch(url, {
+      const safewayOpts = {
         headers: {
           "Ocp-Apim-Subscription-Key": SAFEWAY_API_KEY,
           Accept: "application/json",
         },
         signal: AbortSignal.timeout(15000),
-      });
+      };
+      if (proxyAgent) safewayOpts.agent = proxyAgent;
+      const res = await fetch(url, safewayOpts);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const products = data?.primaryProducts?.response?.docs || [];
@@ -1114,7 +1157,7 @@ async function poll() {
 
 export {
   SEARCH_QUERIES, TARGET_BOTTLES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState,
@@ -1135,6 +1178,7 @@ export function _resetKrogerToken() { krogerToken = null; krogerTokenPromise = n
 
 async function main() {
   console.log("Bourbon Scout 🥃 starting up...");
+  if (proxyAgent) console.log(`[proxy] Routing scraper traffic through proxy`);
 
   try {
     storeCache = await discoverStores({

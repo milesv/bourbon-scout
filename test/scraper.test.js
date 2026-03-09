@@ -29,6 +29,7 @@ vi.mock("playwright-extra", () => ({
   chromium: { use: mocks.chromiumUse, launch: mocks.chromiumLaunch },
 }));
 vi.mock("puppeteer-extra-plugin-stealth", () => ({ default: vi.fn() }));
+vi.mock("https-proxy-agent", () => ({ HttpsProxyAgent: vi.fn() }));
 vi.mock("node-cron", () => ({ default: { schedule: mocks.cronSchedule } }));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
@@ -42,7 +43,7 @@ vi.mock("../lib/discover-stores.js", () => ({
 
 import {
   SEARCH_QUERIES, TARGET_BOTTLES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState,
@@ -1024,7 +1025,11 @@ describe("browser management", () => {
   it("launchBrowser calls chromium.launch", async () => {
     mocks.chromiumLaunch.mockResolvedValueOnce({ newContext: vi.fn(), close: vi.fn().mockResolvedValue(undefined) });
     await launchBrowser();
-    expect(mocks.chromiumLaunch).toHaveBeenCalledWith({ headless: true });
+    expect(mocks.chromiumLaunch).toHaveBeenCalledWith(expect.objectContaining({
+      headless: true,
+      args: expect.arrayContaining(["--disable-blink-features=AutomationControlled"]),
+      ignoreDefaultArgs: ["--enable-automation"],
+    }));
     await closeBrowser();
   });
 
@@ -1728,5 +1733,77 @@ describe("main", () => {
     exitSpy.mockRestore();
     consoleSpy.mockRestore();
     vi.spyOn(console, "log").mockRestore();
+  });
+});
+
+// ─── Shuffle ─────────────────────────────────────────────────────────────────
+
+describe("shuffle", () => {
+  it("returns a new array with same elements", () => {
+    const input = [1, 2, 3, 4, 5];
+    const result = shuffle(input);
+    expect(result).not.toBe(input); // new array, not mutated
+    expect(result).toHaveLength(input.length);
+    expect(result.sort()).toEqual(input.sort());
+  });
+
+  it("does not mutate the original array", () => {
+    const input = ["a", "b", "c", "d"];
+    const copy = [...input];
+    shuffle(input);
+    expect(input).toEqual(copy);
+  });
+
+  it("handles single-element array", () => {
+    expect(shuffle([42])).toEqual([42]);
+  });
+
+  it("handles empty array", () => {
+    expect(shuffle([])).toEqual([]);
+  });
+
+  it("produces different orderings over many runs", () => {
+    const input = [1, 2, 3, 4, 5, 6, 7, 8];
+    const orderings = new Set();
+    for (let i = 0; i < 50; i++) {
+      orderings.add(shuffle(input).join(","));
+    }
+    // With 8 elements and 50 runs, we should see at least 2 different orderings
+    expect(orderings.size).toBeGreaterThan(1);
+  });
+});
+
+// ─── Browser Hardening ───────────────────────────────────────────────────────
+
+describe("browser hardening", () => {
+  it("launchBrowser includes anti-detection Chrome args", async () => {
+    mocks.chromiumLaunch.mockResolvedValueOnce({ newContext: vi.fn(), close: vi.fn().mockResolvedValue(undefined) });
+    await launchBrowser();
+    const callArgs = mocks.chromiumLaunch.mock.calls[0][0];
+    expect(callArgs.args).toContain("--disable-blink-features=AutomationControlled");
+    expect(callArgs.args).toContain("--disable-dev-shm-usage");
+    expect(callArgs.args).toContain("--no-first-run");
+    expect(callArgs.ignoreDefaultArgs).toEqual(["--enable-automation"]);
+    await closeBrowser();
+  });
+
+  it("newPage sets userAgent and Sec-CH-UA headers on context", async () => {
+    const mockPage = { close: vi.fn() };
+    const mockContext = {
+      newPage: vi.fn().mockResolvedValue(mockPage),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const mockBrowser = {
+      newContext: vi.fn().mockResolvedValue(mockContext),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    mocks.chromiumLaunch.mockResolvedValueOnce(mockBrowser);
+    await newPage();
+    const contextOpts = mockBrowser.newContext.mock.calls[0][0];
+    expect(contextOpts.userAgent).toBe(FETCH_HEADERS["User-Agent"]);
+    expect(contextOpts.extraHTTPHeaders["Sec-CH-UA"]).toBe(FETCH_HEADERS["Sec-CH-UA"]);
+    expect(contextOpts.extraHTTPHeaders["Sec-CH-UA-Mobile"]).toBe(FETCH_HEADERS["Sec-CH-UA-Mobile"]);
+    expect(contextOpts.extraHTTPHeaders["Sec-CH-UA-Platform"]).toBe(FETCH_HEADERS["Sec-CH-UA-Platform"]);
+    await closeBrowser();
   });
 });

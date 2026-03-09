@@ -16,9 +16,11 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 reta
 ## Key Patterns
 
 - **ESM throughout** — `"type": "module"` in package.json, all files use `import`/`export`
-- **Playwright + Stealth** — `playwright-extra` with `puppeteer-extra-plugin-stealth` for bot detection bypass
+- **Playwright + Stealth + Hardened Launch** — `playwright-extra` with `puppeteer-extra-plugin-stealth`. Browser launches with `--disable-blink-features=AutomationControlled` and `ignoreDefaultArgs: ['--enable-automation']`. Browser contexts get Chrome 136 UA + `Sec-CH-UA` Client Hints matching `FETCH_HEADERS`.
 - **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 4)`. Browser and API scrapers are unified in the same task queue.
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
+- **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a residential proxy. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
+- **Query order randomization** — `shuffle(SEARCH_QUERIES)` via Fisher-Yates before every scraper loop to avoid predictable access patterns that anti-bot ML models flag.
 - **Fetch-first with browser fallback** — Walmart tries a plain HTTP fetch + `__NEXT_DATA__` parse before spinning up a browser page. Falls back to Playwright if blocked.
 - **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Scraped once and broadcast to all stores.
 - **Broad search queries** — 12 queries cover all 40 bottles. API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
@@ -44,6 +46,7 @@ All config is in `.env`:
 - `KROGER_CLIENT_ID`, `KROGER_CLIENT_SECRET` — Kroger API OAuth credentials
 - `SAFEWAY_API_KEY` — Safeway product search API key
 - `DISCORD_WEBHOOK_URL` — Discord webhook for alerts
+- `PROXY_URL` — Residential proxy URL (e.g., `http://user:pass@gate.example.com:12321`). Routes browser and fetch scraper traffic through proxy. Discord webhooks are NOT proxied.
 - `RUN_ONCE` — Set to `true` for single-run mode (used by GitHub Actions)
 
 ## Retailers
@@ -82,7 +85,7 @@ When a retailer's store locator stops finding stores (selectors broke):
 
 - Costco's search URL (`/s?keyword=`) returns identical results regardless of warehouse — that's why we scrape once and broadcast.
 - Total Wine uses PerimeterX (HUMAN Security) — plain HTTP fetch will always get a 403. Browser with stealth plugin is required.
-- Walmart fetch-first gets blocked on CI (datacenter IPs) but works locally. Browser fallback handles CI. Fetch path skips entirely when `CI=true` or `GITHUB_ACTIONS=true`.
+- Walmart fetch-first gets blocked on CI (datacenter IPs) but works locally. With `PROXY_URL` set, fetch-first works on CI too. Without proxy, fetch path skips on CI and falls back to browser.
 - Walmart fetch validates `__NEXT_DATA__` has a `searchResult` key — challenge pages with valid JSON but empty search data correctly fall back to browser instead of reporting "nothing found."
 - Store locator CSS selectors in `discover-stores.js` break when retailer sites update their DOM. Kroger's API locator is the most stable.
 - Safeway's store locator is at `local.safeway.com/search.html` — NOT `safeway.com/stores/search` (that 404s).
