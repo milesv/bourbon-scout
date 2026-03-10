@@ -65,6 +65,25 @@ BevMo is omitted from the poll loop — no Arizona locations exist.
 
 Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch).
 
+## Tests
+
+281 tests across 5 files using Vitest:
+
+| File | Tests | Focus |
+|------|-------|-------|
+| `test/scraper.test.js` | 205 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation |
+| `test/proxy.test.js` | 9 | Proxy agent routing (all scrapers + skips Discord). Separate file because `proxyAgent` is module-level (frozen at import). |
+| `test/discover-stores.test.js` | 52 | Store locator logic per retailer |
+| `test/geo.test.js` | 9 | Zip-to-coords and haversine distance |
+| `test/fallback-stores.test.js` | 6 | Static store data validation |
+
+Coverage: 98.9% statements, 94.6% branches, 92.5% functions, 99.4% lines.
+
+```sh
+npm test             # Run all tests
+npm test -- --coverage  # With coverage report
+```
+
 ## Running
 
 ```sh

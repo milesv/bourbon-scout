@@ -610,6 +610,17 @@ describe("formatStoreInfo", () => {
     const info = formatStoreInfo("costco", "Costco", { ...TEST_STORE, address: "" });
     expect(info.addressLine).toContain("Address unknown");
   });
+
+  it("uses fallback type label and SKU label for unknown retailer", () => {
+    const info = formatStoreInfo("unknown", "Unknown Retailer", TEST_STORE);
+    expect(info.storeLine).toContain("Store #");
+    expect(info.skuLabel).toBe("Item #");
+  });
+
+  it("handles missing storeId", () => {
+    const info = formatStoreInfo("costco", "Costco", { ...TEST_STORE, storeId: "" });
+    expect(info.storeLine).not.toContain("Item #");
+  });
 });
 
 describe("timeAgo", () => {
@@ -676,6 +687,15 @@ describe("truncateDescription", () => {
   it("handles exactly-at-limit descriptions", () => {
     const desc = "x".repeat(DISCORD_DESC_LIMIT);
     expect(truncateDescription(desc)).toBe(desc);
+  });
+
+  it("truncates before section when OOS header leaves no room", () => {
+    // Before section fills almost all of the limit, OOS header leaves no remaining room
+    const before = "x".repeat(DISCORD_DESC_LIMIT - 10);
+    const desc = `${before}\n\n❌ **OUT OF STOCK (5)**\nBottle1, Bottle2, Bottle3`;
+    const result = truncateDescription(desc);
+    expect(result.length).toBeLessThanOrEqual(DISCORD_DESC_LIMIT);
+    expect(result).toMatch(/\.\.\.$/);
   });
 });
 
@@ -758,6 +778,51 @@ describe("buildStoreEmbeds", () => {
     const changes = { newFinds: [bottle("Weller 12")], stillInStock: [], goneOOS: [] };
     const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
     expect(embeds[0].description).toContain("OUT OF STOCK");
+  });
+
+  it("handles goneOOS bottles without firstSeen or price", () => {
+    const changes = { newFinds: [], stillInStock: [], goneOOS: [{ name: "Stagg Jr", sku: "456" }] };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds).toHaveLength(1);
+    expect(embeds[0].description).toContain("Stagg Jr");
+    expect(embeds[0].description).not.toContain("was $");
+  });
+
+  it("handles stillInStock without firstSeen in new-find embed", () => {
+    const changes = {
+      newFinds: [bottle("Weller 12")],
+      stillInStock: [{ ...bottle("Stagg Jr"), scanCount: 4 }],
+      goneOOS: [],
+    };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds[0].description).toContain("STILL IN STOCK");
+    expect(embeds[0].description).toContain("Stagg Jr");
+    // No "since" text when firstSeen is missing
+    expect(embeds[0].description).not.toContain("since");
+  });
+
+  it("handles re-alert without firstSeen", () => {
+    const changes = {
+      newFinds: [],
+      stillInStock: [{ ...bottle("Weller 12"), scanCount: 4 }],
+      goneOOS: [],
+    };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds).toHaveLength(1);
+    expect(embeds[0].title).toContain("STILL AVAILABLE");
+    // Should still render without crash
+    expect(embeds[0].description).toContain("Weller 12");
+  });
+
+  it("handles stillInStock with missing price and sku in new-find embed", () => {
+    const changes = {
+      newFinds: [bottle("Weller 12")],
+      stillInStock: [{ name: "Stagg Jr", url: "", price: "", sku: "", size: "", fulfillment: "", firstSeen: new Date().toISOString(), scanCount: 4 }],
+      goneOOS: [],
+    };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds[0].description).toContain("N/A");
+    expect(embeds[0].description).toContain("?");
   });
 });
 
@@ -908,6 +973,14 @@ describe("computeChanges", () => {
     expect(stillInStock).toHaveLength(0);
     expect(goneOOS).toHaveLength(0);
   });
+
+  it("handles previous bottle without scanCount (legacy state)", () => {
+    const prev = { bottles: { "Weller 12": { url: "", price: "$29.99", sku: "123", firstSeen: "2026-03-01T00:00:00Z", lastSeen: "2026-03-07T00:00:00Z" } } };
+    const { stillInStock } = computeChanges(prev, [bottle("Weller 12")]);
+    expect(stillInStock).toHaveLength(1);
+    // scanCount should be 0 + 1 = 1 when previous had no scanCount
+    expect(stillInStock[0].scanCount).toBe(1);
+  });
 });
 
 describe("updateStoreState", () => {
@@ -928,6 +1001,15 @@ describe("updateStoreState", () => {
     expect(state.costco["736"].bottles["Weller 12"].firstSeen).toBe("2026-03-01T00:00:00Z");
     expect(state.costco["736"].bottles["Weller 12"].scanCount).toBe(6);
     expect(state.costco["736"].bottles["Weller 12"].price).toBe("$30.99");
+  });
+
+  it("handles products without sku, size, or fulfillment", () => {
+    const state = {};
+    updateStoreState(state, "costco", "736", [{ name: "Weller 12", url: "https://example.com", price: "$29.99" }]);
+    const bottle = state.costco["736"].bottles["Weller 12"];
+    expect(bottle.sku).toBe("");
+    expect(bottle.size).toBe("");
+    expect(bottle.fulfillment).toBe("");
   });
 
   it("removes bottles no longer in currentFound", () => {
@@ -1210,6 +1292,46 @@ describe("scrapeTotalWineStore", () => {
     const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE, mockPage));
     if (found.length > 0) expect(found[0].url).toContain("https://www.totalwine.com");
   });
+
+  it("preserves absolute URLs from INITIAL_STATE", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockImplementation(async (fn) => {
+      const saved = globalThis.window;
+      globalThis.window = {
+        INITIAL_STATE: {
+          search: { results: { products: [{
+            name: "Weller Special Reserve Bourbon",
+            productUrl: "https://www.totalwine.com/spirits/bourbon/weller-sr/p/12345",
+            price: [{ price: 29.99 }],
+            stockLevel: [{ stock: 5 }], transactional: true,
+          }] } },
+        },
+      };
+      try { return fn(); } finally { globalThis.window = saved; }
+    });
+    const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE, mockPage));
+    const wsr = found.find((f) => f.name === "Weller Special Reserve");
+    expect(wsr).toBeTruthy();
+    // Absolute URL should be used as-is, not double-prefixed
+    expect(wsr.url).toBe("https://www.totalwine.com/spirits/bourbon/weller-sr/p/12345");
+  });
+
+  it("skips bot detection pages and continues", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mockPage = createMockPage();
+    // First call triggers bot detection, subsequent calls return empty
+    let callCount = 0;
+    mockPage.title.mockImplementation(async () => {
+      callCount++;
+      if (callCount <= 1) return "Access Denied";
+      return "Total Wine Search";
+    });
+    mockPage.evaluate.mockResolvedValue([]);
+    const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE, mockPage));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Bot detection"));
+    expect(found).toEqual([]);
+    warnSpy.mockRestore();
+  });
 });
 
 // ─── Walmart Scrapers ─────────────────────────────────────────────────────────
@@ -1281,6 +1403,43 @@ describe("scrapeWalmartViaFetch", () => {
   });
 });
 
+describe("scrapeWalmartViaFetch edge cases", () => {
+  it("returns null when validPages is 0 but no failures exceed threshold", async () => {
+    // All queries return HTML without __NEXT_DATA__ — failures increment but don't exceed 3
+    // However, validPages remains 0
+    let callCount = 0;
+    mocks.fetch.mockImplementation(() => {
+      callCount++;
+      // Alternate between no __NEXT_DATA__ and no searchResult
+      if (callCount <= 3) return Promise.resolve({ ok: true, text: async () => "<html>No data</html>" });
+      const fakeData = { props: { pageProps: { initialData: {} } } };
+      return Promise.resolve({
+        ok: true,
+        text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(fakeData)}</script>`,
+      });
+    });
+    const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
+    expect(found).toBeNull();
+  });
+
+  it("returns null when failures > 0 and found is empty", async () => {
+    // Some queries fail, remainder succeed but find no matching bottles
+    let callCount = 0;
+    const emptyNextData = { props: { pageProps: { initialData: { searchResult: { itemStacks: [{ items: [{ __typename: "Product", name: "Random Non-Bourbon Item", sellerName: "Walmart.com", availabilityStatusV2: { value: "IN_STOCK" } }] }] } } } } };
+    mocks.fetch.mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) return Promise.resolve({ ok: false, status: 403 });
+      return Promise.resolve({
+        ok: true,
+        text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(emptyNextData)}</script>`,
+      });
+    });
+    const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
+    // failures > 0, found.length === 0 (no matching bottles) → null
+    expect(found).toBeNull();
+  });
+});
+
 describe("scrapeWalmartViaBrowser", () => {
   it("extracts products from __NEXT_DATA__ via page.evaluate", async () => {
     const mockPage = createMockPage();
@@ -1311,6 +1470,18 @@ describe("scrapeWalmartViaBrowser", () => {
     const found = await runWithFakeTimers(() => scrapeWalmartViaBrowser(TEST_STORE, mockPage));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
+  });
+
+  it("skips queries that hit bot detection", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mockPage = createMockPage();
+    mockPage.title.mockResolvedValue("Access Denied");
+    mockPage.evaluate.mockResolvedValue(null);
+    mockPage.$$eval.mockResolvedValue([]);
+    const found = await runWithFakeTimers(() => scrapeWalmartViaBrowser(TEST_STORE, mockPage));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Bot detection"));
+    expect(found).toEqual([]);
+    warnSpy.mockRestore();
   });
 });
 
@@ -1478,6 +1649,43 @@ describe("scrapeKrogerStore", () => {
     expect(weller.size).toBe("750ml");
   });
 
+  it("includes ship-to-home fulfillment when available", async () => {
+    _resetKrogerToken();
+    mocks.fetch
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{
+          description: "Weller Special Reserve Bourbon 750ml",
+          productId: "0001234",
+          items: [{ fulfillment: { inStore: true, shipToHome: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" }],
+        }] }),
+      });
+    const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
+    const weller = found.find((f) => f.name === "Weller Special Reserve");
+    expect(weller.fulfillment).toContain("In-store");
+    expect(weller.fulfillment).toContain("Ship to home");
+  });
+
+  it("handles products without price or size", async () => {
+    _resetKrogerToken();
+    mocks.fetch
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{
+          description: "Weller Special Reserve Bourbon",
+          productId: "0001234",
+          items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" } }],
+        }] }),
+      });
+    const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
+    const weller = found.find((f) => f.name === "Weller Special Reserve");
+    expect(weller).toBeTruthy();
+    expect(weller.price).toBe("");
+    expect(weller.size).toBe("");
+  });
+
   it("clears cached token on 401 and logs error", async () => {
     _resetKrogerToken();
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1541,6 +1749,41 @@ describe("scrapeSafewayStore", () => {
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
+  });
+
+  it("includes curbside and delivery fulfillment when eligible", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        primaryProducts: { response: { docs: [{
+          name: "Weller Special Reserve Bourbon 750ml", inStock: true,
+          url: "/product/weller-sr", price: 32.99,
+          curbsideEligible: true, deliveryEligible: true,
+          upc: "upc123", pid: "pid456",
+        }] } },
+      }),
+    });
+    const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
+    const weller = found.find((f) => f.name === "Weller Special Reserve");
+    expect(weller.fulfillment).toContain("Curbside");
+    expect(weller.fulfillment).toContain("Delivery");
+  });
+
+  it("handles products with productTitle fallback and missing url/price", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        primaryProducts: { response: { docs: [{
+          productTitle: "Weller Special Reserve Bourbon", inStock: true,
+        }] } },
+      }),
+    });
+    const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
+    const weller = found.find((f) => f.name === "Weller Special Reserve");
+    expect(weller).toBeTruthy();
+    expect(weller.url).toBe("");
+    expect(weller.price).toBe("");
+    expect(weller.sku).toBe("");
   });
 
   it("includes Ocp-Apim-Subscription-Key header", async () => {
@@ -1805,5 +2048,318 @@ describe("browser hardening", () => {
     expect(contextOpts.extraHTTPHeaders["Sec-CH-UA-Mobile"]).toBe(FETCH_HEADERS["Sec-CH-UA-Mobile"]);
     expect(contextOpts.extraHTTPHeaders["Sec-CH-UA-Platform"]).toBe(FETCH_HEADERS["Sec-CH-UA-Platform"]);
     await closeBrowser();
+  });
+
+  it("newPage selects from 4 viewport sizes", async () => {
+    const mockPage = { close: vi.fn() };
+    const mockContext = {
+      newPage: vi.fn().mockResolvedValue(mockPage),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const mockBrowser = {
+      newContext: vi.fn().mockResolvedValue(mockContext),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    mocks.chromiumLaunch.mockResolvedValue(mockBrowser);
+    await launchBrowser();
+    const viewportSet = new Set();
+    for (let i = 0; i < 30; i++) {
+      await newPage();
+      const { viewport } = mockBrowser.newContext.mock.calls.at(-1)[0];
+      viewportSet.add(`${viewport.width}x${viewport.height}`);
+    }
+    // With 30 draws from 4 options, expect at least 2 distinct viewports
+    expect(viewportSet.size).toBeGreaterThanOrEqual(2);
+    // All viewports must be valid known sizes
+    const validSizes = new Set(["1366x768", "1440x900", "1280x720", "1536x864"]);
+    for (const v of viewportSet) {
+      expect(validSizes.has(v)).toBe(true);
+    }
+    await closeBrowser();
+  });
+});
+
+// ─── buildOOSList ───────────────────────────────────────────────────────────
+
+describe("buildOOSList", () => {
+  it("returns formatted OOS list for bottles not in stock", () => {
+    const all = ["Blanton's Gold", "Weller Special Reserve", "Stagg Jr"];
+    const inStock = ["Weller Special Reserve"];
+    const result = buildOOSList(all, inStock);
+    expect(result).toContain("OUT OF STOCK (2)");
+    expect(result).toContain("Blanton's Gold");
+    expect(result).toContain("Stagg Jr");
+    expect(result).not.toContain("Weller Special Reserve");
+  });
+
+  it("returns empty string when everything is in stock", () => {
+    const all = ["Blanton's Gold", "Weller Special Reserve"];
+    expect(buildOOSList(all, all)).toBe("");
+  });
+
+  it("lists all bottles when none are in stock", () => {
+    const all = ["Blanton's Gold", "Stagg Jr"];
+    const result = buildOOSList(all, []);
+    expect(result).toContain("OUT OF STOCK (2)");
+    expect(result).toContain("Blanton's Gold, Stagg Jr");
+  });
+
+  it("returns empty string for empty inputs", () => {
+    expect(buildOOSList([], [])).toBe("");
+  });
+});
+
+// ─── Poll Error Isolation ────────────────────────────────────────────────────
+
+describe("poll error isolation", () => {
+  beforeEach(() => {
+    _resetPolling();
+    _resetKrogerToken();
+    mocks.readFile.mockResolvedValue("{}");
+    mocks.writeFile.mockResolvedValue(undefined);
+    mocks.fetch.mockResolvedValue({ ok: true });
+  });
+
+  it("Costco broadcast continues when one store recordResult fails", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { page: mockPage } = setupMockBrowser();
+    // scrapeCostcoOnce returns empty array (no bottles found)
+    mockPage.evaluate.mockResolvedValue([]);
+    mockPage.title.mockResolvedValue("Costco Search Results");
+    // Two stores — Discord will be called for summary; make it fail on first
+    const store1 = { ...TEST_STORE, storeId: "s1", name: "Store 1" };
+    const store2 = { ...TEST_STORE, storeId: "s2", name: "Store 2" };
+    _setStoreCache({
+      retailers: { costco: [store1, store2], totalwine: [], walmart: [], kroger: [], safeway: [] },
+    });
+    await runWithFakeTimers(() => poll());
+    // Both stores should still be in state (error isolation worked)
+    expect(mocks.writeFile).toHaveBeenCalled();
+    consoleSpy.mockRestore();
+    vi.spyOn(console, "log").mockRestore();
+  });
+
+  it("needsPage (Total Wine) per-store error isolates failures", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { page: mockPage, browser: mockBrowser, context: mockContext } = setupMockBrowser();
+    // Make newPage fail on the first call (simulates browser crash for store 1)
+    // then succeed for store 2
+    let contextCalls = 0;
+    mockBrowser.newContext.mockImplementation(() => {
+      contextCalls++;
+      if (contextCalls === 1) return Promise.reject(new Error("Context crash"));
+      return Promise.resolve(mockContext);
+    });
+    mockPage.evaluate.mockResolvedValue([]);
+    const store1 = { ...TEST_STORE, storeId: "tw1", name: "TW Store 1" };
+    const store2 = { ...TEST_STORE, storeId: "tw2", name: "TW Store 2" };
+    _setStoreCache({
+      retailers: { costco: [], totalwine: [store1, store2], walmart: [], kroger: [], safeway: [] },
+    });
+    await runWithFakeTimers(() => poll());
+    // Should have logged error for first store crash
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("crashed"));
+    // State should still be saved (poll completed despite error)
+    expect(mocks.writeFile).toHaveBeenCalled();
+    consoleSpy.mockRestore();
+    warnSpy.mockRestore();
+    vi.spyOn(console, "log").mockRestore();
+  });
+
+  it("API scraper error isolates failures across stores", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    setupMockBrowser();
+    // Kroger OAuth succeeds, first store's entire scraper throws (not per-query)
+    let storeCount = 0;
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url.includes("oauth2/token")) {
+        return Promise.resolve({ ok: true, json: async () => ({ access_token: "tok" }) });
+      }
+      if (typeof url === "string" && url.includes("api.kroger.com/v1/products")) {
+        storeCount++;
+        // Throw a non-recoverable error (e.g., TypeError) that escapes per-query catch
+        if (storeCount <= 12) throw new TypeError("Cannot read properties of undefined");
+        return Promise.resolve({ ok: true, json: async () => ({ data: [] }) });
+      }
+      // Discord / other
+      return Promise.resolve({ ok: true });
+    });
+    const store1 = { ...TEST_STORE, storeId: "kr1", name: "Kroger 1" };
+    const store2 = { ...TEST_STORE, storeId: "kr2", name: "Kroger 2" };
+    _setStoreCache({
+      retailers: { costco: [], totalwine: [], walmart: [], kroger: [store1, store2], safeway: [] },
+    });
+    await runWithFakeTimers(() => poll());
+    // State should still be saved (poll completed despite error)
+    expect(mocks.writeFile).toHaveBeenCalled();
+    consoleSpy.mockRestore();
+    vi.spyOn(console, "log").mockRestore();
+  });
+
+  it("scrapeOnce crash isolates per-query errors and continues poll", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { page: mockPage } = setupMockBrowser();
+    // scrapeCostcoOnce per-query errors — goto fails for every query
+    mockPage.goto.mockRejectedValue(new Error("Costco unreachable"));
+    _setStoreCache({
+      retailers: { costco: [TEST_STORE], totalwine: [], walmart: [], kroger: [], safeway: [] },
+    });
+    await runWithFakeTimers(() => poll());
+    // Per-query errors logged inside scrapeCostcoOnce
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Costco unreachable"));
+    // State should still be saved (poll completed despite errors)
+    expect(mocks.writeFile).toHaveBeenCalled();
+    consoleSpy.mockRestore();
+    vi.spyOn(console, "log").mockRestore();
+  });
+
+  it("scrapeOnce top-level crash logs 'crashed' and continues poll", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    // Make newPage() itself throw — this is outside the per-query try/catch
+    mocks.chromiumLaunch.mockResolvedValue({
+      newContext: vi.fn().mockRejectedValue(new Error("Browser OOM")),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+    _setStoreCache({
+      retailers: { costco: [TEST_STORE], totalwine: [], walmart: [], kroger: [], safeway: [] },
+    });
+    await runWithFakeTimers(() => poll());
+    // Top-level crash logged with "crashed"
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("crashed"));
+    // State should still be saved
+    expect(mocks.writeFile).toHaveBeenCalled();
+    consoleSpy.mockRestore();
+    vi.spyOn(console, "log").mockRestore();
+  });
+
+  it("poll new-find triggers sendUrgentAlert via recordResult", async () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    setupMockBrowser();
+    // Walmart finds a bottle → recordResult should send urgent alert
+    _setStoreCache({
+      retailers: { costco: [], totalwine: [], walmart: [TEST_STORE], kroger: [], safeway: [] },
+    });
+    const walmartNextData = { props: { pageProps: { initialData: { searchResult: { itemStacks: [{ items: [{
+      __typename: "Product", name: "Weller Special Reserve Bourbon Whiskey",
+      availabilityStatusV2: { value: "IN_STOCK" }, sellerName: "Walmart.com",
+      canonicalUrl: "/ip/123", priceInfo: { currentPrice: { priceString: "$29.99" } },
+    }] }] } } } } };
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url.includes("walmart.com")) {
+        return Promise.resolve({
+          ok: true,
+          text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(walmartNextData)}</script>`,
+        });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    await runWithFakeTimers(() => poll());
+    // Should log the green new-find message
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("New:"));
+    // Discord should have been called with @everyone for urgent alert
+    const discordCalls = mocks.fetch.mock.calls.filter(
+      (c) => typeof c[0] === "string" && c[0].includes("test-webhook")
+    );
+    const urgentCall = discordCalls.find(([, opts]) => {
+      const body = JSON.parse(opts.body);
+      return body.content && body.content.includes("@everyone");
+    });
+    expect(urgentCall).toBeTruthy();
+    consoleSpy.mockRestore();
+  });
+
+  it("poll gone-OOS triggers sendDiscordAlert via recordResult", async () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    setupMockBrowser();
+    // Set previous state with a bottle in stock
+    mocks.readFile.mockResolvedValue(JSON.stringify({
+      walmart: { "1234": { bottles: { "Weller Special Reserve": { url: "", price: "$30", firstSeen: "2025-01-01", lastSeen: "2025-01-01", scanCount: 1, sku: "123" } }, lastScanned: "2025-01-01" } },
+    }));
+    _setStoreCache({
+      retailers: { costco: [], totalwine: [], walmart: [TEST_STORE], kroger: [], safeway: [] },
+    });
+    // Walmart returns nothing → bottle goes OOS
+    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    const { page: mockPage } = setupMockBrowser();
+    mockPage.evaluate.mockResolvedValue(null);
+    mockPage.$$eval.mockResolvedValue([]);
+    await runWithFakeTimers(() => poll());
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("OOS"));
+    consoleSpy.mockRestore();
+  });
+
+  it("poll catches saveState failure", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    setupMockBrowser();
+    mocks.writeFile.mockRejectedValue(new Error("Disk full"));
+    _setStoreCache({
+      retailers: { costco: [], totalwine: [], walmart: [], kroger: [], safeway: [] },
+    });
+    await runWithFakeTimers(() => poll());
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("saveState failed"));
+    consoleSpy.mockRestore();
+    vi.spyOn(console, "log").mockRestore();
+  });
+
+  it("poll catches summary send failure", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    setupMockBrowser();
+    // Make Discord webhook fail only for the summary (last call)
+    let callCount = 0;
+    mocks.fetch.mockImplementation(() => {
+      callCount++;
+      // Summary is always the last Discord call; fail it
+      if (callCount > 0) return Promise.reject(new Error("Discord down"));
+      return Promise.resolve({ ok: true });
+    });
+    _setStoreCache({
+      retailers: { costco: [], totalwine: [], walmart: [], kroger: [], safeway: [] },
+    });
+    await runWithFakeTimers(() => poll());
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Summary send failed"));
+    consoleSpy.mockRestore();
+    vi.spyOn(console, "log").mockRestore();
+  });
+
+  it("Costco broadcast per-store recordResult failure is isolated", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { page: mockPage } = setupMockBrowser();
+    mockPage.evaluate.mockResolvedValue([]);
+    mockPage.title.mockResolvedValue("Costco");
+    // Two stores, make Discord webhook fail on first call with a throw
+    let discordCalls = 0;
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url.includes("test-webhook")) {
+        discordCalls++;
+        if (discordCalls === 1) return Promise.reject(new Error("Discord 500"));
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const store1 = { ...TEST_STORE, storeId: "c1", name: "Costco 1" };
+    const store2 = { ...TEST_STORE, storeId: "c2", name: "Costco 2" };
+    _setStoreCache({
+      retailers: { costco: [store1, store2], totalwine: [], walmart: [], kroger: [], safeway: [] },
+    });
+    // Give stores some previous state so they trigger OOS alerts (which call Discord)
+    mocks.readFile.mockResolvedValue(JSON.stringify({
+      costco: {
+        c1: { bottles: { "Weller Special Reserve": { url: "", price: "", firstSeen: "2025-01-01", lastSeen: "2025-01-01", scanCount: 1 } }, lastScanned: "2025-01-01" },
+        c2: { bottles: { "Weller Special Reserve": { url: "", price: "", firstSeen: "2025-01-01", lastSeen: "2025-01-01", scanCount: 1 } }, lastScanned: "2025-01-01" },
+      },
+    }));
+    await runWithFakeTimers(() => poll());
+    // recordResult failure should be logged but not crash the poll
+    expect(mocks.writeFile).toHaveBeenCalled();
+    consoleSpy.mockRestore();
+    vi.spyOn(console, "log").mockRestore();
   });
 });
