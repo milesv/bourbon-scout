@@ -6,6 +6,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import cron from "node-cron";
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import * as cheerio from "cheerio";
 import { discoverStores } from "./lib/discover-stores.js";
 
 // Stealth plugin makes Playwright bypass bot detection fingerprinting
@@ -438,6 +439,17 @@ function shuffle(arr) {
   return a;
 }
 
+// Fetch with one retry on transient network errors (timeouts, DNS failures).
+// HTTP error responses (4xx/5xx) are NOT retried — caller handles those.
+async function fetchRetry(url, opts) {
+  try {
+    return await fetch(url, opts);
+  } catch (err) {
+    await sleep(1000);
+    return await fetch(url, opts);
+  }
+}
+
 // Parse bottle size from product title text (e.g., "750ml", "1.75L", "750 ML")
 function parseSize(text) {
   if (!text) return "";
@@ -577,16 +589,71 @@ async function isBlockedPage(page) {
     lower.includes("blocked") || lower.includes("verify");
 }
 
+// ─── Costco: fetch-first with browser fallback ──────────────────────────────
 // Costco search has no store filter — results are identical across warehouses.
 // Scrape once and the poll loop copies results to all stores.
-// Uses stable MUI data-testid attributes instead of fragile CSS classes.
+
+// Extract matched bottles from Costco product tiles parsed by cheerio.
+function matchCostcoTiles($) {
+  const found = [];
+  $('[data-testid^="ProductTile_"]').each((_i, tile) => {
+    const $tile = $(tile);
+    const id = ($tile.attr("data-testid") || "").replace("ProductTile_", "");
+    const title = $tile.find(`[data-testid="Text_ProductTile_${id}_title"], h3`).first().text().trim();
+    const price = $tile.find(`[data-testid="Text_Price_${id}"], [data-testid^="Text_Price_"]`).first().text().trim();
+    const url = $tile.find('a[href*=".product."]').first().attr("href") || "";
+
+    for (const bottle of TARGET_BOTTLES) {
+      if (matchesBottle(title, bottle)) {
+        found.push({ name: bottle.name, url, price, sku: id || "", size: parseSize(title), fulfillment: "" });
+      }
+    }
+  });
+  return found;
+}
+
+// Try fetching Costco search HTML directly and parsing with cheerio (no browser needed).
+// Returns found[] on success, null if blocked by Akamai Bot Manager.
+async function scrapeCostcoViaFetch() {
+  if (!proxyAgent) return null; // fetch will always be blocked without proxy
+  const found = [];
+  let failures = 0;
+  let validPages = 0;
+  for (const query of shuffle(SEARCH_QUERIES)) {
+    const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
+    try {
+      const res = await fetchRetry(url, {
+        headers: FETCH_HEADERS,
+        signal: AbortSignal.timeout(15000),
+        agent: proxyAgent,
+      });
+      if (!res.ok) { failures++; if (failures > 3) return null; continue; }
+      const html = await res.text();
+      // Check for bot detection (challenge pages won't have product tiles)
+      if (html.includes("Access Denied") || html.includes("robot") || html.includes("captcha")) {
+        failures++; if (failures > 3) return null; continue;
+      }
+      const $ = cheerio.load(html);
+      const hasTiles = $('[data-testid^="ProductTile_"]').length > 0;
+      if (!hasTiles && failures === 0) { /* no results for this query is fine */ validPages++; continue; }
+      if (hasTiles) validPages++;
+      found.push(...matchCostcoTiles($));
+    } catch {
+      failures++; if (failures > 3) return null; continue;
+    }
+    await sleep(250);
+  }
+  if (validPages === 0) return null;
+  return failures > 0 && found.length === 0 ? null : dedupFound(found);
+}
+
+// Browser-based Costco scraper (fallback). Uses stable MUI data-testid attributes.
 async function scrapeCostcoOnce(page) {
   const found = [];
   for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      // Wait for product tiles or timeout (page may have no results)
       const tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 8000 }).then(() => true).catch(() => false);
       if (!tilesLoaded && await isBlockedPage(page)) {
         console.warn(`[costco] Bot detection page for query "${query}" — skipping`);
@@ -622,23 +689,104 @@ async function scrapeCostcoOnce(page) {
     } catch (err) {
       console.error(`[costco] Error searching "${query}": ${err.message}`);
     }
-    await sleep(1500);
+    await sleep(750);
   }
   return dedupFound(found);
 }
 
-// Total Wine uses PerimeterX — no fetch path possible. Browser required.
-// Product data is in window.INITIAL_STATE.search.results.products (structured JSON).
-// This is far more reliable than CSS selectors (won't break when class names change).
-async function scrapeTotalWineStore(store, page) {
+// Wrapper: try fetch+cheerio first, fall back to browser if blocked by Akamai.
+async function scrapeCostcoStore() {
+  const fetchResult = await scrapeCostcoViaFetch();
+  if (fetchResult !== null) {
+    console.log("[costco] Used fast fetch mode (proxied)");
+    return fetchResult;
+  }
+  console.log("[costco] Fetch blocked, using browser");
+  const page = await newPage();
+  try {
+    return await scrapeCostcoOnce(page);
+  } finally {
+    await page.context().close();
+  }
+}
+
+// ─── Total Wine: fetch-first with browser fallback ───────────────────────────
+
+// Extract matched bottles from Total Wine INITIAL_STATE JSON.
+// Shared by both fetch and browser paths.
+function matchTotalWineInitialState(state) {
   const found = [];
-  // Use storeId URL param (more reliable than cookie)
+  const products = state?.search?.results?.products;
+  if (!Array.isArray(products)) return found;
+
+  for (const p of products) {
+    const inStock = (p.stockLevel?.[0]?.stock > 0) ||
+                    p.transactional === true ||
+                    p.shoppingOptions?.some((o) => o.eligible);
+    if (!inStock) continue;
+
+    for (const bottle of TARGET_BOTTLES) {
+      if (matchesBottle(p.name || "", bottle)) {
+        found.push({
+          name: bottle.name,
+          url: p.productUrl ? (p.productUrl.startsWith("http") ? p.productUrl : `https://www.totalwine.com${p.productUrl}`) : "",
+          price: p.price?.[0]?.price ? `$${p.price[0].price}` : "",
+          sku: (p.productUrl?.match(/\/p\/(\d+)/) || [])[1] || "",
+          size: parseSize(p.name || ""),
+          fulfillment: (p.shoppingOptions || []).filter((o) => o.eligible).map((o) => o.name || o.type || "").join(", "),
+        });
+      }
+    }
+  }
+  return found;
+}
+
+// Try fetching Total Wine search HTML directly and parsing INITIAL_STATE (no browser needed).
+// Returns { name, url, price, sku, size, fulfillment }[] on success, null if blocked.
+async function scrapeTotalWineViaFetch(store) {
+  if (!proxyAgent) return null; // fetch will always be blocked without proxy
+  const found = [];
+  let failures = 0;
+  let validPages = 0;
+  for (const query of shuffle(SEARCH_QUERIES)) {
+    const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
+    try {
+      const res = await fetchRetry(url, {
+        headers: FETCH_HEADERS,
+        signal: AbortSignal.timeout(15000),
+        agent: proxyAgent,
+      });
+      if (!res.ok) { failures++; if (failures > 3) return null; continue; }
+      const html = await res.text();
+      // Extract INITIAL_STATE JSON embedded in a <script> tag
+      const idx = html.indexOf("window.INITIAL_STATE");
+      if (idx === -1) { failures++; if (failures > 3) return null; continue; }
+      const braceStart = html.indexOf("{", idx);
+      const scriptEnd = html.indexOf("</script>", braceStart);
+      if (braceStart === -1 || scriptEnd === -1) { failures++; if (failures > 3) return null; continue; }
+      let jsonStr = html.slice(braceStart, scriptEnd).trim();
+      if (jsonStr.endsWith(";")) jsonStr = jsonStr.slice(0, -1);
+      const state = JSON.parse(jsonStr);
+      if (!state?.search?.results) { failures++; if (failures > 3) return null; continue; }
+      validPages++;
+      found.push(...matchTotalWineInitialState(state));
+    } catch {
+      failures++; if (failures > 3) return null; continue;
+    }
+    await sleep(250);
+  }
+  if (validPages === 0) return null;
+  return failures > 0 && found.length === 0 ? null : dedupFound(found);
+}
+
+// Browser-based Total Wine scraper (fallback). Accepts a shared Playwright page.
+// Product data is in window.INITIAL_STATE.search.results.products (structured JSON).
+async function scrapeTotalWineViaBrowser(store, page) {
+  const found = [];
   for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      // Wait for INITIAL_STATE to be populated by JS hydration (more reliable than fixed 2s wait).
-      // Falls back to CSS selectors if hydration doesn't complete within timeout.
       await page.waitForFunction(
         () => !!window.INITIAL_STATE?.search?.results,
         { timeout: 10000 }
@@ -649,64 +797,70 @@ async function scrapeTotalWineStore(store, page) {
         continue;
       }
 
-      // Extract structured product data from INITIAL_STATE (SSR React state)
-      const products = await page.evaluate(
+      // Extract INITIAL_STATE from browser context
+      const state = await page.evaluate(
         /* v8 ignore start -- browser-only DOM callback */
         () => {
-          try {
-            const state = window.INITIAL_STATE;
-            const products = state?.search?.results?.products;
-            if (!Array.isArray(products)) return [];
-            return products.map((p) => ({
-              name: p.name || "",
-              url: p.productUrl || "",
-              price: p.price?.[0]?.price ? `$${p.price[0].price}` : "",
-              sku: (p.productUrl?.match(/\/p\/(\d+)/) || [])[1] || "",
-              fulfillment: (p.shoppingOptions || []).filter((o) => o.eligible).map((o) => o.name || o.type || "").join(", "),
-              inStock: (p.stockLevel?.[0]?.stock > 0) ||
-                       p.transactional === true ||
-                       p.shoppingOptions?.some((o) => o.eligible),
-            }));
-          } catch { return []; }
+          try { return window.INITIAL_STATE; } catch { return null; }
         }
         /* v8 ignore stop */
       );
 
-      // Fallback: if INITIAL_STATE isn't available, try CSS selectors
-      const items = products.length > 0 ? products : await page.$$eval(
-        '[class*="productCard"], [data-testid="product-card"], .product-card',
-        /* v8 ignore start -- browser-only DOM callback */
-        (cards) =>
-          cards.map((el) => ({
-            name: (el.querySelector('[class*="title"], [class*="name"], h2, a') || {}).textContent || "",
-            inStock: !!el.querySelector('button[class*="addToCart"], button[class*="Add"], [data-testid*="add"]'),
-            url: (el.querySelector('a[href*="/spirits/"], a[href*="/wine/"], a') || {}).href || "",
-            price: (el.querySelector('[class*="price"], [data-testid*="price"]') || {}).textContent?.trim() || "",
-          }))
-        /* v8 ignore stop */
-      );
-
-      for (const p of items) {
-        if (!p.inStock) continue;
-        for (const bottle of TARGET_BOTTLES) {
-          if (matchesBottle(p.name, bottle)) {
-            found.push({
-              name: bottle.name,
-              url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.totalwine.com${p.url}`) : "",
-              price: p.price,
-              sku: p.sku || "",
-              size: parseSize(p.name),
-              fulfillment: p.fulfillment || "",
-            });
+      const matched = matchTotalWineInitialState(state);
+      if (matched.length > 0) {
+        found.push(...matched);
+      } else {
+        // Fallback: if INITIAL_STATE isn't available, try CSS selectors
+        const items = await page.$$eval(
+          '[class*="productCard"], [data-testid="product-card"], .product-card',
+          /* v8 ignore start -- browser-only DOM callback */
+          (cards) =>
+            cards.map((el) => ({
+              name: (el.querySelector('[class*="title"], [class*="name"], h2, a') || {}).textContent || "",
+              inStock: !!el.querySelector('button[class*="addToCart"], button[class*="Add"], [data-testid*="add"]'),
+              url: (el.querySelector('a[href*="/spirits/"], a[href*="/wine/"], a') || {}).href || "",
+              price: (el.querySelector('[class*="price"], [data-testid*="price"]') || {}).textContent?.trim() || "",
+            }))
+          /* v8 ignore stop */
+        );
+        for (const p of items) {
+          if (!p.inStock) continue;
+          for (const bottle of TARGET_BOTTLES) {
+            if (matchesBottle(p.name, bottle)) {
+              found.push({
+                name: bottle.name,
+                url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.totalwine.com${p.url}`) : "",
+                price: p.price,
+                sku: "",
+                size: parseSize(p.name),
+                fulfillment: "",
+              });
+            }
           }
         }
       }
     } catch (err) {
       console.error(`[totalwine:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
-    await sleep(1500);
+    await sleep(750);
   }
   return dedupFound(found);
+}
+
+// Wrapper: try fetch-first, fall back to browser if blocked by PerimeterX.
+async function scrapeTotalWineStore(store) {
+  const fetchResult = await scrapeTotalWineViaFetch(store);
+  if (fetchResult !== null) {
+    console.log(`[totalwine:${store.storeId}] Used fast fetch mode (proxied)`);
+    return fetchResult;
+  }
+  console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser`);
+  const page = await newPage();
+  try {
+    return await scrapeTotalWineViaBrowser(store, page);
+  } finally {
+    await page.context().close();
+  }
 }
 
 // ─── Walmart: fetch-first with browser fallback ─────────────────────────────
@@ -771,7 +925,7 @@ async function scrapeWalmartViaFetch(store) {
     } catch {
       failures++; if (failures > 3) return null; continue;
     }
-    await sleep(500);
+    await sleep(250);
   }
   // Fall back to browser if no queries returned a valid search results page
   if (validPages === 0) return null;
@@ -830,7 +984,7 @@ async function scrapeWalmartViaBrowser(store, page) {
     } catch (err) {
       console.error(`[walmart:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
-    await sleep(1500);
+    await sleep(750);
   }
   return dedupFound(found);
 }
@@ -909,7 +1063,7 @@ async function scrapeKrogerStore(store) {
         signal: AbortSignal.timeout(15000),
       };
       if (proxyAgent) krogerOpts.agent = proxyAgent;
-      const res = await fetch(url, krogerOpts);
+      const res = await fetchRetry(url, krogerOpts);
       // Clear cached token on 401 so next call re-authenticates
       if (res.status === 401) { krogerToken = null; throw new Error("Token expired (401)"); }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -947,7 +1101,7 @@ async function scrapeKrogerStore(store) {
     } catch (err) {
       console.error(`[kroger:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
-    await sleep(500);
+    await sleep(250);
   }
   return dedupFound(found);
 }
@@ -974,7 +1128,7 @@ async function scrapeSafewayStore(store) {
         signal: AbortSignal.timeout(15000),
       };
       if (proxyAgent) safewayOpts.agent = proxyAgent;
-      const res = await fetch(url, safewayOpts);
+      const res = await fetchRetry(url, safewayOpts);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const products = data?.primaryProducts?.response?.docs || [];
@@ -1000,7 +1154,7 @@ async function scrapeSafewayStore(store) {
     } catch (err) {
       console.error(`[safeway:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
-    await sleep(750);
+    await sleep(350);
   }
   return dedupFound(found);
 }
@@ -1012,8 +1166,8 @@ async function scrapeSafewayStore(store) {
 //   If false, scraper is API/fetch-based and doesn't need a browser page.
 
 const RETAILERS = [
-  { key: "costco",    name: "Costco",     scrapeOnce: true,  needsPage: true  },
-  { key: "totalwine", name: "Total Wine", scrapeOnce: false, needsPage: true,  scraper: scrapeTotalWineStore },
+  { key: "costco",    name: "Costco",     scrapeOnce: true,  needsPage: false, scraper: scrapeCostcoStore },
+  { key: "totalwine", name: "Total Wine", scrapeOnce: false, needsPage: false, scraper: scrapeTotalWineStore },
   { key: "walmart",   name: "Walmart",    scrapeOnce: false, needsPage: false, scraper: scrapeWalmartStore },
   { key: "kroger",    name: "Kroger",     scrapeOnce: false, needsPage: false, scraper: scrapeKrogerStore },
   { key: "safeway",   name: "Safeway",    scrapeOnce: false, needsPage: false, scraper: scrapeSafewayStore },
@@ -1082,13 +1236,12 @@ async function poll() {
     retailersSeen.add(retailer.key);
 
     if (retailer.scrapeOnce) {
-      // Costco: scrape once, broadcast results to all stores
+      // Scrape once, broadcast results to all stores (e.g., Costco has no per-store filter)
       tasks.push(async () => {
-        let page;
         try {
           console.log(`[poll] Checking ${retailer.name} (once for ${stores.length} stores)...`);
-          page = await newPage();
-          const inStock = await scrapeCostcoOnce(page);
+          // Wrapper handles its own browser page if needed (fetch-first with browser fallback)
+          const inStock = await retailer.scraper();
           // Per-store try/catch: one Discord failure shouldn't skip remaining stores
           for (const store of stores) {
             try {
@@ -1099,12 +1252,9 @@ async function poll() {
           }
         } catch (err) {
           console.error(`[poll] ${retailer.name} crashed: ${err.message}`);
-        } finally {
-          if (page) await page.context().close().catch(() => {});
         }
       });
-    } else if (retailer.needsPage) {
-      // Browser-based per-store scrapers: share one context per retailer
+    } /* v8 ignore start -- no retailers currently use needsPage */ else if (retailer.needsPage) {
       for (const store of stores) {
         tasks.push(async () => {
           let page;
@@ -1120,7 +1270,7 @@ async function poll() {
           }
         });
       }
-    } else {
+    } /* v8 ignore stop */ else {
       // API/fetch-based scrapers: no browser page needed
       for (const store of stores) {
         tasks.push(async () => {
@@ -1136,8 +1286,8 @@ async function poll() {
     }
   }
 
-  // Run all stores concurrently (limit 4 to manage browser memory)
-  await runWithConcurrency(tasks, 4);
+  // Run all stores concurrently (limit 6 — fetch-first scrapers are lightweight)
+  await runWithConcurrency(tasks, 6);
 
   await closeBrowser().catch((err) => console.error(`[poll] closeBrowser failed: ${err.message}`));
   await saveState(state).catch((err) => console.error(`[poll] saveState failed: ${err.message}`));
@@ -1162,8 +1312,9 @@ export {
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  launchBrowser, closeBrowser, newPage, isBlockedPage,
-  scrapeCostcoOnce, scrapeTotalWineStore,
+  launchBrowser, closeBrowser, newPage, isBlockedPage, fetchRetry,
+  matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
+  matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
   poll,

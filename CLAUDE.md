@@ -17,11 +17,12 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 reta
 
 - **ESM throughout** — `"type": "module"` in package.json, all files use `import`/`export`
 - **Playwright + Stealth + Hardened Launch** — `playwright-extra` with `puppeteer-extra-plugin-stealth`. Browser launches with `--disable-blink-features=AutomationControlled` and `ignoreDefaultArgs: ['--enable-automation']`. Browser contexts get Chrome 136 UA + `Sec-CH-UA` Client Hints matching `FETCH_HEADERS`.
-- **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 4)`. Browser and API scrapers are unified in the same task queue.
+- **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 6)`. Browser and API scrapers are unified in the same task queue.
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
 - **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a residential proxy. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
 - **Query order randomization** — `shuffle(SEARCH_QUERIES)` via Fisher-Yates before every scraper loop to avoid predictable access patterns that anti-bot ML models flag.
-- **Fetch-first with browser fallback** — Walmart tries a plain HTTP fetch + `__NEXT_DATA__` parse before spinning up a browser page. Falls back to Playwright if blocked.
+- **Fetch-first with browser fallback** — Walmart, Total Wine, and Costco all try plain HTTP fetch first (via residential proxy) before spinning up a browser page. Walmart parses `__NEXT_DATA__`, Total Wine parses `window.INITIAL_STATE`, Costco parses `data-testid` tiles via `cheerio`. Falls back to Playwright if blocked.
+- **Fetch retry** — `fetchRetry()` retries once on network errors (timeouts, DNS failures) with 1s backoff. Used by all fetch-based scrapers.
 - **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Scraped once and broadcast to all stores.
 - **Broad search queries** — 12 queries cover all 40 bottles. API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
 - **Shared Kroger OAuth token** — Fetched once per poll via singleton promise, shared across all Kroger stores. Clears cached token on 401 for automatic re-auth.
@@ -53,8 +54,8 @@ All config is in `.env`:
 
 | Retailer | Scraper Type | Data Source | Anti-Bot | Notes |
 |----------|-------------|-------------|----------|-------|
-| Costco | Playwright | MUI `data-testid` DOM attrs | Akamai Bot Manager | Scrape-once (no store filter in search). Uses `/s?keyword=` URL. Next.js App Router — no `__NEXT_DATA__`. |
-| Total Wine | Playwright | `window.INITIAL_STATE` JSON | PerimeterX (HUMAN) | Per-store via `storeId` URL param. Bloomreach CMS + React. CSS selector fallback. |
+| Costco | Fetch-first / Playwright | MUI `data-testid` DOM attrs (cheerio or browser) | Akamai Bot Manager | Scrape-once (no store filter in search). Fetch+cheerio with proxy, browser fallback. Next.js App Router — no `__NEXT_DATA__`. |
+| Total Wine | Fetch-first / Playwright | `window.INITIAL_STATE` JSON | PerimeterX (HUMAN) | Fetch extracts INITIAL_STATE from HTML with proxy. Browser fallback if PerimeterX blocks. Per-store via `storeId` URL param. CSS selector fallback in browser path. |
 | Walmart | Fetch-first / Playwright | `__NEXT_DATA__` JSON | Akamai + PerimeterX | Filters `__typename=Product`, excludes marketplace sellers, includes fulfillment badge. `flatMap` across all `itemStacks`. |
 | Kroger | REST API | JSON | None (API key auth) | Shared OAuth token (singleton promise). Broad SEARCH_QUERIES (12) instead of per-bottle (40). 401 auto-clears token. `filter.limit=50`. |
 | Safeway | REST API | JSON | None (API key auth) | Broad SEARCH_QUERIES. `rows=50`. Skips silently if API key not set. |
@@ -67,17 +68,17 @@ Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Rese
 
 ## Tests
 
-281 tests across 5 files using Vitest:
+309 tests across 5 files using Vitest:
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 205 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation |
-| `test/proxy.test.js` | 9 | Proxy agent routing (all scrapers + skips Discord). Separate file because `proxyAgent` is module-level (frozen at import). |
+| `test/scraper.test.js` | 218 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation, fetch helpers |
+| `test/proxy.test.js` | 24 | Proxy agent routing, fetch-first paths (Costco, Total Wine, Walmart), wrapper fallback logic |
 | `test/discover-stores.test.js` | 52 | Store locator logic per retailer |
 | `test/geo.test.js` | 9 | Zip-to-coords and haversine distance |
 | `test/fallback-stores.test.js` | 6 | Static store data validation |
 
-Coverage: 98.9% statements, 94.6% branches, 92.5% functions, 99.4% lines.
+Coverage: 98.7% statements, 91.9% branches, 94.8% functions, 99.4% lines.
 
 ```sh
 npm test             # Run all tests
@@ -103,7 +104,7 @@ When a retailer's store locator stops finding stores (selectors broke):
 ## Gotchas
 
 - Costco's search URL (`/s?keyword=`) returns identical results regardless of warehouse — that's why we scrape once and broadcast.
-- Total Wine uses PerimeterX (HUMAN Security) — plain HTTP fetch will always get a 403. Browser with stealth plugin is required.
+- Total Wine uses PerimeterX (HUMAN Security) — plain HTTP fetch may get a 403 without residential proxy. With `PROXY_URL` set, fetch-first extracts `INITIAL_STATE` from HTML. Falls back to browser if blocked.
 - Walmart fetch-first gets blocked on CI (datacenter IPs) but works locally. With `PROXY_URL` set, fetch-first works on CI too. Without proxy, fetch path skips on CI and falls back to browser.
 - Walmart fetch validates `__NEXT_DATA__` has a `searchResult` key — challenge pages with valid JSON but empty search data correctly fall back to browser instead of reporting "nothing found."
 - Store locator CSS selectors in `discover-stores.js` break when retailer sites update their DOM. Kroger's API locator is the most stable.

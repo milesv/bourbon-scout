@@ -38,6 +38,7 @@ vi.mock("playwright-extra", () => ({
 }));
 vi.mock("puppeteer-extra-plugin-stealth", () => ({ default: vi.fn() }));
 vi.mock("https-proxy-agent", () => ({ HttpsProxyAgent: mocks.HttpsProxyAgent }));
+vi.mock("cheerio", async () => await vi.importActual("cheerio"));
 vi.mock("node-cron", () => ({ default: { schedule: mocks.cronSchedule } }));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
@@ -52,6 +53,8 @@ vi.mock("../lib/discover-stores.js", () => ({
 import {
   FETCH_HEADERS,
   launchBrowser, closeBrowser,
+  scrapeCostcoViaFetch, scrapeCostcoStore,
+  scrapeTotalWineViaFetch, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartStore, scrapeKrogerStore, scrapeSafewayStore,
   getKrogerToken, main,
   _resetKrogerToken, _resetPolling, _setStoreCache,
@@ -241,5 +244,183 @@ describe("proxy support", () => {
     delete process.env.RUN_ONCE;
     exitSpy.mockRestore();
     consoleSpy.mockRestore();
+  });
+
+  it("scrapeTotalWineViaFetch extracts INITIAL_STATE via proxy", async () => {
+    const initialState = {
+      search: { results: { products: [{
+        name: "Weller Special Reserve Bourbon Whiskey",
+        productUrl: "/spirits/bourbon/weller-sr/p/12345",
+        price: [{ price: 29.99 }],
+        stockLevel: [{ stock: 5 }],
+        transactional: true,
+        shoppingOptions: [{ eligible: true, name: "In-store" }],
+      }] } },
+    };
+    const html = `<html><script>window.INITIAL_STATE = ${JSON.stringify(initialState)};</script></html>`;
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
+    expect(found).not.toBeNull();
+    expect(found.length).toBe(1);
+    expect(found[0].name).toBe("Weller Special Reserve");
+    expect(found[0].price).toBe("$29.99");
+    // Verify proxy was used
+    const twCalls = mocks.fetch.mock.calls.filter(
+      ([url]) => typeof url === "string" && url.includes("totalwine.com")
+    );
+    expect(twCalls.length).toBeGreaterThan(0);
+    for (const [, opts] of twCalls) {
+      expect(opts.agent._isProxy).toBe(true);
+    }
+  });
+
+  it("scrapeTotalWineViaFetch returns null after 4+ failures", async () => {
+    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
+    expect(found).toBeNull();
+  });
+
+  it("scrapeTotalWineViaFetch returns null when INITIAL_STATE missing", async () => {
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => "<html><body>Challenge page</body></html>" });
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
+    expect(found).toBeNull();
+  });
+
+  it("scrapeTotalWineStore wrapper uses fetch when proxy is set", async () => {
+    const initialState = {
+      search: { results: { products: [{
+        name: "Weller Special Reserve Bourbon Whiskey",
+        productUrl: "/spirits/bourbon/weller-sr/p/12345",
+        price: [{ price: 29.99 }],
+        stockLevel: [{ stock: 5 }],
+      }] } },
+    };
+    const html = `<html><script>window.INITIAL_STATE = ${JSON.stringify(initialState)};</script></html>`;
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
+    expect(found).not.toBeNull();
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("fast fetch mode"));
+    consoleSpy.mockRestore();
+  });
+
+  it("scrapeTotalWineStore wrapper falls back to browser when fetch blocked", async () => {
+    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    setupMockBrowser();
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(found).toEqual([]);
+    consoleSpy.mockRestore();
+    await closeBrowser();
+  });
+
+  it("scrapeCostcoViaFetch parses product tiles via proxy", async () => {
+    const html = `<html><body>
+      <div data-testid="ProductTile_12345">
+        <a href="https://www.costco.com/weller-sr.product.100123456.html">
+          <h3 data-testid="Text_ProductTile_12345_title">Weller Special Reserve Bourbon 750ml</h3>
+        </a>
+        <span data-testid="Text_Price_12345">$29.99</span>
+      </div>
+    </body></html>`;
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
+    expect(found).not.toBeNull();
+    expect(found.length).toBe(1);
+    expect(found[0].name).toBe("Weller Special Reserve");
+    expect(found[0].price).toBe("$29.99");
+    expect(found[0].sku).toBe("12345");
+    // Verify proxy was used
+    const costcoCalls = mocks.fetch.mock.calls.filter(
+      ([url]) => typeof url === "string" && url.includes("costco.com")
+    );
+    expect(costcoCalls.length).toBeGreaterThan(0);
+    for (const [, opts] of costcoCalls) {
+      expect(opts.agent._isProxy).toBe(true);
+    }
+  });
+
+  it("scrapeCostcoViaFetch returns null on bot detection", async () => {
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => "<html><title>Access Denied</title><body>robot check</body></html>" });
+    const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
+    expect(found).toBeNull();
+  });
+
+  it("scrapeCostcoViaFetch returns null after 4+ HTTP failures", async () => {
+    mocks.fetch.mockResolvedValue({ ok: false, status: 503 });
+    const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
+    expect(found).toBeNull();
+  });
+
+  it("scrapeCostcoStore wrapper uses fetch when proxy is set", async () => {
+    const html = `<html><body>
+      <div data-testid="ProductTile_99">
+        <h3 data-testid="Text_ProductTile_99_title">Weller Special Reserve Bourbon</h3>
+        <span data-testid="Text_Price_99">$29.99</span>
+      </div>
+    </body></html>`;
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const found = await runWithFakeTimers(() => scrapeCostcoStore());
+    expect(found).not.toBeNull();
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("fast fetch mode"));
+    consoleSpy.mockRestore();
+  });
+
+  it("scrapeCostcoStore wrapper falls back to browser when fetch blocked", async () => {
+    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    setupMockBrowser();
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const found = await runWithFakeTimers(() => scrapeCostcoStore());
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(found).toEqual([]);
+    consoleSpy.mockRestore();
+    await closeBrowser();
+  });
+
+  it("scrapeCostcoViaFetch handles pages with no product tiles (valid empty search)", async () => {
+    const html = `<html><body><div class="no-results">No results found</div></body></html>`;
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
+    // All queries return valid pages with no tiles — should return empty, not null
+    expect(found).not.toBeNull();
+    expect(found).toEqual([]);
+  });
+
+  it("scrapeTotalWineViaFetch handles malformed INITIAL_STATE (missing braces/script)", async () => {
+    // Has marker but no valid JSON structure
+    const html = `<html><script>window.INITIAL_STATE = broken`;
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
+    // Should return null — all queries fail to parse
+    expect(found).toBeNull();
+  });
+
+  it("scrapeTotalWineViaFetch handles INITIAL_STATE without search.results", async () => {
+    const state = { otherData: true };
+    const html = `<html><script>window.INITIAL_STATE = ${JSON.stringify(state)};</script></html>`;
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
+    expect(found).toBeNull();
+  });
+
+  it("scrapeTotalWineViaFetch handles fetch exceptions (network errors)", async () => {
+    // fetchRetry will retry once then throw
+    mocks.fetch.mockRejectedValue(new Error("ECONNRESET"));
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
+    expect(found).toBeNull();
+  });
+
+  it("scrapeTotalWineViaFetch returns empty array when some queries succeed but find nothing", async () => {
+    // Valid page with INITIAL_STATE but no matching products
+    const state = { search: { results: { products: [
+      { name: "Jack Daniel's Tennessee Whiskey", productUrl: "/p/1", stockLevel: [{ stock: 5 }] },
+    ] } } };
+    const html = `<html><script>window.INITIAL_STATE = ${JSON.stringify(state)};</script></html>`;
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
+    expect(found).not.toBeNull();
+    expect(found).toEqual([]);
   });
 });
