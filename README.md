@@ -10,8 +10,8 @@ Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Rese
 
 | Retailer | Method | Data Source |
 |----------|--------|-------------|
-| Costco | Browser (Playwright) | MUI `data-testid` attributes |
-| Total Wine | Browser (Playwright) | `window.INITIAL_STATE` JSON |
+| Costco | Fetch-first (cheerio), browser fallback | MUI `data-testid` attributes |
+| Total Wine | Fetch-first (`INITIAL_STATE`), browser fallback | `window.INITIAL_STATE` JSON |
 | Walmart | Fetch-first, browser fallback | `__NEXT_DATA__` JSON |
 | Kroger | REST API | Structured JSON |
 | Safeway | REST API | Structured JSON |
@@ -19,7 +19,7 @@ Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Rese
 ## How It Works
 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
-2. **Inventory Scanning** — Scans all stores concurrently (limit 4) using 12 broad search queries that cover all 40 bottles. Prefers structured JSON extraction over CSS selectors for reliability. Detects bot challenge pages and falls back to browser when fetch paths are blocked.
+2. **Inventory Scanning** — Scans all stores concurrently (limit 6) using 12 broad search queries that cover all 40 bottles. Prefers fetch-first with structured JSON/HTML extraction over browser scraping — Costco (cheerio), Total Wine (`INITIAL_STATE`), and Walmart (`__NEXT_DATA__`) all try plain HTTP fetch before falling back to Playwright. Detects bot challenge pages and retries transient failures once.
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
 4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@everyone` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 
@@ -65,8 +65,9 @@ SAFEWAY_API_KEY=
 | `KROGER_CLIENT_ID` | No | Kroger API client ID (get from [developer.kroger.com](https://developer.kroger.com)) |
 | `KROGER_CLIENT_SECRET` | No | Kroger API client secret |
 | `SAFEWAY_API_KEY` | No | Safeway product search API key |
+| `PROXY_URL` | No | Residential proxy URL (e.g. `http://host:port`). Enables fetch-first paths for Costco and Total Wine, bypassing browser scraping. |
 
-Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials.
+Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, Costco and Total Wine use browser-only scraping; Walmart's fetch path skips on CI but works locally.
 
 ### Run
 
