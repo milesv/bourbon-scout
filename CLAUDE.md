@@ -16,7 +16,13 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 reta
 ## Key Patterns
 
 - **ESM throughout** — `"type": "module"` in package.json, all files use `import`/`export`
-- **Playwright + Stealth + Hardened Launch** — `playwright-extra` with `puppeteer-extra-plugin-stealth`. Browser launches with `--disable-blink-features=AutomationControlled` and `ignoreDefaultArgs: ['--enable-automation']`. Browser contexts get Chrome 136 UA + `Sec-CH-UA` Client Hints matching `FETCH_HEADERS`.
+- **Playwright + Stealth + Hardened Launch** — `playwright-extra` with `puppeteer-extra-plugin-stealth`. Browser launches with `--disable-blink-features=AutomationControlled` and `ignoreDefaultArgs: ['--enable-automation']`. Browser contexts get platform-aware Chrome 136 UA + `Sec-CH-UA` Client Hints matching `FETCH_HEADERS`.
+- **Platform-aware User-Agent** — `IS_MAC` detection at module level. macOS Chrome UA + `Sec-CH-UA-Platform: "macOS"` on Mac, Windows Chrome on Linux/CI. Prevents UA-vs-TLS fingerprint mismatch that bot detectors flag.
+- **Lazy browser launch** — Browser is only launched when a scraper actually needs it (via `newPage()`). When all scrapers succeed via fetch-first, no browser is started.
+- **Atomic state writes** — `saveState()` writes to `state.json.tmp` then `rename()` to `state.json` (atomic on POSIX). Prevents corruption on crash mid-write.
+- **Browser cookie persistence** — `loadBrowserState()`/`saveBrowserState()` persist Playwright `storageState` to `browser-state.json`. Cookies accumulate across polls, reducing bot detection signals.
+- **Parallel query execution** — API scrapers (Kroger, Safeway) run all 12 queries via `Promise.all` with 50ms staggered starts. Fetch scrapers (Costco, TotalWine, Walmart) use batched parallelism via `runWithConcurrency(queryTasks, 4)`.
+- **Kroger pagination** — Fetches page 2 (`filter.start=50`) when first page returns exactly 50 results, catching allocated bottles that spill past the first page.
 - **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 6)`. Browser and API scrapers are unified in the same task queue.
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
 - **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a residential proxy. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
@@ -56,8 +62,8 @@ All config is in `.env`:
 |----------|-------------|-------------|----------|-------|
 | Costco | Fetch-first / Playwright | MUI `data-testid` DOM attrs (cheerio or browser) | Akamai Bot Manager | Scrape-once (no store filter in search). Fetch+cheerio with proxy, browser fallback. Next.js App Router — no `__NEXT_DATA__`. |
 | Total Wine | Fetch-first / Playwright | `window.INITIAL_STATE` JSON | PerimeterX (HUMAN) | Fetch extracts INITIAL_STATE from HTML with proxy. Browser fallback if PerimeterX blocks. Per-store via `storeId` URL param. CSS selector fallback in browser path. |
-| Walmart | Fetch-first / Playwright | `__NEXT_DATA__` JSON | Akamai + PerimeterX | Filters `__typename=Product`, excludes marketplace sellers, includes fulfillment badge. `flatMap` across all `itemStacks`. |
-| Kroger | REST API | JSON | None (API key auth) | Shared OAuth token (singleton promise). Broad SEARCH_QUERIES (12) instead of per-bottle (40). 401 auto-clears token. `filter.limit=50`. |
+| Walmart | Fetch-first / Playwright | `__NEXT_DATA__` JSON | Akamai + PerimeterX | Filters `__typename=Product`, excludes marketplace sellers. Requires `IN_STOCK` status + store/pickup fulfillment badge. `flatMap` across all `itemStacks`. |
+| Kroger | REST API | JSON | None (API key auth) | Shared OAuth token (singleton promise). Broad SEARCH_QUERIES (12) instead of per-bottle (40). 401 auto-clears token. `filter.limit=50`. Paginates to page 2 when first page is full. |
 | Safeway | REST API | JSON | None (API key auth) | Broad SEARCH_QUERIES. `rows=50`. Skips silently if API key not set. |
 
 BevMo is omitted from the poll loop — no Arizona locations exist.
@@ -68,17 +74,17 @@ Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Rese
 
 ## Tests
 
-309 tests across 5 files using Vitest:
+330 tests across 5 files using Vitest:
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 218 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation, fetch helpers |
+| `test/scraper.test.js` | 232 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination, TotalWine stock signals |
 | `test/proxy.test.js` | 24 | Proxy agent routing, fetch-first paths (Costco, Total Wine, Walmart), wrapper fallback logic |
-| `test/discover-stores.test.js` | 52 | Store locator logic per retailer |
+| `test/discover-stores.test.js` | 59 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords and haversine distance |
 | `test/fallback-stores.test.js` | 6 | Static store data validation |
 
-Coverage: 98.7% statements, 91.9% branches, 94.8% functions, 99.4% lines.
+Coverage: 98.9% statements, 91.6% branches, 95.3% functions, 99.5% lines.
 
 ```sh
 npm test             # Run all tests

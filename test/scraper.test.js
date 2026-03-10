@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => {
     fetch: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
+    rename: vi.fn(),
     chromiumLaunch: vi.fn(),
     chromiumUse: vi.fn(),
     cronSchedule: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock("node-cron", () => ({ default: { schedule: mocks.cronSchedule } }));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
   writeFile: mocks.writeFile,
+  rename: mocks.rename,
 }));
 vi.mock("../lib/discover-stores.js", () => ({
   discoverStores: mocks.discoverStores,
@@ -49,7 +51,7 @@ import {
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  launchBrowser, closeBrowser, newPage, isBlockedPage, fetchRetry,
+  IS_MAC, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
@@ -70,13 +72,13 @@ function createMockPage() {
     evaluate: vi.fn().mockResolvedValue([]),
     $$eval: vi.fn().mockResolvedValue([]),
     $eval: vi.fn().mockResolvedValue(null),
-    context: vi.fn(() => ({ close: vi.fn().mockResolvedValue(undefined) })),
+    context: vi.fn(() => ({ close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }) })),
   };
 }
 
 function setupMockBrowser() {
   const mockPage = createMockPage();
-  const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined) };
+  const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }) };
   const mockBrowser = { newContext: vi.fn().mockResolvedValue(mockContext), close: vi.fn().mockResolvedValue(undefined) };
   mocks.chromiumLaunch.mockResolvedValue(mockBrowser);
   return { browser: mockBrowser, context: mockContext, page: mockPage };
@@ -155,7 +157,8 @@ describe("constants", () => {
   it("FETCH_HEADERS includes Sec-CH-UA Client Hints", () => {
     expect(FETCH_HEADERS["Sec-CH-UA"]).toContain("Chrome");
     expect(FETCH_HEADERS["Sec-CH-UA-Mobile"]).toBe("?0");
-    expect(FETCH_HEADERS["Sec-CH-UA-Platform"]).toBe('"Windows"');
+    const expectedPlatform = process.platform === "darwin" ? '"macOS"' : '"Windows"';
+    expect(FETCH_HEADERS["Sec-CH-UA-Platform"]).toBe(expectedPlatform);
   });
 
   it("FETCH_HEADERS User-Agent version matches Sec-CH-UA version", () => {
@@ -504,8 +507,33 @@ describe("matchWalmartNextData", () => {
     expect(matchWalmartNextData(data)).toHaveLength(0);
   });
 
-  it("handles canAddToCart availability", () => {
+  it("ignores canAddToCart without IN_STOCK status", () => {
+    // canAddToCart alone is not sufficient — requires availabilityStatusV2.value === "IN_STOCK"
     const data = makeNextData([{ __typename: "Product", name: "Weller Special Reserve", canAddToCart: true, sellerName: "Walmart.com" }]);
+    expect(matchWalmartNextData(data)).toHaveLength(0);
+  });
+
+  it("filters ship-only items via fulfillmentBadge", () => {
+    const data = makeNextData([{
+      __typename: "Product", name: "Weller Special Reserve", availabilityStatusV2: { value: "IN_STOCK" },
+      sellerName: "Walmart.com", fulfillmentBadge: "Shipping only",
+    }]);
+    expect(matchWalmartNextData(data)).toHaveLength(0);
+  });
+
+  it("keeps items with pickup fulfillmentBadge", () => {
+    const data = makeNextData([{
+      __typename: "Product", name: "Weller Special Reserve", availabilityStatusV2: { value: "IN_STOCK" },
+      sellerName: "Walmart.com", fulfillmentBadge: "Pickup today",
+    }]);
+    expect(matchWalmartNextData(data)).toHaveLength(1);
+  });
+
+  it("keeps items with no fulfillmentBadge", () => {
+    const data = makeNextData([{
+      __typename: "Product", name: "Weller Special Reserve", availabilityStatusV2: { value: "IN_STOCK" },
+      sellerName: "Walmart.com",
+    }]);
     expect(matchWalmartNextData(data)).toHaveLength(1);
   });
 
@@ -914,10 +942,17 @@ describe("loadState", () => {
 });
 
 describe("saveState", () => {
-  it("writes state as JSON", async () => {
+  it("writes state atomically via temp file + rename", async () => {
     mocks.writeFile.mockResolvedValueOnce(undefined);
+    mocks.rename.mockResolvedValueOnce(undefined);
     await saveState({ costco: {} });
+    // Writes to .tmp file first
+    expect(mocks.writeFile.mock.calls[0][0]).toMatch(/state\.json\.tmp$/);
     expect(JSON.parse(mocks.writeFile.mock.calls[0][1])).toEqual({ costco: {} });
+    // Then renames to final path
+    expect(mocks.rename).toHaveBeenCalledTimes(1);
+    expect(mocks.rename.mock.calls[0][0]).toMatch(/state\.json\.tmp$/);
+    expect(mocks.rename.mock.calls[0][1]).toMatch(/state\.json$/);
   });
 });
 
@@ -2521,5 +2556,163 @@ describe("poll error isolation", () => {
     expect(mocks.writeFile).toHaveBeenCalled();
     consoleSpy.mockRestore();
     vi.spyOn(console, "log").mockRestore();
+  });
+});
+
+// ─── Platform-aware User-Agent ───────────────────────────────────────────────
+
+describe("platform-aware User-Agent", () => {
+  it("IS_MAC matches current platform", () => {
+    expect(IS_MAC).toBe(process.platform === "darwin");
+  });
+
+  it("FETCH_HEADERS User-Agent matches platform", () => {
+    if (IS_MAC) {
+      expect(FETCH_HEADERS["User-Agent"]).toContain("Macintosh");
+      expect(FETCH_HEADERS["Sec-CH-UA-Platform"]).toBe('"macOS"');
+    } else {
+      expect(FETCH_HEADERS["User-Agent"]).toContain("Windows");
+      expect(FETCH_HEADERS["Sec-CH-UA-Platform"]).toBe('"Windows"');
+    }
+  });
+});
+
+// ─── Browser State Persistence ───────────────────────────────────────────────
+
+describe("browser state persistence", () => {
+  it("loadBrowserState returns parsed JSON when file exists", async () => {
+    const state = { cookies: [{ name: "test", value: "123" }], origins: [] };
+    mocks.readFile.mockResolvedValueOnce(JSON.stringify(state));
+    const result = await loadBrowserState();
+    expect(result).toEqual(state);
+  });
+
+  it("loadBrowserState returns undefined when file does not exist", async () => {
+    mocks.readFile.mockRejectedValueOnce(new Error("ENOENT"));
+    const result = await loadBrowserState();
+    expect(result).toBeUndefined();
+  });
+
+  it("saveBrowserState writes context storageState to file", async () => {
+    const state = { cookies: [{ name: "sid", value: "abc" }], origins: [] };
+    const mockContext = { storageState: vi.fn().mockResolvedValue(state) };
+    mocks.writeFile.mockResolvedValueOnce(undefined);
+    await saveBrowserState(mockContext);
+    expect(mockContext.storageState).toHaveBeenCalled();
+    expect(mocks.writeFile).toHaveBeenCalledWith(
+      expect.stringContaining("browser-state.json"),
+      JSON.stringify(state),
+    );
+  });
+
+  it("saveBrowserState swallows errors silently", async () => {
+    const mockContext = { storageState: vi.fn().mockRejectedValue(new Error("fail")) };
+    // Should not throw
+    await saveBrowserState(mockContext);
+  });
+});
+
+// ─── Total Wine Tightened Stock Check ────────────────────────────────────────
+
+describe("matchTotalWineInitialState stock signal tightening", () => {
+  it("rejects transactional-only without stock data", () => {
+    // transactional=true but stockLevel is 0 and shoppingOptions not eligible
+    const state = {
+      search: { results: { products: [{
+        name: "Weller Special Reserve Bourbon Whiskey",
+        productUrl: "/spirits/bourbon/weller-sr/p/12345",
+        stockLevel: [{ stock: 0 }],
+        transactional: true,
+        shoppingOptions: [{ eligible: false }],
+      }] } },
+    };
+    expect(matchTotalWineInitialState(state)).toEqual([]);
+  });
+
+  it("accepts transactional as fallback when stockLevel and shoppingOptions are absent", () => {
+    const state = {
+      search: { results: { products: [{
+        name: "Weller Special Reserve Bourbon Whiskey",
+        productUrl: "/spirits/bourbon/weller-sr/p/12345",
+        transactional: true,
+        // No stockLevel, no shoppingOptions
+      }] } },
+    };
+    const found = matchTotalWineInitialState(state);
+    expect(found.length).toBe(1);
+    expect(found[0].name).toBe("Weller Special Reserve");
+  });
+
+  it("accepts shoppingOptions eligible even without stockLevel", () => {
+    const state = {
+      search: { results: { products: [{
+        name: "Weller Special Reserve Bourbon Whiskey",
+        productUrl: "/spirits/bourbon/weller-sr/p/12345",
+        shoppingOptions: [{ eligible: true, name: "Delivery" }],
+      }] } },
+    };
+    const found = matchTotalWineInitialState(state);
+    expect(found.length).toBe(1);
+    expect(found[0].fulfillment).toBe("Delivery");
+  });
+});
+
+// ─── Kroger Pagination ───────────────────────────────────────────────────────
+
+describe("scrapeKrogerStore pagination", () => {
+  it("fetches page 2 when first page returns exactly 50 results", async () => {
+    _resetKrogerToken();
+    // Generate 50 non-matching products for page 1 + 1 matching product on page 2
+    const page1Data = Array.from({ length: 50 }, (_, i) => ({
+      description: `Random Product ${i}`,
+      productId: `p${i}`,
+      items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 10 } }],
+    }));
+    const page2Data = [{
+      description: "Weller Special Reserve Bourbon 750ml",
+      productId: "p-weller",
+      items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" }],
+    }];
+
+    let queryCallCount = 0;
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url.includes("oauth2/token")) {
+        return Promise.resolve({ ok: true, json: async () => ({ access_token: "tk" }) });
+      }
+      if (typeof url === "string" && url.includes("filter.start=50")) {
+        // Page 2 call
+        return Promise.resolve({ ok: true, json: async () => ({ data: page2Data }) });
+      }
+      // Page 1 call
+      queryCallCount++;
+      return Promise.resolve({ ok: true, json: async () => ({ data: page1Data }) });
+    });
+    const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
+    const weller = found.find((f) => f.name === "Weller Special Reserve");
+    expect(weller).toBeTruthy();
+    // Verify page 2 was actually fetched (at least one call with filter.start=50)
+    const page2Calls = mocks.fetch.mock.calls.filter(
+      (c) => typeof c[0] === "string" && c[0].includes("filter.start=50")
+    );
+    expect(page2Calls.length).toBeGreaterThan(0);
+  });
+
+  it("does not fetch page 2 when results are under 50", async () => {
+    _resetKrogerToken();
+    mocks.fetch
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{
+          description: "Weller Special Reserve Bourbon 750ml",
+          productId: "0001234",
+          items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 } }],
+        }] }),
+      });
+    await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
+    const page2Calls = mocks.fetch.mock.calls.filter(
+      (c) => typeof c[0] === "string" && c[0].includes("filter.start=50")
+    );
+    expect(page2Calls.length).toBe(0);
   });
 });

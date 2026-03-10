@@ -4,7 +4,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { chromium } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import cron from "node-cron";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, rename } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import * as cheerio from "cheerio";
 import { discoverStores } from "./lib/discover-stores.js";
@@ -108,7 +108,9 @@ async function loadState() {
 }
 
 async function saveState(state) {
-  await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
+  const tmp = fileURLToPath(STATE_FILE) + ".tmp";
+  await writeFile(tmp, JSON.stringify(state, null, 2));
+  await rename(tmp, fileURLToPath(STATE_FILE));
 }
 
 // ─── State Change Tracking ──────────────────────────────────────────────────
@@ -510,15 +512,19 @@ async function runWithConcurrency(tasks, limit) {
 // Headers for fetch-based scrapers (mimics a real Chrome 136 browser navigation).
 // Must include Sec-CH-UA Client Hints alongside Sec-Fetch-* — omitting them creates
 // a fingerprint that matches no real browser and trips bot detectors.
+// Platform-aware: uses macOS UA on Mac (self-hosted runner) to match TLS fingerprint.
+const IS_MAC = process.platform === "darwin";
 const FETCH_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+  "User-Agent": IS_MAC
+    ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
   "Accept-Encoding": "gzip, deflate, br",
   "Referer": "https://www.google.com/",
   "Sec-CH-UA": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
   "Sec-CH-UA-Mobile": "?0",
-  "Sec-CH-UA-Platform": '"Windows"',
+  "Sec-CH-UA-Platform": IS_MAC ? '"macOS"' : '"Windows"',
   "Sec-Fetch-Dest": "document",
   "Sec-Fetch-Mode": "navigate",
   "Sec-Fetch-Site": "cross-site",
@@ -528,6 +534,22 @@ const FETCH_HEADERS = {
 // ─── Browser Management ──────────────────────────────────────────────────────
 
 let browser = null;
+const BROWSER_STATE_FILE = new URL("./browser-state.json", import.meta.url);
+
+async function loadBrowserState() {
+  try {
+    return JSON.parse(await readFile(BROWSER_STATE_FILE, "utf-8"));
+  } catch {
+    return undefined;
+  }
+}
+
+async function saveBrowserState(context) {
+  try {
+    const state = await context.storageState();
+    await writeFile(fileURLToPath(BROWSER_STATE_FILE), JSON.stringify(state));
+  } catch { /* best-effort */ }
+}
 
 async function launchBrowser() {
   const launchOpts = {
@@ -563,6 +585,7 @@ async function newPage() {
     { width: 1536, height: 864 },
   ];
   const viewport = viewports[Math.floor(Math.random() * viewports.length)];
+  const storedState = await loadBrowserState();
   const context = await browser.newContext({
     viewport,
     locale: "en-US",
@@ -572,6 +595,7 @@ async function newPage() {
       "Sec-CH-UA-Mobile": FETCH_HEADERS["Sec-CH-UA-Mobile"],
       "Sec-CH-UA-Platform": FETCH_HEADERS["Sec-CH-UA-Platform"],
     },
+    ...(storedState && { storageState: storedState }),
   });
   return context.newPage();
 }
@@ -619,7 +643,9 @@ async function scrapeCostcoViaFetch() {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  for (const query of shuffle(SEARCH_QUERIES)) {
+  // Batch queries (4 concurrent) — balances speed vs bot detection risk
+  const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
+    if (failures > 3) return;
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     try {
       const res = await fetchRetry(url, {
@@ -627,22 +653,21 @@ async function scrapeCostcoViaFetch() {
         signal: AbortSignal.timeout(15000),
         agent: proxyAgent,
       });
-      if (!res.ok) { failures++; if (failures > 3) return null; continue; }
+      if (!res.ok) { failures++; return; }
       const html = await res.text();
-      // Check for bot detection (challenge pages won't have product tiles)
       if (html.includes("Access Denied") || html.includes("robot") || html.includes("captcha")) {
-        failures++; if (failures > 3) return null; continue;
+        failures++; return;
       }
       const $ = cheerio.load(html);
       const hasTiles = $('[data-testid^="ProductTile_"]').length > 0;
-      if (!hasTiles && failures === 0) { /* no results for this query is fine */ validPages++; continue; }
+      if (!hasTiles && failures === 0) { validPages++; return; }
       if (hasTiles) validPages++;
       found.push(...matchCostcoTiles($));
     } catch {
-      failures++; if (failures > 3) return null; continue;
+      failures++;
     }
-    await sleep(250);
-  }
+  });
+  await runWithConcurrency(queryTasks, 4);
   if (validPages === 0) return null;
   return failures > 0 && found.length === 0 ? null : dedupFound(found);
 }
@@ -704,7 +729,9 @@ async function scrapeCostcoStore() {
   console.log("[costco] Fetch blocked, using browser");
   const page = await newPage();
   try {
-    return await scrapeCostcoOnce(page);
+    const result = await scrapeCostcoOnce(page);
+    await saveBrowserState(page.context());
+    return result;
   } finally {
     await page.context().close();
   }
@@ -720,9 +747,12 @@ function matchTotalWineInitialState(state) {
   if (!Array.isArray(products)) return found;
 
   for (const p of products) {
+    // Primary: physical stock or eligible shopping options. Use transactional only
+    // as fallback when both stockLevel and shoppingOptions data are absent.
+    const hasStockData = p.stockLevel != null || p.shoppingOptions != null;
     const inStock = (p.stockLevel?.[0]?.stock > 0) ||
-                    p.transactional === true ||
-                    p.shoppingOptions?.some((o) => o.eligible);
+                    p.shoppingOptions?.some((o) => o.eligible) ||
+                    (!hasStockData && p.transactional === true);
     if (!inStock) continue;
 
     for (const bottle of TARGET_BOTTLES) {
@@ -748,7 +778,9 @@ async function scrapeTotalWineViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  for (const query of shuffle(SEARCH_QUERIES)) {
+  // Batch queries (4 concurrent) — balances speed vs PerimeterX detection risk
+  const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
+    if (failures > 3) return;
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
     try {
       const res = await fetchRetry(url, {
@@ -756,25 +788,24 @@ async function scrapeTotalWineViaFetch(store) {
         signal: AbortSignal.timeout(15000),
         agent: proxyAgent,
       });
-      if (!res.ok) { failures++; if (failures > 3) return null; continue; }
+      if (!res.ok) { failures++; return; }
       const html = await res.text();
-      // Extract INITIAL_STATE JSON embedded in a <script> tag
       const idx = html.indexOf("window.INITIAL_STATE");
-      if (idx === -1) { failures++; if (failures > 3) return null; continue; }
+      if (idx === -1) { failures++; return; }
       const braceStart = html.indexOf("{", idx);
       const scriptEnd = html.indexOf("</script>", braceStart);
-      if (braceStart === -1 || scriptEnd === -1) { failures++; if (failures > 3) return null; continue; }
+      if (braceStart === -1 || scriptEnd === -1) { failures++; return; }
       let jsonStr = html.slice(braceStart, scriptEnd).trim();
       if (jsonStr.endsWith(";")) jsonStr = jsonStr.slice(0, -1);
       const state = JSON.parse(jsonStr);
-      if (!state?.search?.results) { failures++; if (failures > 3) return null; continue; }
+      if (!state?.search?.results) { failures++; return; }
       validPages++;
       found.push(...matchTotalWineInitialState(state));
     } catch {
-      failures++; if (failures > 3) return null; continue;
+      failures++;
     }
-    await sleep(250);
-  }
+  });
+  await runWithConcurrency(queryTasks, 4);
   if (validPages === 0) return null;
   return failures > 0 && found.length === 0 ? null : dedupFound(found);
 }
@@ -857,7 +888,9 @@ async function scrapeTotalWineStore(store) {
   console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser`);
   const page = await newPage();
   try {
-    return await scrapeTotalWineViaBrowser(store, page);
+    const result = await scrapeTotalWineViaBrowser(store, page);
+    await saveBrowserState(page.context());
+    return result;
   } finally {
     await page.context().close();
   }
@@ -879,8 +912,12 @@ function matchWalmartNextData(nextData) {
     // Skip third-party marketplace sellers (inflated prices, unreliable stock)
     if (item.sellerName && item.sellerName !== "Walmart.com") continue;
 
-    const available = item.availabilityStatusV2?.value === "IN_STOCK" || item.canAddToCart === true;
-    if (!available || !item.name) continue;
+    if (!item.name) continue;
+    const inStock = item.availabilityStatusV2?.value === "IN_STOCK";
+    if (!inStock) continue;
+    // Skip ship-only items — we want walk-in/pickup availability
+    const badge = (item.fulfillmentBadge || "").toLowerCase();
+    if (badge && !(/store|pickup|today/i.test(badge))) continue;
 
     for (const bottle of TARGET_BOTTLES) {
       if (matchesBottle(item.name, bottle)) {
@@ -905,29 +942,28 @@ async function scrapeWalmartViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  for (const query of shuffle(SEARCH_QUERIES)) {
+  // Batch queries (4 concurrent) — balances speed vs Akamai/PerimeterX detection risk
+  const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
+    if (failures > 3) return;
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&cat_id=976759&store_id=${store.storeId}`;
     try {
       const fetchOpts = { headers: FETCH_HEADERS, signal: AbortSignal.timeout(15000) };
       if (proxyAgent) fetchOpts.agent = proxyAgent;
       const res = await fetch(url, fetchOpts);
-      if (!res.ok) { failures++; if (failures > 3) return null; continue; }
+      if (!res.ok) { failures++; return; }
       const html = await res.text();
       const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-      if (!match) { failures++; if (failures > 3) return null; continue; }
+      if (!match) { failures++; return; }
       const nextData = JSON.parse(match[1]);
-      // Verify this is a real search results page, not a challenge/login/geo-block page
-      // that happens to contain __NEXT_DATA__ but with empty or missing searchResult
       const hasSearchResult = nextData?.props?.pageProps?.initialData?.searchResult != null;
-      if (!hasSearchResult) { failures++; if (failures > 3) return null; continue; }
+      if (!hasSearchResult) { failures++; return; }
       validPages++;
       found.push(...matchWalmartNextData(nextData));
     } catch {
-      failures++; if (failures > 3) return null; continue;
+      failures++;
     }
-    await sleep(250);
-  }
-  // Fall back to browser if no queries returned a valid search results page
+  });
+  await runWithConcurrency(queryTasks, 4);
   if (validPages === 0) return null;
   return failures > 0 && found.length === 0 ? null : dedupFound(found);
 }
@@ -1002,7 +1038,9 @@ async function scrapeWalmartStore(store) {
   console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser`);
   const page = await newPage();
   try {
-    return await scrapeWalmartViaBrowser(store, page);
+    const result = await scrapeWalmartViaBrowser(store, page);
+    await saveBrowserState(page.context());
+    return result;
   } finally {
     await page.context().close();
   }
@@ -1055,54 +1093,69 @@ async function scrapeKrogerStore(store) {
 
   // Use broad SEARCH_QUERIES (12) instead of per-bottle (40) to cut API calls ~70%
   const found = [];
-  for (const query of shuffle(SEARCH_QUERIES)) {
-    const url = `https://api.kroger.com/v1/products?filter.term=${encodeURIComponent(query)}&filter.locationId=${store.storeId}&filter.limit=50`;
+
+  function matchKrogerProducts(products) {
+    for (const product of products) {
+      const title = product.description || "";
+      const inStock = product.items?.some(
+        (i) =>
+          i.fulfillment?.inStore === true &&
+          i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
+      );
+      if (!inStock) continue;
+      for (const bottle of TARGET_BOTTLES) {
+        if (matchesBottle(title, bottle)) {
+          // Prefer the item variant that is actually in-store, not blindly items[0]
+          // (which may be a different size at a different price)
+          const inStoreItem = product.items?.find(
+            (i) => i.fulfillment?.inStore === true && i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
+          ) || product.items?.[0];
+          const price = inStoreItem?.price?.regular;
+          const fulfillmentParts = [];
+          if (inStoreItem?.fulfillment?.inStore) fulfillmentParts.push("In-store");
+          if (inStoreItem?.fulfillment?.shipToHome) fulfillmentParts.push("Ship to home");
+          found.push({
+            name: bottle.name,
+            url: product.productId ? `https://www.kroger.com/p/${product.productId}` : "",
+            price: price != null ? `$${price.toFixed(2)}` : "",
+            sku: product.productId || "",
+            size: inStoreItem?.size || "",
+            fulfillment: fulfillmentParts.join(", "),
+          });
+        }
+      }
+    }
+  }
+
+  // Run all queries in parallel (API-key auth, no bot detection risk)
+  await Promise.all(shuffle(SEARCH_QUERIES).map(async (query, i) => {
+    await sleep(i * 50); // stagger starts to avoid thundering herd
+    const baseUrl = `https://api.kroger.com/v1/products?filter.term=${encodeURIComponent(query)}&filter.locationId=${store.storeId}&filter.limit=50`;
     try {
       const krogerOpts = {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
         signal: AbortSignal.timeout(15000),
       };
       if (proxyAgent) krogerOpts.agent = proxyAgent;
-      const res = await fetchRetry(url, krogerOpts);
+      const res = await fetchRetry(baseUrl, krogerOpts);
       // Clear cached token on 401 so next call re-authenticates
       if (res.status === 401) { krogerToken = null; throw new Error("Token expired (401)"); }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      for (const product of data.data || []) {
-        const title = product.description || "";
-        const inStock = product.items?.some(
-          (i) =>
-            i.fulfillment?.inStore === true &&
-            i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
-        );
-        if (!inStock) continue;
-        for (const bottle of TARGET_BOTTLES) {
-          if (matchesBottle(title, bottle)) {
-            // Prefer the item variant that is actually in-store, not blindly items[0]
-            // (which may be a different size at a different price)
-            const inStoreItem = product.items?.find(
-              (i) => i.fulfillment?.inStore === true && i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
-            ) || product.items?.[0];
-            const price = inStoreItem?.price?.regular;
-            const fulfillmentParts = [];
-            if (inStoreItem?.fulfillment?.inStore) fulfillmentParts.push("In-store");
-            if (inStoreItem?.fulfillment?.shipToHome) fulfillmentParts.push("Ship to home");
-            found.push({
-              name: bottle.name,
-              url: product.productId ? `https://www.kroger.com/p/${product.productId}` : "",
-              price: price != null ? `$${price.toFixed(2)}` : "",
-              sku: product.productId || "",
-              size: inStoreItem?.size || "",
-              fulfillment: fulfillmentParts.join(", "),
-            });
-          }
+      matchKrogerProducts(data.data || []);
+      // Fetch page 2 if first page was full (may have more results)
+      if (data.data?.length === 50) {
+        const page2Opts = { ...krogerOpts, signal: AbortSignal.timeout(15000) };
+        const res2 = await fetchRetry(`${baseUrl}&filter.start=50`, page2Opts);
+        if (res2.ok) {
+          const data2 = await res2.json();
+          matchKrogerProducts(data2.data || []);
         }
       }
     } catch (err) {
       console.error(`[kroger:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
-    await sleep(250);
-  }
+  }));
   return dedupFound(found);
 }
 
@@ -1117,7 +1170,9 @@ async function scrapeSafewayStore(store) {
   const found = [];
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
 
-  for (const query of shuffle(SEARCH_QUERIES)) {
+  // Run all queries in parallel (API-key auth, no bot detection risk)
+  await Promise.all(shuffle(SEARCH_QUERIES).map(async (query, i) => {
+    await sleep(i * 50); // stagger starts
     const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
     try {
       const safewayOpts = {
@@ -1154,8 +1209,7 @@ async function scrapeSafewayStore(store) {
     } catch (err) {
       console.error(`[safeway:${store.storeId}] Error searching "${query}": ${err.message}`);
     }
-    await sleep(350);
-  }
+  }));
   return dedupFound(found);
 }
 
@@ -1200,8 +1254,6 @@ async function poll() {
 
   // Reset per-poll state
   krogerToken = null;
-
-  await launchBrowser();
 
   // Helper to record results for a store and send alerts
   async function recordResult(retailer, store, inStock) {
@@ -1312,7 +1364,7 @@ export {
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  launchBrowser, closeBrowser, newPage, isBlockedPage, fetchRetry,
+  IS_MAC, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,

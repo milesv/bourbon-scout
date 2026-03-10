@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => {
     fetch: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
+    rename: vi.fn(),
     chromiumLaunch: vi.fn(),
     chromiumUse: vi.fn(),
     cronSchedule: vi.fn(),
@@ -43,6 +44,7 @@ vi.mock("node-cron", () => ({ default: { schedule: mocks.cronSchedule } }));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
   writeFile: mocks.writeFile,
+  rename: mocks.rename,
 }));
 vi.mock("../lib/discover-stores.js", () => ({
   discoverStores: mocks.discoverStores,
@@ -79,9 +81,9 @@ function setupMockBrowser() {
     evaluate: vi.fn().mockResolvedValue([]),
     $$eval: vi.fn().mockResolvedValue([]),
     $eval: vi.fn().mockResolvedValue(null),
-    context: vi.fn(() => ({ close: vi.fn().mockResolvedValue(undefined) })),
+    context: vi.fn(() => ({ close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }) })),
   };
-  const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined) };
+  const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }) };
   const mockBrowser = { newContext: vi.fn().mockResolvedValue(mockContext), close: vi.fn().mockResolvedValue(undefined) };
   mocks.chromiumLaunch.mockResolvedValue(mockBrowser);
   return { browser: mockBrowser, context: mockContext, page: mockPage };
