@@ -21,7 +21,7 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 import {
-  loadCache, saveCache, isCacheValid,
+  loadCache, saveCache, isCacheValid, cleanStoreEntries,
   locateCostco, locateTotalWine, locateWalmart,
   locateKroger, locateSafeway, locateBevMo,
   discoverStores,
@@ -110,6 +110,72 @@ describe("isCacheValid", () => {
     const sixDaysAgo = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000).toISOString();
     const cache = { zipCode: "85283", radiusMiles: 15, discoveredAt: sixDaysAgo };
     expect(isCacheValid(cache, "85283", 15)).toBe(true);
+  });
+});
+
+// ─── Store Name Sanitization ─────────────────────────────────────────────────
+
+describe("cleanStoreEntries", () => {
+  it("strips distance text from store names", () => {
+    const retailers = {
+      safeway: [
+        { storeId: "1515", name: "Safeway Safeway E Elliot Rd1.83 mi to your search", address: "1515 E Elliot Rd", distanceMiles: 1.83 },
+      ],
+    };
+    cleanStoreEntries(retailers);
+    expect(retailers.safeway[0].name).toBe("Safeway E Elliot Rd");
+  });
+
+  it("filters non-store entries like location count headers", () => {
+    const retailers = {
+      safeway: [
+        { storeId: "sw-2", name: 'Safeway 20 locations near "Tempe, AZ"', address: "", distanceMiles: null },
+        { storeId: "1515", name: "Safeway E Elliot Rd", address: "1515 E Elliot Rd", distanceMiles: 1.83 },
+      ],
+    };
+    cleanStoreEntries(retailers);
+    expect(retailers.safeway).toHaveLength(1);
+    expect(retailers.safeway[0].storeId).toBe("1515");
+  });
+
+  it("deduplicates stores by storeId", () => {
+    const retailers = {
+      safeway: [
+        { storeId: "1515", name: "Safeway E Elliot Rd", address: "1515 E Elliot Rd", distanceMiles: 1.83 },
+        { storeId: "1515", name: "Safeway E Elliot Rd", address: "1515 E Elliot Rd", distanceMiles: 1.83 },
+        { storeId: "1515", name: "Safeway E Elliot Rd", address: "1515 E Elliot Rd", distanceMiles: 1.83 },
+      ],
+    };
+    cleanStoreEntries(retailers);
+    expect(retailers.safeway).toHaveLength(1);
+  });
+
+  it("fixes double retailer prefix", () => {
+    const retailers = {
+      safeway: [{ storeId: "1", name: "Safeway Safeway Store", address: "", distanceMiles: null }],
+      costco: [{ storeId: "2", name: "Costco Costco Chandler", address: "", distanceMiles: null }],
+    };
+    cleanStoreEntries(retailers);
+    expect(retailers.safeway[0].name).toBe("Safeway Store");
+    expect(retailers.costco[0].name).toBe("Costco Chandler");
+  });
+
+  it("normalizes non-breaking spaces", () => {
+    const retailers = {
+      safeway: [{ storeId: "1", name: "Safeway\u00a0Store", address: "", distanceMiles: null }],
+    };
+    cleanStoreEntries(retailers);
+    expect(retailers.safeway[0].name).toBe("Safeway Store");
+  });
+
+  it("handles already-clean names", () => {
+    const retailers = {
+      walmart: [
+        { storeId: "5768", name: "Walmart Supercenter #5768", address: "800 E Southern Ave", distanceMiles: 1.8 },
+      ],
+    };
+    cleanStoreEntries(retailers);
+    expect(retailers.walmart[0].name).toBe("Walmart Supercenter #5768");
   });
 });
 
