@@ -47,6 +47,16 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install chromium
 
+      # Cache state files so stock-change tracking persists across runs
+      - uses: actions/cache@v4
+        with:
+          path: |
+            state.json
+            stores.json
+            browser-state.json
+          key: bourbon-state-local-${{ github.run_id }}
+          restore-keys: bourbon-state-local-
+
       - name: Run scan
         run: node scraper.js
         env:
@@ -99,6 +109,7 @@ jobs:
           path: |
             state.json
             stores.json
+            browser-state.json
           key: bourbon-state-${{ github.run_id }}
           restore-keys: bourbon-state-
 

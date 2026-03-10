@@ -1,10 +1,10 @@
 # Bourbon Scout
 
-Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 retailers for 40 rare/allocated bottles near a zip code, sends per-store Discord alerts with @everyone pings when bottles are found, plus a quiet summary after each scan.
+Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 retailers for 38 rare/allocated bottles near a zip code, sends per-store Discord alerts with @everyone pings when bottles are found, plus a quiet summary after each scan.
 
 ## Architecture
 
-- **`scraper.js`** — Main entry point. Contains all scrapers, Discord alerting, and poll orchestration. Runs a cron-scheduled poll loop (or single-run via `RUN_ONCE=true` for CI). Scans all stores concurrently with a limit of 4.
+- **`scraper.js`** — Main entry point. Contains all scrapers, Discord alerting, and poll orchestration. Runs a cron-scheduled poll loop (or single-run via `RUN_ONCE=true` for CI). Scans all stores concurrently with a limit of 6.
 - **`lib/geo.js`** — Zip-to-coordinates (`zipToCoords`) via zippopotam.us API and `haversine` distance calculation. No dependencies.
 - **`lib/discover-stores.js`** — Auto-discovers nearby stores for all retailers given a zip code and radius. Caches results to `stores.json` with a 7-day TTL. Uses Playwright for browser-based store locators and Kroger REST API for Kroger.
 - **`lib/fallback-stores.js`** — Static hardcoded store data for the 85283 area. Used when browser-based store locators fail (e.g., CI datacenter IPs get blocked).
@@ -19,9 +19,9 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 reta
 - **Playwright + Stealth + Hardened Launch** — `playwright-extra` with `puppeteer-extra-plugin-stealth`. Browser launches with `--disable-blink-features=AutomationControlled` and `ignoreDefaultArgs: ['--enable-automation']`. Browser contexts get platform-aware Chrome 136 UA + `Sec-CH-UA` Client Hints matching `FETCH_HEADERS`.
 - **Platform-aware User-Agent** — `IS_MAC` detection at module level. macOS Chrome UA + `Sec-CH-UA-Platform: "macOS"` on Mac, Windows Chrome on Linux/CI. Prevents UA-vs-TLS fingerprint mismatch that bot detectors flag.
 - **Lazy browser launch** — Browser is only launched when a scraper actually needs it (via `newPage()`). When all scrapers succeed via fetch-first, no browser is started.
-- **Atomic state writes** — `saveState()` writes to `state.json.tmp` then `rename()` to `state.json` (atomic on POSIX). Prevents corruption on crash mid-write.
-- **Browser cookie persistence** — `loadBrowserState()`/`saveBrowserState()` persist Playwright `storageState` to `browser-state.json`. Cookies accumulate across polls, reducing bot detection signals.
-- **Parallel query execution** — API scrapers (Kroger, Safeway) run all 12 queries via `Promise.all` with 50ms staggered starts. Fetch scrapers (Costco, TotalWine, Walmart) use batched parallelism via `runWithConcurrency(queryTasks, 4)`.
+- **Atomic state writes** — `saveState()`, `saveBrowserState()`, `saveCache()` (discover-stores) all write to `.tmp` then `rename()` (atomic on POSIX). Prevents corruption on crash mid-write.
+- **Browser cookie persistence** — `loadBrowserState()`/`saveBrowserState()` persist Playwright `storageState` to `browser-state.json`. In-memory cache (`browserStateCache`) avoids re-reading from disk on every `newPage()`. Cookies accumulate across polls, reducing bot detection signals.
+- **Parallel query execution** — API scrapers (Kroger, Safeway) run all 13 queries via `Promise.all` with 50ms staggered starts. Fetch scrapers (Costco, TotalWine, Walmart) use batched parallelism via `runWithConcurrency(queryTasks, 4)`.
 - **Kroger pagination** — Fetches page 2 (`filter.start=50`) when first page returns exactly 50 results, catching allocated bottles that spill past the first page.
 - **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 6)`. Browser and API scrapers are unified in the same task queue.
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
@@ -30,16 +30,18 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 reta
 - **Fetch-first with browser fallback** — Walmart, Total Wine, and Costco all try plain HTTP fetch first (via residential proxy) before spinning up a browser page. Walmart parses `__NEXT_DATA__`, Total Wine parses `window.INITIAL_STATE`, Costco parses `data-testid` tiles via `cheerio`. Falls back to Playwright if blocked.
 - **Fetch retry** — `fetchRetry()` retries once on network errors (timeouts, DNS failures) with 1s backoff. Used by all fetch-based scrapers.
 - **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Scraped once and broadcast to all stores.
-- **Broad search queries** — 12 queries cover all 40 bottles. API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
-- **Shared Kroger OAuth token** — Fetched once per poll via singleton promise, shared across all Kroger stores. Clears cached token on 401 for automatic re-auth.
-- **Bot detection** — `isBlockedPage()` checks page title for challenge/CAPTCHA/access-denied indicators. Browser scrapers skip queries that hit bot detection instead of recording false "empty" results.
+- **Broad search queries** — 13 queries cover all 38 bottles. API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
+- **Shared Kroger OAuth token** — Fetched once per poll via singleton promise, shared across all Kroger stores. Clears cached token on 401 for automatic re-auth. Uses promo price when available (falls back to regular).
+- **Bot detection** — `isBlockedPage()` checks page title AND body text for challenge/CAPTCHA/access-denied/security-check indicators. Browser scrapers skip queries that hit bot detection instead of recording false "empty" results.
+- **Per-retailer Sec-Fetch-Site** — First query per scraper sends `cross-site` + Google Referer (simulating search click). Subsequent queries send `same-origin` + retailer domain Referer (simulating internal navigation).
+- **State pruning** — `pruneState()` removes stale retailer/store entries from `state.json` on each poll, keeping state clean when stores change.
 - **Text normalization** — `normalizeText()` converts Unicode curly quotes/apostrophes to ASCII before matching, preventing silent misses when retailers use `\u2019` in product names.
 - **Fetch sanity checks** — Walmart fetch path validates `__NEXT_DATA__` contains a real `searchResult` structure before trusting results. Prevents challenge pages with valid JSON but no search data from being treated as "nothing in stock."
-- **AbortSignal timeouts** — All fetch calls (Discord 10s, Kroger/Safeway/Walmart 15s) use `AbortSignal.timeout()` to prevent hung requests from blocking concurrency slots.
+- **AbortSignal timeouts** — All fetch calls (Discord 10s, Kroger/Safeway/Walmart 15s, Kroger store locator 15s) use `AbortSignal.timeout()` to prevent hung requests from blocking concurrency slots.
 - **Error isolation** — `runWithConcurrency` wraps tasks in `.catch()` so one failing task never aborts remaining tasks. Costco broadcast loop has per-store try/catch. `saveState`/`closeBrowser`/summary send are all individually error-handled.
 - **Store discovery is separate from scraping** — `discover-stores.js` handles finding stores, `scraper.js` handles checking inventory
 - **State change tracking** — `computeChanges()` diffs previous and current scan results. `updateStoreState()` persists `firstSeen`, `lastSeen`, `scanCount` per bottle per store. Re-alerts every N scans via `REALERT_EVERY_N_SCANS`.
-- **Color-coded Discord embeds** — Green `@everyone` for new finds, orange for OOS losses, blue re-alerts, purple scan summary. Summary includes scanned store list (grouped by retailer) when nothing is found. 429 rate limit retry with `Retry-After` backoff. Embed descriptions truncated at 4096 chars.
+- **Color-coded Discord embeds** — Green `@everyone` for new finds, orange for OOS losses, blue re-alerts, purple scan summary. Summary includes scanned store list (grouped by retailer) when nothing is found. 429 rate limit retry with `Retry-After` backoff (throws after 3x 429 to prevent silent alert loss). Embed descriptions truncated at 4096 chars.
 - **Google Maps links** — Store addresses are hyperlinked to Google Maps universal search URLs.
 
 ## Environment Variables
@@ -68,23 +70,23 @@ All config is in `.env`:
 
 BevMo is omitted from the poll loop — no Arizona locations exist.
 
-## Bottles (40)
+## Bottles (38)
 
-Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch).
+Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch).
 
 ## Tests
 
-330 tests across 5 files using Vitest:
+349 tests across 5 files using Vitest:
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 232 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination, TotalWine stock signals |
+| `test/scraper.test.js` | 251 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing, TotalWine stock signals, Safeway strict inStock, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks |
 | `test/proxy.test.js` | 24 | Proxy agent routing, fetch-first paths (Costco, Total Wine, Walmart), wrapper fallback logic |
 | `test/discover-stores.test.js` | 59 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords and haversine distance |
 | `test/fallback-stores.test.js` | 6 | Static store data validation |
 
-Coverage: 98.9% statements, 91.6% branches, 95.3% functions, 99.5% lines.
+Coverage: 98.8% statements, 91.8% branches, 94.1% functions, 99.5% lines.
 
 ```sh
 npm test             # Run all tests

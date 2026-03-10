@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   fetch: vi.fn(),
   readFile: vi.fn(),
   writeFile: vi.fn(),
+  rename: vi.fn(),
   chromiumLaunch: vi.fn(),
   chromiumUse: vi.fn(),
 }));
@@ -18,6 +19,7 @@ vi.mock("puppeteer-extra-plugin-stealth", () => ({ default: vi.fn() }));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
   writeFile: mocks.writeFile,
+  rename: mocks.rename,
 }));
 
 import {
@@ -71,12 +73,19 @@ describe("loadCache", () => {
 });
 
 describe("saveCache", () => {
-  it("writes cache as formatted JSON", async () => {
+  it("writes to tmp file then renames atomically", async () => {
     mocks.writeFile.mockResolvedValueOnce(undefined);
+    mocks.rename.mockResolvedValueOnce(undefined);
     await saveCache({ zipCode: "85283" });
     expect(mocks.writeFile).toHaveBeenCalledOnce();
+    const tmpPath = mocks.writeFile.mock.calls[0][0];
+    expect(tmpPath).toContain("stores.json.tmp");
     const content = mocks.writeFile.mock.calls[0][1];
     expect(JSON.parse(content)).toEqual({ zipCode: "85283" });
+    expect(mocks.rename).toHaveBeenCalledWith(
+      expect.stringContaining("stores.json.tmp"),
+      expect.stringContaining("stores.json"),
+    );
   });
 });
 

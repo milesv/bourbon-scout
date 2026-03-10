@@ -16,7 +16,7 @@ chromium.use(StealthPlugin());
 
 const {
   DISCORD_WEBHOOK_URL,
-  ZIP_CODE = "85281",
+  ZIP_CODE = "85283",
   SEARCH_RADIUS_MILES = "15",
   MAX_STORES_PER_RETAILER = "5",
   KROGER_CLIENT_ID,
@@ -42,6 +42,7 @@ const SEARCH_QUERIES = [
   "van winkle",                // Pappy 10/12/15/20/23 + Family Reserve Rye 13
   "eh taylor",                 // All Taylor: SmB/SiB/BP/Rye/Seasoned/4Grain/Amaranth/CuredOak/18yr
   "stagg bourbon",             // Stagg Jr + George T. Stagg
+  "george t stagg",            // George T. Stagg (BTAC) — keyword search needs exact name
   "eagle rare 17",             // Eagle Rare 17 Year (BTAC)
   "sazerac rye 18",            // Sazerac Rye 18 Year (BTAC)
   "thomas handy sazerac",      // Thomas H. Handy (BTAC)
@@ -55,9 +56,7 @@ const TARGET_BOTTLES = [
   { name: "Blanton's Gold",             searchTerms: ["blanton's gold", "blantons gold"] },
   { name: "Blanton's Straight from the Barrel", searchTerms: ["blanton's straight from the barrel", "blantons straight from the barrel", "blantons sftb", "blanton's sftb"] },
   { name: "Blanton's Special Reserve",  searchTerms: ["blanton's special reserve", "blantons special reserve"] },
-  { name: "Blanton's Red",              searchTerms: ["blanton's red", "blantons red"] },
-  { name: "Blanton's Green",            searchTerms: ["blanton's green", "blantons green"] },
-  { name: "Blanton's Black",            searchTerms: ["blanton's black", "blantons black"] },
+  { name: "Blanton's Original",         searchTerms: ["blanton's single barrel", "blantons single barrel", "blanton's original", "blantons original"] },
   { name: "Weller Special Reserve",      searchTerms: ["weller special reserve", "weller sr", "w.l. weller special"] },
   { name: "Weller Antique 107",          searchTerms: ["weller antique 107", "old weller antique"] },
   { name: "Weller 12 Year",             searchTerms: ["weller 12", "w.l. weller 12", "weller 12 year"] },
@@ -78,7 +77,7 @@ const TARGET_BOTTLES = [
   { name: "Eagle Rare 17 Year",         searchTerms: ["eagle rare 17"] },
   { name: "William Larue Weller",       searchTerms: ["william larue weller", "wm larue weller", "william l weller", "w.l. weller btac", "larue weller"] },
   { name: "Thomas H. Handy",            searchTerms: ["thomas h. handy", "thomas handy sazerac", "thomas h handy"] },
-  { name: "Sazerac Rye 18 Year",        searchTerms: ["sazerac rye 18", "sazerac 18"] },
+  { name: "Sazerac Rye 18 Year",        searchTerms: ["sazerac rye 18", "sazerac 18 year"] },
   { name: "Pappy Van Winkle 10 Year",   searchTerms: ["pappy van winkle 10", "old rip van winkle 10"] },
   { name: "Pappy Van Winkle 12 Year",   searchTerms: ["pappy van winkle 12", "van winkle special reserve 12"] },
   { name: "Pappy Van Winkle 15 Year",   searchTerms: ["pappy van winkle 15"] },
@@ -162,6 +161,21 @@ function updateStoreState(state, retailerKey, storeId, currentFound) {
   state[retailerKey][storeId] = { bottles, lastScanned: now };
 }
 
+function pruneState(state, activeStores) {
+  for (const retailerKey of Object.keys(state)) {
+    if (!activeStores[retailerKey]) {
+      delete state[retailerKey];
+      continue;
+    }
+    const activeIds = new Set(activeStores[retailerKey].map((s) => s.storeId));
+    for (const storeId of Object.keys(state[retailerKey])) {
+      if (!activeIds.has(storeId)) {
+        delete state[retailerKey][storeId];
+      }
+    }
+  }
+}
+
 // ─── Discord Alerts ──────────────────────────────────────────────────────────
 
 // Post a Discord webhook payload with automatic 429 retry (up to 3 attempts).
@@ -186,6 +200,7 @@ async function postDiscordWebhook(payload) {
     return res;
   }
   console.error("[discord] Webhook failed after 3 retries (rate limited)");
+  throw new Error("Discord webhook failed after 3 retries (rate limited)");
 }
 
 async function sendDiscordAlert(embeds) {
@@ -240,6 +255,11 @@ const STORE_TYPE_LABELS = {
 
 function parseCity(address) {
   if (!address) return "";
+  // Match the city name directly before the state abbreviation + zip.
+  // Handles addresses with commas in street (e.g. "123 Main St, Ste 200, Tempe, AZ 85283")
+  const match = address.match(/,\s*([^,]+?)\s*,\s*[A-Z]{2}\s*\d{5}/);
+  if (match) return match[1].trim();
+  // Fallback: second-to-last comma-separated part
   const parts = address.split(",").map((s) => s.trim());
   if (parts.length >= 2) return parts[parts.length - 2];
   return "";
@@ -520,7 +540,7 @@ const FETCH_HEADERS = {
     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate, br",
+  "Accept-Encoding": "gzip, deflate",
   "Referer": "https://www.google.com/",
   "Sec-CH-UA": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
   "Sec-CH-UA-Mobile": "?0",
@@ -535,10 +555,13 @@ const FETCH_HEADERS = {
 
 let browser = null;
 const BROWSER_STATE_FILE = new URL("./browser-state.json", import.meta.url);
+let browserStateCache = null;
 
 async function loadBrowserState() {
+  if (browserStateCache) return browserStateCache;
   try {
-    return JSON.parse(await readFile(BROWSER_STATE_FILE, "utf-8"));
+    browserStateCache = JSON.parse(await readFile(BROWSER_STATE_FILE, "utf-8"));
+    return browserStateCache;
   } catch {
     return undefined;
   }
@@ -547,7 +570,10 @@ async function loadBrowserState() {
 async function saveBrowserState(context) {
   try {
     const state = await context.storageState();
-    await writeFile(fileURLToPath(BROWSER_STATE_FILE), JSON.stringify(state));
+    browserStateCache = state;
+    const tmp = fileURLToPath(BROWSER_STATE_FILE) + ".tmp";
+    await writeFile(tmp, JSON.stringify(state));
+    await rename(tmp, fileURLToPath(BROWSER_STATE_FILE));
   } catch { /* best-effort */ }
 }
 
@@ -608,9 +634,17 @@ async function newPage() {
 async function isBlockedPage(page) {
   const title = await page.title().catch(() => "");
   const lower = title.toLowerCase();
-  return lower.includes("access denied") || lower.includes("robot") ||
-    lower.includes("captcha") || lower.includes("challenge") ||
-    lower.includes("blocked") || lower.includes("verify");
+  if (lower.includes("access denied") || lower.includes("robot") ||
+      lower.includes("captcha") || lower.includes("challenge") ||
+      lower.includes("blocked") || lower.includes("verify")) {
+    return true;
+  }
+  // Check body text for challenges that use normal-looking titles
+  const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || "").catch(() => "");
+  const bodyLower = bodyText.toLowerCase();
+  return bodyLower.includes("please verify") || bodyLower.includes("are you a robot") ||
+    bodyLower.includes("security check") || bodyLower.includes("one more step") ||
+    bodyLower.includes("checking your browser");
 }
 
 // ─── Costco: fetch-first with browser fallback ──────────────────────────────
@@ -625,7 +659,8 @@ function matchCostcoTiles($) {
     const id = ($tile.attr("data-testid") || "").replace("ProductTile_", "");
     const title = $tile.find(`[data-testid="Text_ProductTile_${id}_title"], h3`).first().text().trim();
     const price = $tile.find(`[data-testid="Text_Price_${id}"], [data-testid^="Text_Price_"]`).first().text().trim();
-    const url = $tile.find('a[href*=".product."]').first().attr("href") || "";
+    const href = $tile.find('a[href*=".product."]').first().attr("href") || "";
+    const url = href || (id ? `https://www.costco.com/.product.${id}.html` : "");
 
     for (const bottle of TARGET_BOTTLES) {
       if (matchesBottle(title, bottle)) {
@@ -643,13 +678,20 @@ async function scrapeCostcoViaFetch() {
   const found = [];
   let failures = 0;
   let validPages = 0;
+  let isFirstQuery = true;
   // Batch queries (4 concurrent) — balances speed vs bot detection risk
   const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
     if (failures > 3) return;
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
+    const headers = { ...FETCH_HEADERS };
+    if (!isFirstQuery) {
+      headers["Sec-Fetch-Site"] = "same-origin";
+      headers["Referer"] = "https://www.costco.com/";
+    }
+    isFirstQuery = false;
     try {
       const res = await fetchRetry(url, {
-        headers: FETCH_HEADERS,
+        headers,
         signal: AbortSignal.timeout(15000),
         agent: proxyAgent,
       });
@@ -660,7 +702,7 @@ async function scrapeCostcoViaFetch() {
       }
       const $ = cheerio.load(html);
       const hasTiles = $('[data-testid^="ProductTile_"]').length > 0;
-      if (!hasTiles && failures === 0) { validPages++; return; }
+      if (!hasTiles) { validPages++; return; }
       if (hasTiles) validPages++;
       found.push(...matchCostcoTiles($));
     } catch {
@@ -669,7 +711,7 @@ async function scrapeCostcoViaFetch() {
   });
   await runWithConcurrency(queryTasks, 4);
   if (validPages === 0) return null;
-  return failures > 0 && found.length === 0 ? null : dedupFound(found);
+  return dedupFound(found);
 }
 
 // Browser-based Costco scraper (fallback). Uses stable MUI data-testid attributes.
@@ -705,9 +747,10 @@ async function scrapeCostcoOnce(page) {
       );
 
       for (const p of products) {
+        const productUrl = p.url || (p.id ? `https://www.costco.com/.product.${p.id}.html` : "");
         for (const bottle of TARGET_BOTTLES) {
           if (matchesBottle(p.title, bottle)) {
-            found.push({ name: bottle.name, url: p.url, price: p.price, sku: p.id || "", size: parseSize(p.title), fulfillment: "" });
+            found.push({ name: bottle.name, url: productUrl, price: p.price, sku: p.id || "", size: parseSize(p.title), fulfillment: "" });
           }
         }
       }
@@ -778,13 +821,20 @@ async function scrapeTotalWineViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
+  let isFirstQuery = true;
   // Batch queries (4 concurrent) — balances speed vs PerimeterX detection risk
   const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
     if (failures > 3) return;
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
+    const headers = { ...FETCH_HEADERS };
+    if (!isFirstQuery) {
+      headers["Sec-Fetch-Site"] = "same-origin";
+      headers["Referer"] = "https://www.totalwine.com/";
+    }
+    isFirstQuery = false;
     try {
       const res = await fetchRetry(url, {
-        headers: FETCH_HEADERS,
+        headers,
         signal: AbortSignal.timeout(15000),
         agent: proxyAgent,
       });
@@ -807,7 +857,7 @@ async function scrapeTotalWineViaFetch(store) {
   });
   await runWithConcurrency(queryTasks, 4);
   if (validPages === 0) return null;
-  return failures > 0 && found.length === 0 ? null : dedupFound(found);
+  return dedupFound(found);
 }
 
 // Browser-based Total Wine scraper (fallback). Accepts a shared Playwright page.
@@ -942,14 +992,21 @@ async function scrapeWalmartViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
+  let isFirstQuery = true;
   // Batch queries (4 concurrent) — balances speed vs Akamai/PerimeterX detection risk
   const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
     if (failures > 3) return;
-    const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&cat_id=976759&store_id=${store.storeId}`;
+    const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
+    const headers = { ...FETCH_HEADERS };
+    if (!isFirstQuery) {
+      headers["Sec-Fetch-Site"] = "same-origin";
+      headers["Referer"] = "https://www.walmart.com/";
+    }
+    isFirstQuery = false;
     try {
-      const fetchOpts = { headers: FETCH_HEADERS, signal: AbortSignal.timeout(15000) };
+      const fetchOpts = { headers, signal: AbortSignal.timeout(15000) };
       if (proxyAgent) fetchOpts.agent = proxyAgent;
-      const res = await fetch(url, fetchOpts);
+      const res = await fetchRetry(url, fetchOpts);
       if (!res.ok) { failures++; return; }
       const html = await res.text();
       const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
@@ -965,17 +1022,17 @@ async function scrapeWalmartViaFetch(store) {
   });
   await runWithConcurrency(queryTasks, 4);
   if (validPages === 0) return null;
-  return failures > 0 && found.length === 0 ? null : dedupFound(found);
+  return dedupFound(found);
 }
 
 // Browser-based Walmart scraper (fallback). Accepts a shared page.
 async function scrapeWalmartViaBrowser(store, page) {
   const found = [];
   for (const query of shuffle(SEARCH_QUERIES)) {
-    const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&cat_id=976759&store_id=${store.storeId}`;
+    const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(2000);
+      await page.waitForFunction(() => document.querySelector('script#__NEXT_DATA__')?.textContent?.length > 100, { timeout: 10000 }).catch(() => {});
 
       if (await isBlockedPage(page)) {
         console.warn(`[walmart:${store.storeId}] Bot detection page for query "${query}" — skipping`);
@@ -1110,7 +1167,7 @@ async function scrapeKrogerStore(store) {
           const inStoreItem = product.items?.find(
             (i) => i.fulfillment?.inStore === true && i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
           ) || product.items?.[0];
-          const price = inStoreItem?.price?.regular;
+          const price = inStoreItem?.price?.promo ?? inStoreItem?.price?.regular;
           const fulfillmentParts = [];
           if (inStoreItem?.fulfillment?.inStore) fulfillmentParts.push("In-store");
           if (inStoreItem?.fulfillment?.shipToHome) fulfillmentParts.push("Ship to home");
@@ -1189,7 +1246,7 @@ async function scrapeSafewayStore(store) {
       const products = data?.primaryProducts?.response?.docs || [];
       for (const product of products) {
         const title = product.name || product.productTitle || "";
-        if (!product.inStock) continue;
+        if (product.inStock !== true && product.inStock !== 1) continue;
         for (const bottle of TARGET_BOTTLES) {
           if (matchesBottle(title, bottle)) {
             const fulfillmentParts = [];
@@ -1244,6 +1301,7 @@ async function poll() {
   console.log(`[poll] Starting scan at ${new Date().toISOString()}`);
 
   const state = await loadState();
+  pruneState(state, storeCache.retailers);
   let storesScanned = 0;
   let totalNewFinds = 0;
   let totalStillInStock = 0;
@@ -1254,6 +1312,7 @@ async function poll() {
 
   // Reset per-poll state
   krogerToken = null;
+  browserStateCache = null;
 
   // Helper to record results for a store and send alerts
   async function recordResult(retailer, store, inStock) {
@@ -1261,6 +1320,7 @@ async function poll() {
     const changes = computeChanges(previousStore, inStock);
     updateStoreState(state, retailer.key, store.storeId, inStock);
     storesScanned++;
+    retailersSeen.add(retailer.key);
     scannedStores.push({ retailerName: retailer.name, storeName: store.name, storeId: store.storeId });
 
     totalNewFinds += changes.newFinds.length;
@@ -1285,7 +1345,6 @@ async function poll() {
   for (const retailer of RETAILERS) {
     const stores = storeCache.retailers[retailer.key] || [];
     if (stores.length === 0) continue;
-    retailersSeen.add(retailer.key);
 
     if (retailer.scrapeOnce) {
       // Scrape once, broadcast results to all stores (e.g., Costco has no per-store filter)
@@ -1362,7 +1421,7 @@ export {
   normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
-  loadState, saveState, computeChanges, updateStoreState,
+  loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
@@ -1376,6 +1435,7 @@ export {
 export function _setStoreCache(cache) { storeCache = cache; }
 export function _resetPolling() { polling = false; }
 export function _resetKrogerToken() { krogerToken = null; krogerTokenPromise = null; }
+export function _resetBrowserStateCache() { browserStateCache = null; }
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
