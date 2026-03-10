@@ -138,6 +138,18 @@ describe("cleanStoreEntries", () => {
     expect(retailers.safeway[0].storeId).toBe("1515");
   });
 
+  it("drops synthetic sw-N store IDs", () => {
+    const retailers = {
+      safeway: [
+        { storeId: "sw-0", name: "Safeway E Elliot Rd", address: "1515 E Elliot Rd", distanceMiles: 1.83 },
+        { storeId: "1515", name: "Safeway E Elliot Rd", address: "1515 E Elliot Rd", distanceMiles: 1.83 },
+      ],
+    };
+    cleanStoreEntries(retailers);
+    expect(retailers.safeway).toHaveLength(1);
+    expect(retailers.safeway[0].storeId).toBe("1515");
+  });
+
   it("deduplicates stores by storeId", () => {
     const retailers = {
       safeway: [
