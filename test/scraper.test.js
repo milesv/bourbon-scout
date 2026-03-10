@@ -48,7 +48,7 @@ import {
   SEARCH_QUERIES, TARGET_BOTTLES, RETAILERS, FETCH_HEADERS,
   normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
-  formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
+  formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
@@ -2906,5 +2906,182 @@ describe("scrapeKrogerStore pagination", () => {
       (c) => typeof c[0] === "string" && c[0].includes("filter.start=50")
     );
     expect(page2Calls.length).toBe(0);
+  });
+});
+
+// ─── Round 3: 16 new improvements ────────────────────────────────────────────
+
+describe("Stagg Jr expanded search terms (#1)", () => {
+  it("matches 'Stagg Bourbon' as Stagg Jr", () => {
+    const stagg = TARGET_BOTTLES.find((b) => b.name === "Stagg Jr");
+    expect(matchesBottle("Stagg Bourbon Kentucky Straight 750ml", stagg)).toBe(true);
+  });
+
+  it("matches 'Stagg Kentucky' as Stagg Jr", () => {
+    const stagg = TARGET_BOTTLES.find((b) => b.name === "Stagg Jr");
+    expect(matchesBottle("Stagg Kentucky Straight Bourbon Whiskey", stagg)).toBe(true);
+  });
+
+  it("does not cross-match George T. Stagg with Stagg Jr via 'stagg bourbon'", () => {
+    const gts = TARGET_BOTTLES.find((b) => b.name === "George T. Stagg");
+    expect(matchesBottle("Stagg Bourbon 750ml", gts)).toBe(false);
+  });
+});
+
+describe("Thomas H. Handy short search term (#4)", () => {
+  it("matches 'Thomas Handy' without 'sazerac' suffix", () => {
+    const handy = TARGET_BOTTLES.find((b) => b.name === "Thomas H. Handy");
+    expect(matchesBottle("Thomas Handy Rye Whiskey 2024 Release", handy)).toBe(true);
+  });
+});
+
+describe("Old Forester President search term (#16)", () => {
+  it("matches 'Old Forester President' without 'Choice' suffix", () => {
+    const pc = TARGET_BOTTLES.find((b) => b.name === "Old Forester President's Choice");
+    expect(matchesBottle("Old Forester President Barrel Pick 750ml", pc)).toBe(true);
+  });
+});
+
+describe("FETCH_HEADERS Chrome 136 fidelity (#5, #6)", () => {
+  it("Accept header matches full Chrome 136 value", () => {
+    expect(FETCH_HEADERS["Accept"]).toContain("image/avif");
+    expect(FETCH_HEADERS["Accept"]).toContain("image/webp");
+    expect(FETCH_HEADERS["Accept"]).toContain("application/signed-exchange");
+  });
+
+  it("includes Sec-Fetch-User header", () => {
+    expect(FETCH_HEADERS["Sec-Fetch-User"]).toBe("?1");
+  });
+});
+
+describe("parseSize centiliter support (#14)", () => {
+  it("converts 75cl to 750ml", () => {
+    expect(parseSize("Weller Special Reserve 75cl")).toBe("750ml");
+  });
+
+  it("converts 70cl to 700ml", () => {
+    expect(parseSize("Blanton's Gold 70 cl")).toBe("700ml");
+  });
+
+  it("converts 50cl to 500ml", () => {
+    expect(parseSize("Whiskey Miniature 50cl")).toBe("500ml");
+  });
+});
+
+describe("formatStoreInfo duplicate name prevention (#15)", () => {
+  it("does not duplicate retailer name when store.name already starts with it", () => {
+    const store = { ...TEST_STORE, name: "Costco Chandler" };
+    const info = formatStoreInfo("costco", "Costco", store);
+    expect(info.title).toContain("Costco Chandler");
+    expect(info.title).not.toContain("Costco Costco");
+    expect(info.storeLine).not.toContain("Costco Costco");
+  });
+
+  it("prefixes retailer name when store.name does not start with it", () => {
+    const store = { ...TEST_STORE, name: "Chandler" };
+    const info = formatStoreInfo("costco", "Costco", store);
+    expect(info.title).toContain("Costco Chandler");
+  });
+});
+
+describe("truncateTitle (#8, #13)", () => {
+  it("returns short titles unchanged", () => {
+    const title = "🚨 NEW FIND — Costco Tempe (#736) · 3.5 mi";
+    expect(truncateTitle(title)).toBe(title);
+  });
+
+  it("truncates titles exceeding 256 chars", () => {
+    const longTitle = "🚨 NEW FIND — " + "A".repeat(300);
+    const result = truncateTitle(longTitle);
+    expect(result.length).toBeLessThanOrEqual(DISCORD_TITLE_LIMIT);
+    expect(result).toMatch(/…$/);
+  });
+
+  it("returns exactly-at-limit titles unchanged", () => {
+    const title = "x".repeat(DISCORD_TITLE_LIMIT);
+    expect(truncateTitle(title)).toBe(title);
+  });
+});
+
+describe("Safeway price formatting (#7)", () => {
+  it("formats price to 2 decimal places", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        primaryProducts: { response: { docs: [{
+          name: "Weller Special Reserve Bourbon 750ml", inStock: true,
+          url: "/product/weller-sr", price: 33,
+        }] } },
+      }),
+    });
+    const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
+    const weller = found.find((f) => f.name === "Weller Special Reserve");
+    // Should be "$33.00", not "$33"
+    expect(weller.price).toBe("$33.00");
+  });
+
+  it("formats fractional price correctly", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        primaryProducts: { response: { docs: [{
+          name: "Weller Special Reserve Bourbon 750ml", inStock: true,
+          url: "/product/weller-sr", price: 32.5,
+        }] } },
+      }),
+    });
+    const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
+    const weller = found.find((f) => f.name === "Weller Special Reserve");
+    expect(weller.price).toBe("$32.50");
+  });
+});
+
+describe("fetchRetry warns on first failure (#11)", () => {
+  it("logs a warning before retrying", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.fetch
+      .mockRejectedValueOnce(new Error("ECONNRESET"))
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+    await runWithFakeTimers(() => fetchRetry("http://example.com", {}));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("[fetchRetry]"));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("ECONNRESET"));
+    warnSpy.mockRestore();
+  });
+});
+
+describe("Total Wine INITIAL_STATE brace-counting extraction (#12)", () => {
+  // Note: scrapeTotalWineViaFetch requires proxyAgent (module-level, frozen at import).
+  // The brace-counting parser is tested end-to-end in test/proxy.test.js.
+  // Here we verify the matcher handles product data with special characters.
+  it("matchTotalWineInitialState handles descriptions with special HTML chars", () => {
+    const state = {
+      search: { results: { products: [{
+        name: "Weller Special Reserve Bourbon Whiskey",
+        productUrl: "/spirits/bourbon/weller-sr/p/12345",
+        stockLevel: [{ stock: 5 }],
+        description: 'Uses a </script> tag & <b>HTML</b> entities',
+      }] } },
+    };
+    const found = matchTotalWineInitialState(state);
+    expect(found.length).toBe(1);
+    expect(found[0].name).toBe("Weller Special Reserve");
+  });
+});
+
+describe("buildSummaryEmbed uses truncateDescription (#8)", () => {
+  it("truncates extremely long summary descriptions", () => {
+    // Create many stores to generate a very long summary
+    const scannedStores = Array.from({ length: 200 }, (_, i) => ({
+      retailerName: `Retailer${i}`,
+      storeName: `Store With An Extremely Long Name Number ${i} In Some City`,
+      storeId: `${i}`,
+    }));
+    const embed = buildSummaryEmbed({
+      storesScanned: 200, retailersScanned: 200,
+      totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 200,
+      durationSec: 600, scannedStores,
+    });
+    expect(embed.description.length).toBeLessThanOrEqual(DISCORD_DESC_LIMIT);
   });
 });

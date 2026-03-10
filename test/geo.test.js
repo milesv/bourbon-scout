@@ -53,7 +53,10 @@ describe("zipToCoords", () => {
 
     const result = await zipToCoords("85283");
     expect(result).toEqual({ lat: 33.4152, lng: -111.8315 });
-    expect(fetch).toHaveBeenCalledWith("https://api.zippopotam.us/us/85283");
+    expect(fetch).toHaveBeenCalledWith(
+      "https://api.zippopotam.us/us/85283",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it("throws on invalid zip (HTTP error)", async () => {

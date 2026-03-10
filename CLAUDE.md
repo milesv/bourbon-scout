@@ -28,20 +28,22 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 reta
 - **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a residential proxy. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
 - **Query order randomization** — `shuffle(SEARCH_QUERIES)` via Fisher-Yates before every scraper loop to avoid predictable access patterns that anti-bot ML models flag.
 - **Fetch-first with browser fallback** — Walmart, Total Wine, and Costco all try plain HTTP fetch first (via residential proxy) before spinning up a browser page. Walmart parses `__NEXT_DATA__`, Total Wine parses `window.INITIAL_STATE`, Costco parses `data-testid` tiles via `cheerio`. Falls back to Playwright if blocked.
-- **Fetch retry** — `fetchRetry()` retries once on network errors (timeouts, DNS failures) with 1s backoff. Used by all fetch-based scrapers.
+- **Fetch retry** — `fetchRetry()` retries once on network errors (timeouts, DNS failures) with 1s backoff and `console.warn` on first failure. Used by all fetch-based scrapers.
+- **Brace-counting JSON extraction** — Total Wine INITIAL_STATE is extracted from HTML using a character-by-character brace counter that tracks string context and escape characters, safely handling `</script>` inside JSON string values.
 - **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Scraped once and broadcast to all stores.
 - **Broad search queries** — 13 queries cover all 38 bottles. API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
 - **Shared Kroger OAuth token** — Fetched once per poll via singleton promise, shared across all Kroger stores. Clears cached token on 401 for automatic re-auth. Uses promo price when available (falls back to regular).
 - **Bot detection** — `isBlockedPage()` checks page title AND body text for challenge/CAPTCHA/access-denied/security-check indicators. Browser scrapers skip queries that hit bot detection instead of recording false "empty" results.
-- **Per-retailer Sec-Fetch-Site** — First query per scraper sends `cross-site` + Google Referer (simulating search click). Subsequent queries send `same-origin` + retailer domain Referer (simulating internal navigation).
+- **Per-retailer Sec-Fetch-Site** — First query per scraper sends `cross-site` + Google Referer (simulating search click). Subsequent queries send `same-origin` + retailer domain Referer (simulating internal navigation). Uses `.map()` index (`i > 0`) instead of runtime flag to avoid race conditions in concurrent task execution.
+- **Chrome-accurate FETCH_HEADERS** — `Accept` header matches real Chrome 136 (includes `image/avif`, `image/webp`, `application/signed-exchange`). `Sec-Fetch-User: ?1` header included. `Accept-Encoding` is `gzip, deflate` only (Brotli removed, `node-fetch` can't decompress it).
 - **State pruning** — `pruneState()` removes stale retailer/store entries from `state.json` on each poll, keeping state clean when stores change.
 - **Text normalization** — `normalizeText()` converts Unicode curly quotes/apostrophes to ASCII before matching, preventing silent misses when retailers use `\u2019` in product names.
 - **Fetch sanity checks** — Walmart fetch path validates `__NEXT_DATA__` contains a real `searchResult` structure before trusting results. Prevents challenge pages with valid JSON but no search data from being treated as "nothing in stock."
-- **AbortSignal timeouts** — All fetch calls (Discord 10s, Kroger/Safeway/Walmart 15s, Kroger store locator 15s) use `AbortSignal.timeout()` to prevent hung requests from blocking concurrency slots.
+- **AbortSignal timeouts** — All fetch calls (Discord 10s, zipToCoords 10s, Kroger/Safeway/Walmart 15s, Kroger store locator 15s) use `AbortSignal.timeout()` to prevent hung requests from blocking concurrency slots.
 - **Error isolation** — `runWithConcurrency` wraps tasks in `.catch()` so one failing task never aborts remaining tasks. Costco broadcast loop has per-store try/catch. `saveState`/`closeBrowser`/summary send are all individually error-handled.
 - **Store discovery is separate from scraping** — `discover-stores.js` handles finding stores, `scraper.js` handles checking inventory
 - **State change tracking** — `computeChanges()` diffs previous and current scan results. `updateStoreState()` persists `firstSeen`, `lastSeen`, `scanCount` per bottle per store. Re-alerts every N scans via `REALERT_EVERY_N_SCANS`.
-- **Color-coded Discord embeds** — Green `@everyone` for new finds, orange for OOS losses, blue re-alerts, purple scan summary. Summary includes scanned store list (grouped by retailer) when nothing is found. 429 rate limit retry with `Retry-After` backoff (throws after 3x 429 to prevent silent alert loss). Embed descriptions truncated at 4096 chars.
+- **Color-coded Discord embeds** — Green `@everyone` for new finds, orange for OOS losses, blue re-alerts, purple scan summary. Summary includes scanned store list (grouped by retailer) when nothing is found. 429 rate limit retry with `Retry-After` backoff (throws after 3x 429 to prevent silent alert loss). Embed titles truncated at 256 chars, descriptions at 4096 chars.
 - **Google Maps links** — Store addresses are hyperlinked to Google Maps universal search URLs.
 
 ## Environment Variables
@@ -76,17 +78,17 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-349 tests across 5 files using Vitest:
+369 tests across 5 files using Vitest:
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 251 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing, TotalWine stock signals, Safeway strict inStock, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks |
+| `test/scraper.test.js` | 271 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing, TotalWine stock signals, Safeway strict inStock/price formatting, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks, truncateTitle, parseSize centiliter, formatStoreInfo dedup, fetchRetry logging |
 | `test/proxy.test.js` | 24 | Proxy agent routing, fetch-first paths (Costco, Total Wine, Walmart), wrapper fallback logic |
 | `test/discover-stores.test.js` | 59 | Store locator logic per retailer, store name sanitization |
-| `test/geo.test.js` | 9 | Zip-to-coords and haversine distance |
+| `test/geo.test.js` | 9 | Zip-to-coords, haversine distance, AbortSignal timeout |
 | `test/fallback-stores.test.js` | 6 | Static store data validation |
 
-Coverage: 98.8% statements, 91.8% branches, 94.1% functions, 99.5% lines.
+Coverage: 98.0% statements, 91.8% branches, 93.4% functions, 99.4% lines.
 
 ```sh
 npm test             # Run all tests

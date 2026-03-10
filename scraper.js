@@ -72,11 +72,11 @@ const TARGET_BOTTLES = [
   { name: "E.H. Taylor Amaranth",       searchTerms: ["eh taylor amaranth", "e.h. taylor amaranth"] },
   { name: "E.H. Taylor Cured Oak",      searchTerms: ["eh taylor cured oak", "e.h. taylor cured oak"] },
   { name: "E.H. Taylor 18 Year Marriage", searchTerms: ["eh taylor 18 year", "e.h. taylor 18 year", "eh taylor 18 year marriage", "e.h. taylor 18 year marriage"] },
-  { name: "Stagg Jr",                   searchTerms: ["stagg jr", "stagg junior"] },
+  { name: "Stagg Jr",                   searchTerms: ["stagg jr", "stagg junior", "stagg bourbon", "stagg kentucky"] },
   { name: "George T. Stagg",            searchTerms: ["george t. stagg", "george t stagg"] },
   { name: "Eagle Rare 17 Year",         searchTerms: ["eagle rare 17"] },
   { name: "William Larue Weller",       searchTerms: ["william larue weller", "wm larue weller", "william l weller", "w.l. weller btac", "larue weller"] },
-  { name: "Thomas H. Handy",            searchTerms: ["thomas h. handy", "thomas handy sazerac", "thomas h handy"] },
+  { name: "Thomas H. Handy",            searchTerms: ["thomas h. handy", "thomas handy sazerac", "thomas h handy", "thomas handy"] },
   { name: "Sazerac Rye 18 Year",        searchTerms: ["sazerac rye 18", "sazerac 18 year"] },
   { name: "Pappy Van Winkle 10 Year",   searchTerms: ["pappy van winkle 10", "old rip van winkle 10"] },
   { name: "Pappy Van Winkle 12 Year",   searchTerms: ["pappy van winkle 12", "van winkle special reserve 12"] },
@@ -88,7 +88,7 @@ const TARGET_BOTTLES = [
   { name: "Rock Hill Farms",            searchTerms: ["rock hill farms"] },
   { name: "King of Kentucky",           searchTerms: ["king of kentucky"] },
   { name: "Old Forester Birthday Bourbon", searchTerms: ["old forester birthday"] },
-  { name: "Old Forester President's Choice", searchTerms: ["old forester president's choice", "old forester presidents choice", "president's choice bourbon"] },
+  { name: "Old Forester President's Choice", searchTerms: ["old forester president's choice", "old forester presidents choice", "old forester president", "president's choice bourbon"] },
   { name: "Old Forester 150th Anniversary", searchTerms: ["old forester 150th", "old forester 150"] },
   { name: "Old Forester King Ranch",    searchTerms: ["old forester king ranch"] },
 ];
@@ -281,10 +281,12 @@ function formatStoreInfo(retailerKey, retailerName, store) {
   const mapsLink = store.address
     ? `📍 [${store.address}](https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(store.address)})`
     : "📍 Address unknown";
+  // Strip duplicate retailer prefix (e.g. "Costco Costco Chandler" → "Costco Chandler")
+  const displayName = store.name.startsWith(retailerName) ? store.name : `${retailerName} ${store.name}`;
 
   return {
-    title: `${retailerName} ${store.name} (#${store.storeId})${dist}`,
-    storeLine: `🏬 ${retailerName} ${store.name}${storeNum}${cityState}`,
+    title: `${displayName} (#${store.storeId})${dist}`,
+    storeLine: `🏬 ${displayName}${storeNum}${cityState}`,
     addressLine: mapsLink,
     skuLabel: SKU_LABELS[retailerKey] || "Item #",
   };
@@ -322,6 +324,11 @@ function buildOOSList(allBottleNames, inStockNames) {
 
 // Discord limits embed descriptions to 4096 chars. Truncate the OOS tail if needed.
 const DISCORD_DESC_LIMIT = 4096;
+const DISCORD_TITLE_LIMIT = 256;
+function truncateTitle(title) {
+  if (title.length <= DISCORD_TITLE_LIMIT) return title;
+  return title.slice(0, DISCORD_TITLE_LIMIT - 1) + "…";
+}
 function truncateDescription(desc) {
   if (desc.length <= DISCORD_DESC_LIMIT) return desc;
   // Find the OOS section and truncate it to fit
@@ -358,7 +365,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
     desc += buildOOSList(allNames, inStockNames);
 
     embeds.push({
-      title: `🚨 NEW FIND — ${info.title}`,
+      title: truncateTitle(`🚨 NEW FIND — ${info.title}`),
       description: truncateDescription(desc),
       color: COLORS.newFind,
       footer: { text: `Bourbon Scout 🥃 │ ${retailerName}` },
@@ -378,7 +385,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
     desc += buildOOSList(allNames, inStockNames);
 
     embeds.push({
-      title: `⚠️ STOCK LOST — ${info.title}`,
+      title: truncateTitle(`⚠️ STOCK LOST — ${info.title}`),
       description: truncateDescription(desc),
       color: COLORS.goneOOS,
       footer: { text: `Bourbon Scout 🥃 │ ${retailerName}` },
@@ -401,7 +408,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
       desc += buildOOSList(allNames, inStockNames);
 
       embeds.push({
-        title: `🔵 STILL AVAILABLE — ${info.title}`,
+        title: truncateTitle(`🔵 STILL AVAILABLE — ${info.title}`),
         description: truncateDescription(desc),
         color: COLORS.stillIn,
         footer: { text: `Bourbon Scout 🥃 │ ${retailerName}` },
@@ -435,7 +442,7 @@ function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, tot
 
   return {
     title: "📊 Scan Complete",
-    description: desc,
+    description: truncateDescription(desc),
     color: COLORS.summary,
     footer: { text: "Bourbon Scout 🥃" },
     timestamp: new Date().toISOString(),
@@ -467,6 +474,7 @@ async function fetchRetry(url, opts) {
   try {
     return await fetch(url, opts);
   } catch (err) {
+    console.warn(`[fetchRetry] ${err.message} — retrying in 1s`);
     await sleep(1000);
     return await fetch(url, opts);
   }
@@ -475,10 +483,12 @@ async function fetchRetry(url, opts) {
 // Parse bottle size from product title text (e.g., "750ml", "1.75L", "750 ML")
 function parseSize(text) {
   if (!text) return "";
-  const match = text.match(/([\d.]+)\s*(ml|l|liter|litre)/i);
+  const match = text.match(/([\d.]+)\s*(ml|cl|l|liter|litre)/i);
   if (!match) return "";
   const [, num, unit] = match;
-  if (unit.toLowerCase() === "ml") return `${num}ml`;
+  const u = unit.toLowerCase();
+  if (u === "ml") return `${num}ml`;
+  if (u === "cl") return `${Math.round(parseFloat(num) * 10)}ml`;
   return `${num}L`;
 }
 
@@ -538,7 +548,7 @@ const FETCH_HEADERS = {
   "User-Agent": IS_MAC
     ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
   "Accept-Language": "en-US,en;q=0.9",
   "Accept-Encoding": "gzip, deflate",
   "Referer": "https://www.google.com/",
@@ -548,6 +558,7 @@ const FETCH_HEADERS = {
   "Sec-Fetch-Dest": "document",
   "Sec-Fetch-Mode": "navigate",
   "Sec-Fetch-Site": "cross-site",
+  "Sec-Fetch-User": "?1",
   "Upgrade-Insecure-Requests": "1",
 };
 
@@ -678,17 +689,16 @@ async function scrapeCostcoViaFetch() {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  let isFirstQuery = true;
   // Batch queries (4 concurrent) — balances speed vs bot detection risk
-  const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
+  // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
+  const queryTasks = shuffle(SEARCH_QUERIES).map((query, i) => async () => {
     if (failures > 3) return;
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     const headers = { ...FETCH_HEADERS };
-    if (!isFirstQuery) {
+    if (i > 0) {
       headers["Sec-Fetch-Site"] = "same-origin";
       headers["Referer"] = "https://www.costco.com/";
     }
-    isFirstQuery = false;
     try {
       const res = await fetchRetry(url, {
         headers,
@@ -703,7 +713,7 @@ async function scrapeCostcoViaFetch() {
       const $ = cheerio.load(html);
       const hasTiles = $('[data-testid^="ProductTile_"]').length > 0;
       if (!hasTiles) { validPages++; return; }
-      if (hasTiles) validPages++;
+      validPages++;
       found.push(...matchCostcoTiles($));
     } catch {
       failures++;
@@ -821,17 +831,16 @@ async function scrapeTotalWineViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  let isFirstQuery = true;
   // Batch queries (4 concurrent) — balances speed vs PerimeterX detection risk
-  const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
+  // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
+  const queryTasks = shuffle(SEARCH_QUERIES).map((query, i) => async () => {
     if (failures > 3) return;
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
     const headers = { ...FETCH_HEADERS };
-    if (!isFirstQuery) {
+    if (i > 0) {
       headers["Sec-Fetch-Site"] = "same-origin";
       headers["Referer"] = "https://www.totalwine.com/";
     }
-    isFirstQuery = false;
     try {
       const res = await fetchRetry(url, {
         headers,
@@ -843,11 +852,20 @@ async function scrapeTotalWineViaFetch(store) {
       const idx = html.indexOf("window.INITIAL_STATE");
       if (idx === -1) { failures++; return; }
       const braceStart = html.indexOf("{", idx);
-      const scriptEnd = html.indexOf("</script>", braceStart);
-      if (braceStart === -1 || scriptEnd === -1) { failures++; return; }
-      let jsonStr = html.slice(braceStart, scriptEnd).trim();
-      if (jsonStr.endsWith(";")) jsonStr = jsonStr.slice(0, -1);
-      const state = JSON.parse(jsonStr);
+      if (braceStart === -1) { failures++; return; }
+      // Use brace counting to find the matching closing brace (handles </script> inside JSON strings)
+      let depth = 0, inStr = false, escape = false, end = -1;
+      for (let j = braceStart; j < html.length; j++) {
+        const ch = html[j];
+        if (escape) { escape = false; continue; }
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === "{") depth++;
+        else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
+      }
+      if (end === -1) { failures++; return; }
+      const state = JSON.parse(html.slice(braceStart, end));
       if (!state?.search?.results) { failures++; return; }
       validPages++;
       found.push(...matchTotalWineInitialState(state));
@@ -992,17 +1010,16 @@ async function scrapeWalmartViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  let isFirstQuery = true;
   // Batch queries (4 concurrent) — balances speed vs Akamai/PerimeterX detection risk
-  const queryTasks = shuffle(SEARCH_QUERIES).map((query) => async () => {
+  // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
+  const queryTasks = shuffle(SEARCH_QUERIES).map((query, i) => async () => {
     if (failures > 3) return;
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
     const headers = { ...FETCH_HEADERS };
-    if (!isFirstQuery) {
+    if (i > 0) {
       headers["Sec-Fetch-Site"] = "same-origin";
       headers["Referer"] = "https://www.walmart.com/";
     }
-    isFirstQuery = false;
     try {
       const fetchOpts = { headers, signal: AbortSignal.timeout(15000) };
       if (proxyAgent) fetchOpts.agent = proxyAgent;
@@ -1255,7 +1272,7 @@ async function scrapeSafewayStore(store) {
             found.push({
               name: bottle.name,
               url: product.url ? `https://www.safeway.com${product.url}` : "",
-              price: product.price != null ? `$${product.price}` : "",
+              price: product.price != null ? `$${Number(product.price).toFixed(2)}` : "",
               sku: product.upc || product.pid || "",
               size: parseSize(title),
               fulfillment: fulfillmentParts.join(", "),
@@ -1420,7 +1437,7 @@ export {
   SEARCH_QUERIES, TARGET_BOTTLES, RETAILERS, FETCH_HEADERS,
   normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
-  formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
+  formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
