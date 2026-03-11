@@ -7,33 +7,7 @@ on:
   workflow_dispatch: {} # Manual trigger from GitHub UI
 
 jobs:
-  # Fast check (~5s) on GitHub-hosted runner to see if self-hosted Mac is online.
-  # Routes to self-hosted (residential IP) when available, falls back to cloud.
-  check-runner:
-    runs-on: ubuntu-latest
-    permissions:
-      administration: read
-    outputs:
-      use-self-hosted: ${{ steps.check.outputs.available }}
-    steps:
-      - id: check
-        run: |
-          STATUS=$(gh api repos/${{ github.repository }}/actions/runners \
-            --jq '.runners[] | select(.name=="bourbon-scout-mac") | .status' 2>/dev/null || echo "")
-          if [ "$STATUS" = "online" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "Self-hosted runner is online — using residential IP"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "Self-hosted runner is offline — falling back to GitHub-hosted"
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-  # Primary: runs on your Mac with residential IP (no bot detection issues)
-  scan-local:
-    needs: check-runner
-    if: needs.check-runner.outputs.use-self-hosted == 'true'
+  scan:
     runs-on: [self-hosted, bourbon]
     timeout-minutes: 15
     steps:
@@ -49,7 +23,7 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install chromium
 
-      # Cache state files so stock-change tracking persists across runs
+      # Persist state files so stock-change tracking works across runs
       - uses: actions/cache@v4
         with:
           path: |
@@ -71,60 +45,3 @@ jobs:
           KROGER_CLIENT_ID: ${{ secrets.KROGER_CLIENT_ID }}
           KROGER_CLIENT_SECRET: ${{ secrets.KROGER_CLIENT_SECRET }}
           SAFEWAY_API_KEY: ${{ secrets.SAFEWAY_API_KEY }}
-
-  # Fallback: runs on GitHub-hosted Ubuntu when Mac is offline.
-  # Costco/Walmart will hit bot detection (datacenter IPs), but Total Wine,
-  # Kroger, and Safeway still work. Better than no scan at all.
-  scan-cloud:
-    needs: check-runner
-    if: needs.check-runner.outputs.use-self-hosted != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - run: npm ci
-
-      # Cache Playwright Chromium binary (~150MB) across runs
-      - uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ hashFiles('package-lock.json') }}
-
-      - name: Install Playwright Chromium
-        run: npx playwright install chromium --with-deps
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-
-      - name: Install Playwright system deps (cached browser)
-        run: npx playwright install-deps chromium
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-
-      # Restore state.json + stores.json from previous cloud runs
-      - uses: actions/cache@v4
-        with:
-          path: |
-            state.json
-            stores.json
-            browser-state.json
-          key: bourbon-state-${{ github.run_id }}
-          restore-keys: bourbon-state-
-
-      - name: Run scan
-        run: node scraper.js
-        env:
-          RUN_ONCE: "true"
-          ZIP_CODE: "85283"
-          SEARCH_RADIUS_MILES: "15"
-          MAX_STORES_PER_RETAILER: "5"
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          REALERT_EVERY_N_SCANS: "4"
-          KROGER_CLIENT_ID: ${{ secrets.KROGER_CLIENT_ID }}
-          KROGER_CLIENT_SECRET: ${{ secrets.KROGER_CLIENT_SECRET }}
-          SAFEWAY_API_KEY: ${{ secrets.SAFEWAY_API_KEY }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
