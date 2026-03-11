@@ -11,6 +11,8 @@ jobs:
   # Routes to self-hosted (residential IP) when available, falls back to cloud.
   check-runner:
     runs-on: ubuntu-latest
+    permissions:
+      administration: read
     outputs:
       use-self-hosted: ${{ steps.check.outputs.available }}
     steps:
