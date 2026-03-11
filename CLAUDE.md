@@ -1,10 +1,10 @@
 # Bourbon Scout
 
-Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 retailers for 38 rare/allocated bottles near a zip code, sends per-store Discord alerts with @everyone pings when bottles are found, plus a quiet summary after each scan.
+Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 6 retailers for 39 bottles (38 rare/allocated + 1 canary health check) near a zip code, sends per-store Discord alerts with @everyone pings when bottles are found, plus a quiet summary with per-scraper health metrics after each scan.
 
 ## Architecture
 
-- **`scraper.js`** — Main entry point. Contains all scrapers, Discord alerting, and poll orchestration. Runs a cron-scheduled poll loop (or single-run via `RUN_ONCE=true` for CI). Scans all stores concurrently with a limit of 6.
+- **`scraper.js`** — Main entry point. Contains all scrapers, Discord alerting, and poll orchestration. Runs a cron-scheduled poll loop (or single-run via `RUN_ONCE=true` for CI). Scans all stores concurrently with a limit of 8.
 - **`lib/geo.js`** — Zip-to-coordinates (`zipToCoords`) via zippopotam.us API and `haversine` distance calculation. No dependencies.
 - **`lib/discover-stores.js`** — Auto-discovers nearby stores for all retailers given a zip code and radius. Caches results to `stores.json` with a 7-day TTL. Uses Playwright for browser-based store locators and Kroger REST API for Kroger.
 - **`lib/fallback-stores.js`** — Static hardcoded store data for the 85283 area. Used when browser-based store locators fail (e.g., CI datacenter IPs get blocked).
@@ -22,16 +22,19 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 5 reta
 - **Atomic state writes** — `saveState()`, `saveBrowserState()`, `saveCache()` (discover-stores) all write to `.tmp` then `rename()` (atomic on POSIX). Prevents corruption on crash mid-write.
 - **Browser cookie persistence** — `loadBrowserState()`/`saveBrowserState()` persist Playwright `storageState` to `browser-state.json`. In-memory cache (`browserStateCache`) avoids re-reading from disk on every `newPage()`. Cookies accumulate across polls, reducing bot detection signals.
 - **Parallel query execution** — API scrapers (Kroger, Safeway) run all 13 queries via `Promise.all` with 50ms staggered starts. Fetch scrapers (Costco, TotalWine, Walmart) use batched parallelism via `runWithConcurrency(queryTasks, 4)`.
-- **Kroger pagination** — Fetches page 2 (`filter.start=50`) when first page returns exactly 50 results, catching allocated bottles that spill past the first page.
-- **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 6)`. Browser and API scrapers are unified in the same task queue.
+- **Kroger pagination** — Fetches page 2 (`filter.start=50`) when first page returns exactly 50 results, catching allocated bottles that spill past the first page. Same pattern used by Safeway.
+- **Kroger null-inventory guard** — Requires `stockLevel != null` in addition to checking for `TEMPORARILY_OUT_OF_STOCK`. Prevents false positives when Kroger API returns products with null/missing inventory data.
+- **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 8)`. Browser and API scrapers are unified in the same task queue.
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
 - **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a residential proxy. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
 - **Query order randomization** — `shuffle(SEARCH_QUERIES)` via Fisher-Yates before every scraper loop to avoid predictable access patterns that anti-bot ML models flag.
 - **Fetch-first with browser fallback** — Walmart, Total Wine, and Costco all try plain HTTP fetch first (via residential proxy) before spinning up a browser page. Walmart parses `__NEXT_DATA__`, Total Wine parses `window.INITIAL_STATE`, Costco parses `data-testid` tiles via `cheerio`. Falls back to Playwright if blocked.
 - **Fetch retry** — `fetchRetry()` retries once on network errors (timeouts, DNS failures) with 1s backoff and `console.warn` on first failure. Used by all fetch-based scrapers.
-- **Brace-counting JSON extraction** — Total Wine INITIAL_STATE is extracted from HTML using a character-by-character brace counter that tracks string context and escape characters, safely handling `</script>` inside JSON string values.
-- **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Scraped once and broadcast to all stores.
-- **Broad search queries** — 13 queries cover all 38 bottles. API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
+- **Brace-counting JSON extraction** — Total Wine INITIAL_STATE and Walmart `__NEXT_DATA__` are both extracted from HTML using a character-by-character brace counter that tracks string context and escape characters, safely handling `</script>` inside JSON string values.
+- **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Walgreens uses `USER_LOC` cookie with zip coordinates — nearby stores share results. Both scraped once and broadcast to all stores.
+- **Broad search queries** — 14 queries cover all 39 bottles (38 allocated + 1 canary). API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
+- **Canary bottle (Buffalo Trace)** — Always-in-stock bottle used as a scraper health check. Found canary = scraper is working. Missing canary = scraper may be broken. Canary results are filtered out before alerts/state — only shown in the health section of the summary embed.
+- **Per-scraper health tracking** — `scraperHealth` module-level object tracks queries succeeded/failed/blocked per retailer per poll. `trackHealth(retailerKey, outcome)` called in every scraper's query loop. Reset each poll. Displayed as inline Discord embed fields (3 per row).
 - **Shared Kroger OAuth token** — Fetched once per poll via singleton promise, shared across all Kroger stores. Clears cached token on 401 for automatic re-auth. Uses promo price when available (falls back to regular).
 - **Bot detection** — `isBlockedPage()` checks page title AND body text for challenge/CAPTCHA/access-denied/security-check indicators. Browser scrapers skip queries that hit bot detection instead of recording false "empty" results.
 - **Per-retailer Sec-Fetch-Site** — First query per scraper sends `cross-site` + Google Referer (simulating search click). Subsequent queries send `same-origin` + retailer domain Referer (simulating internal navigation). Uses `.map()` index (`i > 0`) instead of runtime flag to avoid race conditions in concurrent task execution.
@@ -66,29 +69,30 @@ All config is in `.env`:
 |----------|-------------|-------------|----------|-------|
 | Costco | Fetch-first / Playwright | MUI `data-testid` DOM attrs (cheerio or browser) | Akamai Bot Manager | Scrape-once (no store filter in search). Fetch+cheerio with proxy, browser fallback. Next.js App Router — no `__NEXT_DATA__`. |
 | Total Wine | Fetch-first / Playwright | `window.INITIAL_STATE` JSON | PerimeterX (HUMAN) | Fetch extracts INITIAL_STATE from HTML with proxy. Browser fallback if PerimeterX blocks. Per-store via `storeId` URL param. CSS selector fallback in browser path. |
-| Walmart | Fetch-first / Playwright | `__NEXT_DATA__` JSON | Akamai + PerimeterX | Filters `__typename=Product`, excludes marketplace sellers. Requires `IN_STOCK` status + store/pickup fulfillment badge. `flatMap` across all `itemStacks`. |
+| Walmart | Fetch-first / Playwright | `__NEXT_DATA__` JSON | Akamai + PerimeterX | Brace-counting JSON extraction (handles `</script>` in JSON strings). Filters `__typename=Product`, excludes marketplace sellers. Requires `IN_STOCK` status + store/pickup fulfillment badge. `flatMap` across all `itemStacks`. |
 | Kroger | REST API | JSON | None (API key auth) | Shared OAuth token (singleton promise). Broad SEARCH_QUERIES (12) instead of per-bottle (40). 401 auto-clears token. `filter.limit=50`. Paginates to page 2 when first page is full. |
-| Safeway | REST API | JSON | None (API key auth) | Broad SEARCH_QUERIES. `rows=50`. Skips silently if API key not set. |
+| Safeway | REST API | JSON | None (API key auth) | Broad SEARCH_QUERIES. `rows=50`. Paginates to page 2 (`start=50`) when first page is full. Skips silently if API key not set. |
+| Walgreens | Playwright (browser-only) | Server-rendered HTML (CSS selectors) | Akamai Bot Manager | Scrape-once. `USER_LOC` cookie (base64 JSON with lat/lng/zip) sets store context. No embedded JSON — extracts `.card__product` DOM elements. Filters by "Not sold at your store" text. |
 
 BevMo is omitted from the poll loop — no Arizona locations exist.
 
-## Bottles (38)
+## Bottles (39)
 
 Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch).
 
 ## Tests
 
-369 tests across 5 files using Vitest:
+410 tests across 5 files using Vitest:
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 271 | Bottle matching, scrapers, Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing, TotalWine stock signals, Safeway strict inStock/price formatting, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks, truncateTitle, parseSize centiliter, formatStoreInfo dedup, fetchRetry logging |
+| `test/scraper.test.js` | 307 | Bottle matching, scrapers (Costco/TotalWine/Walmart/Kroger/Safeway/Walgreens), Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing/null-inventory guard, TotalWine stock signals/fulfillment filter, Safeway strict inStock/price formatting/pagination, Walmart brace-counting extraction, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks, truncateTitle, parseSize centiliter, formatStoreInfo dedup, fetchRetry logging, Walgreens USER_LOC cookie, poll concurrency limit, canary bottle (Buffalo Trace), scraper health tracking (trackHealth), summary embed health fields + canary indicators |
 | `test/proxy.test.js` | 24 | Proxy agent routing, fetch-first paths (Costco, Total Wine, Walmart), wrapper fallback logic |
-| `test/discover-stores.test.js` | 59 | Store locator logic per retailer, store name sanitization |
+| `test/discover-stores.test.js` | 64 | Store locator logic per retailer (incl. Walgreens), store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance, AbortSignal timeout |
 | `test/fallback-stores.test.js` | 6 | Static store data validation |
 
-Coverage: 98.0% statements, 91.8% branches, 93.4% functions, 99.4% lines.
+Coverage: 97.62% statements, 91.42% branches, 94.03% functions, 99.45% lines.
 
 ```sh
 npm test             # Run all tests
@@ -123,3 +127,4 @@ When a retailer's store locator stops finding stores (selectors broke):
 - The Safeway scraper and Kroger scraper silently skip if their API keys aren't set.
 - `stores.json` cache invalidates on zip/radius change or after 7 days.
 - `lib/fallback-stores.js` provides static store data when browser-based locators fail on CI.
+- Walgreens has no embedded JSON (`__NEXT_DATA__`, `INITIAL_STATE`) — server-rendered HTML only. Akamai blocks direct fetch (403), so it's browser-only with no fetch-first path. Store context set via `USER_LOC` cookie (base64 JSON: `{"la":"<lat>","lo":"<lng>","uz":"<zip>"}`).

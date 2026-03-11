@@ -25,7 +25,7 @@ vi.mock("node:fs/promises", () => ({
 import {
   loadCache, saveCache, isCacheValid, cleanStoreEntries,
   locateCostco, locateTotalWine, locateWalmart,
-  locateKroger, locateSafeway, locateBevMo,
+  locateKroger, locateSafeway, locateWalgreens, locateBevMo,
   discoverStores,
 } from "../lib/discover-stores.js";
 
@@ -610,6 +610,71 @@ describe("locateSafeway", () => {
       { name: "Store C", address: "C", id: "3", distance: "3", href: "" },
     ]);
     const stores = await locateSafeway(mockPage, "85283", COORDS, 15, 2);
+    expect(stores).toHaveLength(2);
+  });
+});
+
+// ─── Walgreens Locator ────────────────────────────────────────────────────────
+
+describe("locateWalgreens", () => {
+  it("extracts stores from store locator page", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { storeId: "5768", name: "Walgreens", address: "1919 N Dobson Rd, Chandler, AZ 85224", distance: 0.9 },
+      { storeId: "3422", name: "Walgreens", address: "2100 E Baseline Rd, Tempe, AZ 85283", distance: 2.3 },
+    ]);
+    const stores = await locateWalgreens(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toHaveLength(2);
+    expect(stores[0]).toEqual({
+      storeId: "5768",
+      name: "Walgreens",
+      address: "1919 N Dobson Rd, Chandler, AZ 85224",
+      distanceMiles: 0.9,
+    });
+    expect(mockPage.goto).toHaveBeenCalledWith(
+      expect.stringContaining("walgreens.com/storelocator/find.jsp"),
+      expect.any(Object)
+    );
+  });
+
+  it("filters stores by radius", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { storeId: "5768", name: "Walgreens", address: "Nearby", distance: 5.0 },
+      { storeId: "9999", name: "Walgreens", address: "Far Away", distance: 25.0 },
+    ]);
+    const stores = await locateWalgreens(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toHaveLength(1);
+    expect(stores[0].storeId).toBe("5768");
+  });
+
+  it("returns empty array on locator failure", async () => {
+    const mockPage = createMockPage();
+    mockPage.goto.mockRejectedValueOnce(new Error("Navigation timeout"));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stores = await locateWalgreens(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toEqual([]);
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("[discover] Walgreens locator failed"));
+    errSpy.mockRestore();
+  });
+
+  it("prefixes store name with Walgreens if missing", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { storeId: "5768", name: "Dobson Rd", address: "1919 N Dobson Rd", distance: 1.0 },
+    ]);
+    const stores = await locateWalgreens(mockPage, "85283", COORDS, 15, 5);
+    expect(stores[0].name).toBe("Walgreens Dobson Rd");
+  });
+
+  it("caps at maxStores", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { storeId: "1", name: "Walgreens A", address: "Addr A", distance: 1.0 },
+      { storeId: "2", name: "Walgreens B", address: "Addr B", distance: 2.0 },
+      { storeId: "3", name: "Walgreens C", address: "Addr C", distance: 3.0 },
+    ]);
+    const stores = await locateWalgreens(mockPage, "85283", COORDS, 15, 2);
     expect(stores).toHaveLength(2);
   });
 });

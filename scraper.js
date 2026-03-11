@@ -8,6 +8,7 @@ import { readFile, writeFile, rename } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import * as cheerio from "cheerio";
 import { discoverStores } from "./lib/discover-stores.js";
+import { zipToCoords } from "./lib/geo.js";
 
 // Stealth plugin makes Playwright bypass bot detection fingerprinting
 chromium.use(StealthPlugin());
@@ -31,6 +32,22 @@ const {
 // Only created when PROXY_URL is set. Discord webhook calls intentionally skip the proxy.
 const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
 
+// Per-poll health metrics per retailer. Reset each poll().
+// Structure: { retailerKey: { queries: 0, succeeded: 0, failed: 0, blocked: 0 } }
+let scraperHealth = {};
+
+function initHealth(key) {
+  if (!scraperHealth[key]) scraperHealth[key] = { queries: 0, succeeded: 0, failed: 0, blocked: 0 };
+}
+
+function trackHealth(key, outcome) {
+  initHealth(key);
+  scraperHealth[key].queries++;
+  if (outcome === "ok") scraperHealth[key].succeeded++;
+  else if (outcome === "blocked") scraperHealth[key].blocked++;
+  else scraperHealth[key].failed++;
+}
+
 const STATE_FILE = new URL("./state.json", import.meta.url);
 
 // ─── Target Bottles ──────────────────────────────────────────────────────────
@@ -50,6 +67,7 @@ const SEARCH_QUERIES = [
   "rock hill farms",           // Rock Hill Farms
   "king of kentucky bourbon",  // King of Kentucky
   "old forester bourbon",      // Birthday, President's Choice, 150th Anniversary, King Ranch
+  "buffalo trace",              // Canary bottle — always-available health check
 ];
 
 const TARGET_BOTTLES = [
@@ -91,7 +109,12 @@ const TARGET_BOTTLES = [
   { name: "Old Forester President's Choice", searchTerms: ["old forester president's choice", "old forester presidents choice", "old forester president", "president's choice bourbon"] },
   { name: "Old Forester 150th Anniversary", searchTerms: ["old forester 150th", "old forester 150"] },
   { name: "Old Forester King Ranch",    searchTerms: ["old forester king ranch"] },
+  // Canary — always-available bottle used as a scraper health check
+  { name: "Buffalo Trace", searchTerms: ["buffalo trace"], canary: true },
 ];
+
+// Fast lookup for canary bottles (filtered out of alerts, used in health summary only)
+const CANARY_NAMES = new Set(TARGET_BOTTLES.filter((b) => b.canary).map((b) => b.name));
 
 // ─── State Management ────────────────────────────────────────────────────────
 // State is nested by retailer key then store ID:
@@ -420,7 +443,10 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   return embeds;
 }
 
-function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [] }) {
+const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens"];
+const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens" };
+
+function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {} }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
   desc += `🟢 ${totalNewFinds} new finds   🔵 ${totalStillInStock} still in stock\n`;
   desc += `🔴 ${totalGoneOOS} went OOS    💤 ${nothingCount} nothing`;
@@ -440,13 +466,26 @@ function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, tot
     }
   }
 
-  return {
+  // Build health fields: one inline field per retailer (3 per row in Discord)
+  const fields = [];
+  for (const key of RETAILER_ORDER) {
+    const h = health[key];
+    if (!h) continue;
+    const pct = h.queries > 0 ? h.succeeded / h.queries : 0;
+    const emoji = pct >= 0.75 ? "✅" : pct >= 0.25 ? "⚠️" : "❌";
+    const canary = canaryResults[key] ? " 🐤" : "";
+    fields.push({ name: RETAILER_LABELS[key] || key, value: `${emoji} ${h.succeeded}/${h.queries}${canary}`, inline: true });
+  }
+
+  const embed = {
     title: "📊 Scan Complete",
     description: truncateDescription(desc),
     color: COLORS.summary,
     footer: { text: "Bourbon Scout 🥃" },
     timestamp: new Date().toISOString(),
   };
+  if (fields.length > 0) embed.fields = fields;
+  return embed;
 }
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
@@ -705,18 +744,20 @@ async function scrapeCostcoViaFetch() {
         signal: AbortSignal.timeout(15000),
         agent: proxyAgent,
       });
-      if (!res.ok) { failures++; return; }
+      if (!res.ok) { failures++; trackHealth("costco", "fail"); return; }
       const html = await res.text();
       if (html.includes("Access Denied") || html.includes("robot") || html.includes("captcha")) {
-        failures++; return;
+        failures++; trackHealth("costco", "blocked"); return;
       }
       const $ = cheerio.load(html);
       const hasTiles = $('[data-testid^="ProductTile_"]').length > 0;
-      if (!hasTiles) { validPages++; return; }
+      if (!hasTiles) { validPages++; trackHealth("costco", "ok"); return; }
       validPages++;
+      trackHealth("costco", "ok");
       found.push(...matchCostcoTiles($));
     } catch {
       failures++;
+      trackHealth("costco", "fail");
     }
   });
   await runWithConcurrency(queryTasks, 4);
@@ -734,6 +775,7 @@ async function scrapeCostcoOnce(page) {
       const tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 8000 }).then(() => true).catch(() => false);
       if (!tilesLoaded && await isBlockedPage(page)) {
         console.warn(`[costco] Bot detection page for query "${query}" — skipping`);
+        trackHealth("costco", "blocked");
         continue;
       }
 
@@ -764,8 +806,10 @@ async function scrapeCostcoOnce(page) {
           }
         }
       }
+      trackHealth("costco", "ok");
     } catch (err) {
       console.error(`[costco] Error searching "${query}": ${err.message}`);
+      trackHealth("costco", "fail");
     }
     await sleep(750);
   }
@@ -816,7 +860,7 @@ function matchTotalWineInitialState(state) {
           price: p.price?.[0]?.price ? `$${p.price[0].price}` : "",
           sku: (p.productUrl?.match(/\/p\/(\d+)/) || [])[1] || "",
           size: parseSize(p.name || ""),
-          fulfillment: (p.shoppingOptions || []).filter((o) => o.eligible).map((o) => o.name || o.type || "").join(", "),
+          fulfillment: (p.shoppingOptions || []).filter((o) => o.eligible).map((o) => o.name || o.type || "").filter(Boolean).join(", "),
         });
       }
     }
@@ -847,12 +891,12 @@ async function scrapeTotalWineViaFetch(store) {
         signal: AbortSignal.timeout(15000),
         agent: proxyAgent,
       });
-      if (!res.ok) { failures++; return; }
+      if (!res.ok) { failures++; trackHealth("totalwine", "fail"); return; }
       const html = await res.text();
       const idx = html.indexOf("window.INITIAL_STATE");
-      if (idx === -1) { failures++; return; }
+      if (idx === -1) { failures++; trackHealth("totalwine", "blocked"); return; }
       const braceStart = html.indexOf("{", idx);
-      if (braceStart === -1) { failures++; return; }
+      if (braceStart === -1) { failures++; trackHealth("totalwine", "blocked"); return; }
       // Use brace counting to find the matching closing brace (handles </script> inside JSON strings)
       let depth = 0, inStr = false, escape = false, end = -1;
       for (let j = braceStart; j < html.length; j++) {
@@ -864,13 +908,15 @@ async function scrapeTotalWineViaFetch(store) {
         if (ch === "{") depth++;
         else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
       }
-      if (end === -1) { failures++; return; }
+      if (end === -1) { failures++; trackHealth("totalwine", "blocked"); return; }
       const state = JSON.parse(html.slice(braceStart, end));
-      if (!state?.search?.results) { failures++; return; }
+      if (!state?.search?.results) { failures++; trackHealth("totalwine", "blocked"); return; }
       validPages++;
+      trackHealth("totalwine", "ok");
       found.push(...matchTotalWineInitialState(state));
     } catch {
       failures++;
+      trackHealth("totalwine", "fail");
     }
   });
   await runWithConcurrency(queryTasks, 4);
@@ -893,6 +939,7 @@ async function scrapeTotalWineViaBrowser(store, page) {
 
       if (await isBlockedPage(page)) {
         console.warn(`[totalwine:${store.storeId}] Bot detection page for query "${query}" — skipping`);
+        trackHealth("totalwine", "blocked");
         continue;
       }
 
@@ -938,8 +985,10 @@ async function scrapeTotalWineViaBrowser(store, page) {
           }
         }
       }
+      trackHealth("totalwine", "ok");
     } catch (err) {
       console.error(`[totalwine:${store.storeId}] Error searching "${query}": ${err.message}`);
+      trackHealth("totalwine", "fail");
     }
     await sleep(750);
   }
@@ -1024,17 +1073,33 @@ async function scrapeWalmartViaFetch(store) {
       const fetchOpts = { headers, signal: AbortSignal.timeout(15000) };
       if (proxyAgent) fetchOpts.agent = proxyAgent;
       const res = await fetchRetry(url, fetchOpts);
-      if (!res.ok) { failures++; return; }
+      if (!res.ok) { failures++; trackHealth("walmart", "fail"); return; }
       const html = await res.text();
-      const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-      if (!match) { failures++; return; }
-      const nextData = JSON.parse(match[1]);
+      // Use brace-counting to extract JSON (handles </script> inside JSON strings)
+      const idx = html.indexOf('id="__NEXT_DATA__"');
+      if (idx === -1) { failures++; trackHealth("walmart", "blocked"); return; }
+      const braceStart = html.indexOf("{", idx);
+      if (braceStart === -1) { failures++; trackHealth("walmart", "blocked"); return; }
+      let depth = 0, inStr = false, escape = false, end = -1;
+      for (let j = braceStart; j < html.length; j++) {
+        const ch = html[j];
+        if (escape) { escape = false; continue; }
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === "{") depth++;
+        else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
+      }
+      if (end === -1) { failures++; trackHealth("walmart", "blocked"); return; }
+      const nextData = JSON.parse(html.slice(braceStart, end));
       const hasSearchResult = nextData?.props?.pageProps?.initialData?.searchResult != null;
-      if (!hasSearchResult) { failures++; return; }
+      if (!hasSearchResult) { failures++; trackHealth("walmart", "blocked"); return; }
       validPages++;
+      trackHealth("walmart", "ok");
       found.push(...matchWalmartNextData(nextData));
     } catch {
       failures++;
+      trackHealth("walmart", "fail");
     }
   });
   await runWithConcurrency(queryTasks, 4);
@@ -1053,6 +1118,7 @@ async function scrapeWalmartViaBrowser(store, page) {
 
       if (await isBlockedPage(page)) {
         console.warn(`[walmart:${store.storeId}] Bot detection page for query "${query}" — skipping`);
+        trackHealth("walmart", "blocked");
         continue;
       }
 
@@ -1091,8 +1157,10 @@ async function scrapeWalmartViaBrowser(store, page) {
           }
         }
       }
+      trackHealth("walmart", "ok");
     } catch (err) {
       console.error(`[walmart:${store.storeId}] Error searching "${query}": ${err.message}`);
+      trackHealth("walmart", "fail");
     }
     await sleep(750);
   }
@@ -1113,6 +1181,96 @@ async function scrapeWalmartStore(store) {
   const page = await newPage();
   try {
     const result = await scrapeWalmartViaBrowser(store, page);
+    await saveBrowserState(page.context());
+    return result;
+  } finally {
+    await page.context().close();
+  }
+}
+
+// ─── Walgreens: browser-only (Akamai blocks direct fetch) ───────────────────
+// Walgreens uses server-rendered HTML with no embedded JSON (__NEXT_DATA__,
+// INITIAL_STATE). Akamai Bot Manager returns 403 for direct HTTP requests.
+// Store context is set via USER_LOC cookie (base64 JSON with lat/lng/zip).
+// scrapeOnce pattern: results are based on the nearest store to ZIP_CODE.
+
+let walgreensCoords = null;
+
+async function scrapeWalgreensViaBrowser(page) {
+  const found = [];
+
+  // Cache zip coordinates for USER_LOC cookie (same zip every poll)
+  if (!walgreensCoords) walgreensCoords = await zipToCoords(ZIP_CODE);
+
+  // Set location cookie so search results reflect nearest store inventory
+  const locPayload = JSON.stringify({
+    la: String(walgreensCoords.lat),
+    lo: String(walgreensCoords.lng),
+    uz: ZIP_CODE,
+  });
+  await page.context().addCookies([{
+    name: "USER_LOC",
+    value: Buffer.from(locPayload).toString("base64"),
+    domain: ".walgreens.com",
+    path: "/",
+  }]);
+
+  for (const query of shuffle(SEARCH_QUERIES)) {
+    const url = `https://www.walgreens.com/search/results.jsp?Ntt=${encodeURIComponent(query)}`;
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForSelector(".card__product", { timeout: 10000 }).catch(() => {});
+
+      if (await isBlockedPage(page)) {
+        console.warn(`[walgreens] Bot detection page for query "${query}" — skipping`);
+        trackHealth("walgreens", "blocked");
+        continue;
+      }
+
+      const products = await page.$$eval(
+        ".card__product",
+        /* v8 ignore start -- browser-only DOM callback */
+        (cards) =>
+          cards.map((el) => ({
+            title: (el.querySelector(".product__title, [class*='product__title']") || {}).textContent?.trim() || "",
+            price: (el.querySelector(".product__price-contain, [class*='product__price']") || {}).textContent?.trim() || "",
+            url: (el.querySelector('a[href*="ID="]') || {}).href || "",
+            outOfStock: (el.textContent || "").includes("Not sold at your store"),
+          }))
+        /* v8 ignore stop */
+      );
+
+      for (const p of products) {
+        if (p.outOfStock) continue;
+        for (const bottle of TARGET_BOTTLES) {
+          if (matchesBottle(p.title, bottle)) {
+            const idMatch = p.url.match(/ID=(\w+)/);
+            found.push({
+              name: bottle.name,
+              url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.walgreens.com${p.url}`) : "",
+              price: p.price || "",
+              sku: idMatch?.[1] || "",
+              size: parseSize(p.title),
+              fulfillment: "In-Store",
+            });
+          }
+        }
+      }
+      trackHealth("walgreens", "ok");
+    } catch (err) {
+      console.error(`[walgreens] Error searching "${query}": ${err.message}`);
+      trackHealth("walgreens", "fail");
+    }
+    await sleep(750);
+  }
+  return dedupFound(found);
+}
+
+// Wrapper: browser-only (no fetch-first — Akamai blocks direct HTTP).
+async function scrapeWalgreensStore() {
+  const page = await newPage();
+  try {
+    const result = await scrapeWalgreensViaBrowser(page);
     await saveBrowserState(page.context());
     return result;
   } finally {
@@ -1171,10 +1329,12 @@ async function scrapeKrogerStore(store) {
   function matchKrogerProducts(products) {
     for (const product of products) {
       const title = product.description || "";
+      // Require a positive inventory signal — null/missing inventory is not "in stock"
       const inStock = product.items?.some(
         (i) =>
           i.fulfillment?.inStore === true &&
-          i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
+          i.inventory?.stockLevel != null &&
+          i.inventory.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
       );
       if (!inStock) continue;
       for (const bottle of TARGET_BOTTLES) {
@@ -1182,7 +1342,7 @@ async function scrapeKrogerStore(store) {
           // Prefer the item variant that is actually in-store, not blindly items[0]
           // (which may be a different size at a different price)
           const inStoreItem = product.items?.find(
-            (i) => i.fulfillment?.inStore === true && i.inventory?.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
+            (i) => i.fulfillment?.inStore === true && i.inventory?.stockLevel != null && i.inventory.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
           ) || product.items?.[0];
           const price = inStoreItem?.price?.promo ?? inStoreItem?.price?.regular;
           const fulfillmentParts = [];
@@ -1226,8 +1386,10 @@ async function scrapeKrogerStore(store) {
           matchKrogerProducts(data2.data || []);
         }
       }
+      trackHealth("kroger", "ok");
     } catch (err) {
       console.error(`[kroger:${store.storeId}] Error searching "${query}": ${err.message}`);
+      trackHealth("kroger", "fail");
     }
   }));
   return dedupFound(found);
@@ -1243,6 +1405,28 @@ async function scrapeSafewayStore(store) {
   // Use broad SEARCH_QUERIES (12) instead of per-bottle (40) to cut API calls ~70%
   const found = [];
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
+
+  function matchSafewayProducts(products) {
+    for (const product of products) {
+      const title = product.name || product.productTitle || "";
+      if (product.inStock !== true && product.inStock !== 1) continue;
+      for (const bottle of TARGET_BOTTLES) {
+        if (matchesBottle(title, bottle)) {
+          const fulfillmentParts = [];
+          if (product.curbsideEligible) fulfillmentParts.push("Curbside");
+          if (product.deliveryEligible) fulfillmentParts.push("Delivery");
+          found.push({
+            name: bottle.name,
+            url: product.url ? `https://www.safeway.com${product.url}` : "",
+            price: product.price != null ? `$${Number(product.price).toFixed(2)}` : "",
+            sku: product.upc || product.pid || "",
+            size: parseSize(title),
+            fulfillment: fulfillmentParts.join(", "),
+          });
+        }
+      }
+    }
+  }
 
   // Run all queries in parallel (API-key auth, no bot detection risk)
   await Promise.all(shuffle(SEARCH_QUERIES).map(async (query, i) => {
@@ -1261,27 +1445,21 @@ async function scrapeSafewayStore(store) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const products = data?.primaryProducts?.response?.docs || [];
-      for (const product of products) {
-        const title = product.name || product.productTitle || "";
-        if (product.inStock !== true && product.inStock !== 1) continue;
-        for (const bottle of TARGET_BOTTLES) {
-          if (matchesBottle(title, bottle)) {
-            const fulfillmentParts = [];
-            if (product.curbsideEligible) fulfillmentParts.push("Curbside");
-            if (product.deliveryEligible) fulfillmentParts.push("Delivery");
-            found.push({
-              name: bottle.name,
-              url: product.url ? `https://www.safeway.com${product.url}` : "",
-              price: product.price != null ? `$${Number(product.price).toFixed(2)}` : "",
-              sku: product.upc || product.pid || "",
-              size: parseSize(title),
-              fulfillment: fulfillmentParts.join(", "),
-            });
-          }
+      matchSafewayProducts(products);
+      // Fetch page 2 if first page was full (may have more results)
+      if (products.length === 50) {
+        const page2Url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
+        const page2Opts = { ...safewayOpts, signal: AbortSignal.timeout(15000) };
+        const res2 = await fetchRetry(page2Url, page2Opts);
+        if (res2.ok) {
+          const data2 = await res2.json();
+          matchSafewayProducts(data2?.primaryProducts?.response?.docs || []);
         }
       }
+      trackHealth("safeway", "ok");
     } catch (err) {
       console.error(`[safeway:${store.storeId}] Error searching "${query}": ${err.message}`);
+      trackHealth("safeway", "fail");
     }
   }));
   return dedupFound(found);
@@ -1299,6 +1477,7 @@ const RETAILERS = [
   { key: "walmart",   name: "Walmart",    scrapeOnce: false, needsPage: false, scraper: scrapeWalmartStore },
   { key: "kroger",    name: "Kroger",     scrapeOnce: false, needsPage: false, scraper: scrapeKrogerStore },
   { key: "safeway",   name: "Safeway",    scrapeOnce: false, needsPage: false, scraper: scrapeSafewayStore },
+  { key: "walgreens", name: "Walgreens",  scrapeOnce: true,  needsPage: false, scraper: scrapeWalgreensStore },
   // BevMo omitted — no AZ locations
 ];
 
@@ -1330,12 +1509,19 @@ async function poll() {
   // Reset per-poll state
   krogerToken = null;
   browserStateCache = null;
+  scraperHealth = {};
+  const canaryResults = {};
 
   // Helper to record results for a store and send alerts
   async function recordResult(retailer, store, inStock) {
+    // Separate canary from allocated bottles — canary never triggers alerts or state
+    const canaryFound = inStock.some((b) => CANARY_NAMES.has(b.name));
+    if (canaryFound) canaryResults[retailer.key] = true;
+    const realInStock = inStock.filter((b) => !CANARY_NAMES.has(b.name));
+
     const previousStore = state[retailer.key]?.[store.storeId];
-    const changes = computeChanges(previousStore, inStock);
-    updateStoreState(state, retailer.key, store.storeId, inStock);
+    const changes = computeChanges(previousStore, realInStock);
+    updateStoreState(state, retailer.key, store.storeId, realInStock);
     storesScanned++;
     retailersSeen.add(retailer.key);
     scannedStores.push({ retailerName: retailer.name, storeName: store.name, storeId: store.storeId });
@@ -1414,15 +1600,15 @@ async function poll() {
     }
   }
 
-  // Run all stores concurrently (limit 6 — fetch-first scrapers are lightweight)
-  await runWithConcurrency(tasks, 6);
+  // Run all stores concurrently (limit 8 — 6 retailers, fetch-first scrapers are lightweight)
+  await runWithConcurrency(tasks, 8);
 
   await closeBrowser().catch((err) => console.error(`[poll] closeBrowser failed: ${err.message}`));
   await saveState(state).catch((err) => console.error(`[poll] saveState failed: ${err.message}`));
 
   // Quiet summary at end of every poll
   const durationSec = Math.round((Date.now() - scanStart) / 1000);
-  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores });
+  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults });
   await sendDiscordAlert([summary]).catch((err) => console.error(`[poll] Summary send failed: ${err.message}`));
 
   console.log(`[poll] Scan complete — ${storesScanned} stores, ${totalNewFinds} new, ${totalStillInStock} still, ${totalGoneOOS} OOS, ${durationSec}s\n`);
@@ -1434,7 +1620,7 @@ async function poll() {
 // ─── Exports (for testing) ────────────────────────────────────────────────────
 
 export {
-  SEARCH_QUERIES, TARGET_BOTTLES, RETAILERS, FETCH_HEADERS,
+  SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
   normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
@@ -1445,6 +1631,8 @@ export {
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
+  scrapeWalgreensViaBrowser, scrapeWalgreensStore,
+  trackHealth,
   poll,
 };
 
@@ -1453,6 +1641,9 @@ export function _setStoreCache(cache) { storeCache = cache; }
 export function _resetPolling() { polling = false; }
 export function _resetKrogerToken() { krogerToken = null; krogerTokenPromise = null; }
 export function _resetBrowserStateCache() { browserStateCache = null; }
+export function _resetWalgreensCoords() { walgreensCoords = null; }
+export function _getScraperHealth() { return scraperHealth; }
+export function _resetScraperHealth() { scraperHealth = {}; }
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
