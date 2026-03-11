@@ -9,7 +9,7 @@ on:
 jobs:
   scan:
     runs-on: [self-hosted, bourbon]
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
