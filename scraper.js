@@ -578,20 +578,20 @@ async function runWithConcurrency(tasks, limit) {
   await Promise.all(executing);
 }
 
-// Headers for fetch-based scrapers (mimics a real Chrome 136 browser navigation).
+// Headers for fetch-based scrapers (mimics a real Chrome 145 browser navigation).
 // Must include Sec-CH-UA Client Hints alongside Sec-Fetch-* — omitting them creates
 // a fingerprint that matches no real browser and trips bot detectors.
 // Platform-aware: uses macOS UA on Mac (self-hosted runner) to match TLS fingerprint.
 const IS_MAC = process.platform === "darwin";
 const FETCH_HEADERS = {
   "User-Agent": IS_MAC
-    ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
   "Accept-Language": "en-US,en;q=0.9",
   "Accept-Encoding": "gzip, deflate",
   "Referer": "https://www.google.com/",
-  "Sec-CH-UA": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+  "Sec-CH-UA": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
   "Sec-CH-UA-Mobile": "?0",
   "Sec-CH-UA-Platform": IS_MAC ? '"macOS"' : '"Windows"',
   "Sec-Fetch-Dest": "document",
@@ -627,6 +627,12 @@ async function saveBrowserState(context) {
   } catch { /* best-effort */ }
 }
 
+// Use system Chrome on Mac for authentic TLS fingerprint (Playwright's bundled
+// Chromium has a recognizable TLS signature that Akamai/PerimeterX flag).
+const CHROME_PATH = IS_MAC
+  ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  : null;
+
 async function launchBrowser() {
   const launchOpts = {
     headless: true,
@@ -639,6 +645,7 @@ async function launchBrowser() {
     ],
     ignoreDefaultArgs: ["--enable-automation"],
   };
+  if (CHROME_PATH) launchOpts.executablePath = CHROME_PATH;
   if (PROXY_URL) launchOpts.proxy = { server: PROXY_URL };
   browser = await chromium.launch(launchOpts);
   return browser;
@@ -1626,7 +1633,7 @@ export {
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
+  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,

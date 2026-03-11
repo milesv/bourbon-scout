@@ -125,7 +125,12 @@ async function main() {
   await mkdir(DEBUG_DIR, { recursive: true });
 
   console.log("Launching browser...");
-  const browser = await chromium.launch({ headless: true });
+  const chromePath = process.platform === "darwin"
+    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    : null;
+  const launchOpts = { headless: true };
+  if (chromePath) launchOpts.executablePath = chromePath;
+  const browser = await chromium.launch(launchOpts);
 
   try {
     const context = await browser.newContext({

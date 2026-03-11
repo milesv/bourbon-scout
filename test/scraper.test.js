@@ -55,7 +55,7 @@ import {
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
+  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
@@ -2726,6 +2726,26 @@ describe("browser hardening", () => {
     await closeBrowser();
   });
 
+  it("CHROME_PATH is set on Mac, null otherwise", () => {
+    if (IS_MAC) {
+      expect(CHROME_PATH).toBe("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    } else {
+      expect(CHROME_PATH).toBeNull();
+    }
+  });
+
+  it("launchBrowser passes executablePath on Mac", async () => {
+    mocks.chromiumLaunch.mockResolvedValueOnce({ newContext: vi.fn(), close: vi.fn().mockResolvedValue(undefined) });
+    await launchBrowser();
+    const callArgs = mocks.chromiumLaunch.mock.calls[0][0];
+    if (IS_MAC) {
+      expect(callArgs.executablePath).toBe(CHROME_PATH);
+    } else {
+      expect(callArgs.executablePath).toBeUndefined();
+    }
+    await closeBrowser();
+  });
+
   it("newPage sets userAgent and Sec-CH-UA headers on context", async () => {
     const mockPage = { close: vi.fn() };
     const mockContext = {
@@ -3283,8 +3303,8 @@ describe("Old Forester President search term (#16)", () => {
   });
 });
 
-describe("FETCH_HEADERS Chrome 136 fidelity (#5, #6)", () => {
-  it("Accept header matches full Chrome 136 value", () => {
+describe("FETCH_HEADERS Chrome 145 fidelity (#5, #6)", () => {
+  it("Accept header matches full Chrome 145 value", () => {
     expect(FETCH_HEADERS["Accept"]).toContain("image/avif");
     expect(FETCH_HEADERS["Accept"]).toContain("image/webp");
     expect(FETCH_HEADERS["Accept"]).toContain("application/signed-exchange");
