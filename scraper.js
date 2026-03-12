@@ -846,11 +846,13 @@ async function scrapeCostcoStore() {
   console.log("[costco] Fetch blocked, using browser");
   const page = await newPage();
   try {
-    const result = await withTimeout(scrapeCostcoOnce(page), 180000, []);
-    await saveBrowserState(page.context());
+    const scraperPromise = scrapeCostcoOnce(page);
+    scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
+    const result = await withTimeout(scraperPromise, 180000, []);
+    await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close();
+    await page.context().close().catch(() => {});
   }
 }
 
@@ -1025,11 +1027,13 @@ async function scrapeTotalWineStore(store) {
   console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser`);
   const page = await newPage();
   try {
-    const result = await withTimeout(scrapeTotalWineViaBrowser(store, page), 180000, []);
-    await saveBrowserState(page.context());
+    const scraperPromise = scrapeTotalWineViaBrowser(store, page);
+    scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
+    const result = await withTimeout(scraperPromise, 180000, []);
+    await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close();
+    await page.context().close().catch(() => {});
   }
 }
 
@@ -1204,11 +1208,13 @@ async function scrapeWalmartStore(store) {
   console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser`);
   const page = await newPage();
   try {
-    const result = await withTimeout(scrapeWalmartViaBrowser(store, page), 180000, []);
-    await saveBrowserState(page.context());
+    const scraperPromise = scrapeWalmartViaBrowser(store, page);
+    scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
+    const result = await withTimeout(scraperPromise, 180000, []);
+    await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close();
+    await page.context().close().catch(() => {});
   }
 }
 
@@ -1294,11 +1300,13 @@ async function scrapeWalgreensViaBrowser(page) {
 async function scrapeWalgreensStore() {
   const page = await newPage();
   try {
-    const result = await withTimeout(scrapeWalgreensViaBrowser(page), 180000, []);
-    await saveBrowserState(page.context());
+    const scraperPromise = scrapeWalgreensViaBrowser(page);
+    scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
+    const result = await withTimeout(scraperPromise, 180000, []);
+    await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close();
+    await page.context().close().catch(() => {});
   }
 }
 
@@ -1540,7 +1548,10 @@ async function poll() {
   async function recordResult(retailer, store, inStock) {
     // Separate canary from allocated bottles — canary never triggers alerts or state
     const canaryFound = inStock.some((b) => CANARY_NAMES.has(b.name));
-    if (canaryFound) canaryResults[retailer.key] = true;
+    if (canaryFound) {
+      canaryResults[retailer.key] = true;
+      console.log(`[${retailer.key}:${store.storeId}] 🐤 Canary found (${inStock.filter((b) => CANARY_NAMES.has(b.name)).map((b) => b.name).join(", ")})`);
+    }
     const realInStock = inStock.filter((b) => !CANARY_NAMES.has(b.name));
 
     const previousStore = state[retailer.key]?.[store.storeId];
