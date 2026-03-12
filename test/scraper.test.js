@@ -50,7 +50,7 @@ vi.mock("../lib/geo.js", () => ({
 
 import {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
@@ -532,6 +532,27 @@ describe("dedupFound", () => {
   it("returns all items when no duplicates", () => {
     const input = [{ name: "A", url: "/a" }, { name: "B", url: "/b" }];
     expect(dedupFound(input)).toHaveLength(2);
+  });
+});
+
+describe("withTimeout", () => {
+  it("returns promise result when it resolves before timeout", async () => {
+    vi.useRealTimers();
+    const result = await withTimeout(Promise.resolve("done"), 1000, "fallback");
+    expect(result).toBe("done");
+  });
+
+  it("returns fallback when promise exceeds timeout", async () => {
+    vi.useRealTimers();
+    const slow = new Promise((resolve) => setTimeout(() => resolve("late"), 500));
+    const result = await withTimeout(slow, 50, []);
+    expect(result).toEqual([]);
+  });
+
+  it("cleans up timer on fast resolve (no leaked timers)", async () => {
+    vi.useRealTimers();
+    const result = await withTimeout(Promise.resolve(42), 60000, 0);
+    expect(result).toBe(42);
   });
 });
 
@@ -1468,7 +1489,8 @@ describe("scrapeCostcoOnce", () => {
       { title: "Weller Special Reserve Bourbon 750ml", url: "https://costco.com/weller.product.html", price: "$29.99" },
     ]);
     const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
-    expect(mockPage.goto).toHaveBeenCalledTimes(SEARCH_QUERIES.length);
+    // +1 for homepage pre-warm visit
+    expect(mockPage.goto).toHaveBeenCalledTimes(SEARCH_QUERIES.length + 1);
     expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
   });
 

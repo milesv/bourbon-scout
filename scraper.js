@@ -565,6 +565,15 @@ function parsePrice(str) {
   return match ? parseFloat(match[1]) : 0;
 }
 
+// Hard timeout for async operations. Returns fallback value on timeout.
+function withTimeout(promise, ms, fallback) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 // Run async tasks with a concurrency limit
 async function runWithConcurrency(tasks, limit) {
   const executing = new Set();
@@ -774,6 +783,10 @@ async function scrapeCostcoViaFetch() {
 
 // Browser-based Costco scraper (fallback). Uses stable MUI data-testid attributes.
 async function scrapeCostcoOnce(page) {
+  // Pre-warm: visit homepage to let Akamai sensor set _abck cookie
+  await page.goto("https://www.costco.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+  await sleep(2000);
+
   const found = [];
   for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
@@ -833,7 +846,7 @@ async function scrapeCostcoStore() {
   console.log("[costco] Fetch blocked, using browser");
   const page = await newPage();
   try {
-    const result = await scrapeCostcoOnce(page);
+    const result = await withTimeout(scrapeCostcoOnce(page), 180000, []);
     await saveBrowserState(page.context());
     return result;
   } finally {
@@ -1012,7 +1025,7 @@ async function scrapeTotalWineStore(store) {
   console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser`);
   const page = await newPage();
   try {
-    const result = await scrapeTotalWineViaBrowser(store, page);
+    const result = await withTimeout(scrapeTotalWineViaBrowser(store, page), 180000, []);
     await saveBrowserState(page.context());
     return result;
   } finally {
@@ -1116,6 +1129,10 @@ async function scrapeWalmartViaFetch(store) {
 
 // Browser-based Walmart scraper (fallback). Accepts a shared page.
 async function scrapeWalmartViaBrowser(store, page) {
+  // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies
+  await page.goto("https://www.walmart.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+  await sleep(2000);
+
   const found = [];
   for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
@@ -1187,7 +1204,7 @@ async function scrapeWalmartStore(store) {
   console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser`);
   const page = await newPage();
   try {
-    const result = await scrapeWalmartViaBrowser(store, page);
+    const result = await withTimeout(scrapeWalmartViaBrowser(store, page), 180000, []);
     await saveBrowserState(page.context());
     return result;
   } finally {
@@ -1277,7 +1294,7 @@ async function scrapeWalgreensViaBrowser(page) {
 async function scrapeWalgreensStore() {
   const page = await newPage();
   try {
-    const result = await scrapeWalgreensViaBrowser(page);
+    const result = await withTimeout(scrapeWalgreensViaBrowser(page), 180000, []);
     await saveBrowserState(page.context());
     return result;
   } finally {
@@ -1628,7 +1645,7 @@ async function poll() {
 
 export {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
