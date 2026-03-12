@@ -130,3 +130,5 @@ When a retailer's store locator stops finding stores (selectors broke):
 - `stores.json` cache invalidates on zip/radius change or after 7 days.
 - `lib/fallback-stores.js` provides static store data when browser-based locators fail on CI.
 - Walgreens has no embedded JSON (`__NEXT_DATA__`, `INITIAL_STATE`) — server-rendered HTML only. Akamai blocks direct fetch (403), so it's browser-only with no fetch-first path. Store context set via `USER_LOC` cookie (base64 JSON: `{"la":"<lat>","lo":"<lng>","uz":"<zip>"}`).
+- NordVPN SOCKS5 proxy (`phoenix.us.socks.nordhold.net:1080`) doesn't work for scraping — it caps concurrent connections, causing `ConnectionRefused`/`ERR_SOCKS_CONNECTION_FAILED` under load. System VPN (NordVPN app) works much better since it tunnels all traffic at OS level with no per-connection limits.
+- `PROXY_URL` supports both HTTP and SOCKS5 via `createProxyAgent()` auto-detection, but SOCKS5 proxies with connection limits (like NordVPN) will fail under concurrent load. Prefer system VPN or a residential HTTP proxy designed for high concurrency.
