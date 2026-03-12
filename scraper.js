@@ -1,6 +1,7 @@
 import "dotenv/config";
 import fetch from "node-fetch";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
 import { chromium } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import cron from "node-cron";
@@ -30,7 +31,15 @@ const {
 
 // Residential proxy agent for fetch-based scrapers (Walmart fetch path, Kroger, Safeway).
 // Only created when PROXY_URL is set. Discord webhook calls intentionally skip the proxy.
-const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
+// Auto-detects SOCKS5/SOCKS4 vs HTTP/HTTPS proxy protocol.
+function createProxyAgent(url) {
+  if (!url) return null;
+  if (url.startsWith("socks4://") || url.startsWith("socks5://")) {
+    return new SocksProxyAgent(url);
+  }
+  return new HttpsProxyAgent(url);
+}
+const proxyAgent = createProxyAgent(PROXY_URL);
 
 // Per-poll health metrics per retailer. Reset each poll().
 // Structure: { retailerKey: { queries: 0, succeeded: 0, failed: 0, blocked: 0 } }
@@ -1662,6 +1671,7 @@ export {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
+  createProxyAgent,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,

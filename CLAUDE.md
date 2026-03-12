@@ -26,7 +26,7 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 6 reta
 - **Kroger null-inventory guard** — Requires `stockLevel != null` in addition to checking for `TEMPORARILY_OUT_OF_STOCK`. Prevents false positives when Kroger API returns products with null/missing inventory data.
 - **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 8)`. Browser and API scrapers are unified in the same task queue.
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
-- **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a residential proxy. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
+- **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a proxy. Supports HTTP/HTTPS and SOCKS5/SOCKS4 protocols — `createProxyAgent()` auto-detects based on URL scheme. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
 - **Query order randomization** — `shuffle(SEARCH_QUERIES)` via Fisher-Yates before every scraper loop to avoid predictable access patterns that anti-bot ML models flag.
 - **Fetch-first with browser fallback** — Walmart, Total Wine, and Costco all try plain HTTP fetch first (via residential proxy) before spinning up a browser page. Walmart parses `__NEXT_DATA__`, Total Wine parses `window.INITIAL_STATE`, Costco parses `data-testid` tiles via `cheerio`. Falls back to Playwright if blocked.
 - **Fetch retry** — `fetchRetry()` retries once on network errors (timeouts, DNS failures) with 1s backoff and `console.warn` on first failure. Used by all fetch-based scrapers.
@@ -62,7 +62,7 @@ All config is in `.env`:
 - `KROGER_CLIENT_ID`, `KROGER_CLIENT_SECRET` — Kroger API OAuth credentials
 - `SAFEWAY_API_KEY` — Safeway product search API key
 - `DISCORD_WEBHOOK_URL` — Discord webhook for alerts
-- `PROXY_URL` — Residential proxy URL (e.g., `http://user:pass@gate.example.com:12321`). Routes browser and fetch scraper traffic through proxy. Discord webhooks are NOT proxied.
+- `PROXY_URL` — Proxy URL. Supports HTTP (`http://user:pass@gate.example.com:12321`) and SOCKS5 (`socks5://user:pass@host:1080`). Routes browser and fetch scraper traffic through proxy. Discord webhooks are NOT proxied.
 - `RUN_ONCE` — Set to `true` for single-run mode (used by GitHub Actions)
 
 ## Retailers
@@ -84,12 +84,12 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-415 tests across 5 files using Vitest:
+420 tests across 5 files using Vitest:
 
 | File | Tests | Focus |
 |------|-------|-------|
 | `test/scraper.test.js` | 312 | Bottle matching, scrapers (Costco/TotalWine/Walmart/Kroger/Safeway/Walgreens), Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing/null-inventory guard, TotalWine stock signals/fulfillment filter, Safeway strict inStock/price formatting/pagination, Walmart brace-counting extraction, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks, truncateTitle, parseSize centiliter, formatStoreInfo dedup, fetchRetry logging, Walgreens USER_LOC cookie, poll concurrency limit, canary bottle (Buffalo Trace), scraper health tracking (trackHealth), summary embed health fields + canary indicators, withTimeout, CHROME_PATH/executablePath |
-| `test/proxy.test.js` | 24 | Proxy agent routing, fetch-first paths (Costco, Total Wine, Walmart), wrapper fallback logic |
+| `test/proxy.test.js` | 29 | Proxy agent routing, SOCKS5/HTTP protocol auto-detection, fetch-first paths (Costco, Total Wine, Walmart), wrapper fallback logic |
 | `test/discover-stores.test.js` | 64 | Store locator logic per retailer (incl. Walgreens), store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance, AbortSignal timeout |
 | `test/fallback-stores.test.js` | 6 | Static store data validation |

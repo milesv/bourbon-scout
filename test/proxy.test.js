@@ -18,6 +18,10 @@ const mocks = vi.hoisted(() => {
   class MockHttpsProxyAgent {
     constructor(url) { MockHttpsProxyAgent._lastUrl = url; Object.assign(this, HttpsProxyAgentInstance); }
   }
+  const SocksProxyAgentInstance = { _isSocksProxy: true };
+  class MockSocksProxyAgent {
+    constructor(url) { MockSocksProxyAgent._lastUrl = url; Object.assign(this, SocksProxyAgentInstance); }
+  }
   return {
     fetch: vi.fn(),
     readFile: vi.fn(),
@@ -29,6 +33,8 @@ const mocks = vi.hoisted(() => {
     discoverStores: vi.fn(),
     HttpsProxyAgent: MockHttpsProxyAgent,
     HttpsProxyAgentInstance,
+    SocksProxyAgent: MockSocksProxyAgent,
+    SocksProxyAgentInstance,
   };
 });
 
@@ -39,6 +45,7 @@ vi.mock("playwright-extra", () => ({
 }));
 vi.mock("puppeteer-extra-plugin-stealth", () => ({ default: vi.fn() }));
 vi.mock("https-proxy-agent", () => ({ HttpsProxyAgent: mocks.HttpsProxyAgent }));
+vi.mock("socks-proxy-agent", () => ({ SocksProxyAgent: mocks.SocksProxyAgent }));
 vi.mock("cheerio", async () => await vi.importActual("cheerio"));
 vi.mock("node-cron", () => ({ default: { schedule: mocks.cronSchedule } }));
 vi.mock("node:fs/promises", () => ({
@@ -58,7 +65,7 @@ import {
   scrapeCostcoViaFetch, scrapeCostcoStore,
   scrapeTotalWineViaFetch, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartStore, scrapeKrogerStore, scrapeSafewayStore,
-  getKrogerToken, main,
+  getKrogerToken, main, createProxyAgent,
   _resetKrogerToken, _resetPolling, _setStoreCache,
 } from "../scraper.js";
 
@@ -424,5 +431,34 @@ describe("proxy support", () => {
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     expect(found).not.toBeNull();
     expect(found).toEqual([]);
+  });
+});
+
+// ─── createProxyAgent Tests ─────────────────────────────────────────────────
+
+describe("createProxyAgent", () => {
+  it("returns HttpsProxyAgent for http:// URL", () => {
+    const agent = createProxyAgent("http://proxy.example.com:8080");
+    expect(agent._isProxy).toBe(true);
+  });
+
+  it("returns HttpsProxyAgent for https:// URL", () => {
+    const agent = createProxyAgent("https://proxy.example.com:8080");
+    expect(agent._isProxy).toBe(true);
+  });
+
+  it("returns SocksProxyAgent for socks5:// URL", () => {
+    const agent = createProxyAgent("socks5://user:pass@proxy.example.com:1080");
+    expect(agent._isSocksProxy).toBe(true);
+  });
+
+  it("returns SocksProxyAgent for socks4:// URL", () => {
+    const agent = createProxyAgent("socks4://proxy.example.com:1080");
+    expect(agent._isSocksProxy).toBe(true);
+  });
+
+  it("returns null for undefined/empty URL", () => {
+    expect(createProxyAgent(undefined)).toBeNull();
+    expect(createProxyAgent("")).toBeNull();
   });
 });
