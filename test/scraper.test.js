@@ -56,11 +56,13 @@ import {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
+  COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
+  SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
@@ -142,9 +144,9 @@ describe("constants", () => {
     expect(TARGET_BOTTLES[0]).toHaveProperty("searchTerms");
   });
 
-  it("RETAILERS has 6 entries", () => {
-    expect(RETAILERS).toHaveLength(6);
-    expect(RETAILERS.map((r) => r.key)).toEqual(["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens"]);
+  it("RETAILERS has 7 entries", () => {
+    expect(RETAILERS).toHaveLength(7);
+    expect(RETAILERS.map((r) => r.key)).toEqual(["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"]);
   });
 
   it("RETAILERS have correct flags", () => {
@@ -157,6 +159,9 @@ describe("constants", () => {
     const walgreens = RETAILERS.find((r) => r.key === "walgreens");
     expect(walgreens.scrapeOnce).toBe(true);
     expect(walgreens.needsPage).toBe(false);
+    const samsclub = RETAILERS.find((r) => r.key === "samsclub");
+    expect(samsclub.scrapeOnce).toBe(true);
+    expect(samsclub.needsPage).toBe(false);
   });
 
   it("SEARCH_QUERIES includes 'george t stagg' for BTAC coverage (B3)", () => {
@@ -1787,6 +1792,30 @@ describe("scrapeTotalWineViaFetch", () => {
   });
 });
 
+describe("isCostcoBlocked", () => {
+  it("detects all Akamai challenge patterns", () => {
+    expect(isCostcoBlocked("Access Denied - you don't have permission")).toBe(true);
+    expect(isCostcoBlocked("Are you a robot?")).toBe(true);
+    expect(isCostcoBlocked("Please complete the captcha")).toBe(true);
+    expect(isCostcoBlocked("Request unsuccessful")).toBe(true);
+    expect(isCostcoBlocked("Incapsula incident")).toBe(true);
+    expect(isCostcoBlocked("Please Enable JavaScript to continue")).toBe(true);
+    expect(isCostcoBlocked("Please verify you are human")).toBe(true);
+    expect(isCostcoBlocked("<script>_ct_challenge</script>")).toBe(true);
+  });
+
+  it("does not flag normal product pages", () => {
+    expect(isCostcoBlocked("<html><body>Weller Special Reserve Bourbon</body></html>")).toBe(false);
+    expect(isCostcoBlocked("<html><body>No results found</body></html>")).toBe(false);
+  });
+
+  it("COSTCO_BLOCKED_PATTERNS contains expected entries", () => {
+    expect(COSTCO_BLOCKED_PATTERNS.length).toBe(8);
+    expect(COSTCO_BLOCKED_PATTERNS).toContain("Access Denied");
+    expect(COSTCO_BLOCKED_PATTERNS).toContain("_ct_challenge");
+  });
+});
+
 describe("scrapeCostcoViaFetch", () => {
   it("returns null when proxyAgent is not set (no PROXY_URL)", async () => {
     const result = await scrapeCostcoViaFetch();
@@ -2516,6 +2545,177 @@ describe("scrapeWalgreensStore", () => {
       expect.any(Object)
     );
     expect(result).toEqual([]);
+  });
+});
+
+// ─── Sam's Club Scrapers ─────────────────────────────────────────────────────
+
+describe("SAMSCLUB_PRODUCTS", () => {
+  it("is a non-empty map", () => {
+    expect(Object.keys(SAMSCLUB_PRODUCTS).length).toBeGreaterThan(0);
+  });
+
+  it("all keys correspond to TARGET_BOTTLES names", () => {
+    const bottleNames = TARGET_BOTTLES.map((b) => b.name);
+    for (const key of Object.keys(SAMSCLUB_PRODUCTS)) {
+      expect(bottleNames).toContain(key);
+    }
+  });
+
+  it("includes the canary bottle (Buffalo Trace)", () => {
+    expect(SAMSCLUB_PRODUCTS["Buffalo Trace"]).toBeDefined();
+  });
+
+  it("all values are non-empty strings", () => {
+    for (const [, productId] of Object.entries(SAMSCLUB_PRODUCTS)) {
+      expect(typeof productId).toBe("string");
+      expect(productId.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("matchSamsClubProduct", () => {
+  const makeNextData = (product) => ({
+    props: { pageProps: { initialData: { data: { product } } } },
+  });
+
+  it("extracts IN_STOCK product", () => {
+    const nextData = makeNextData({
+      name: "Weller Special Reserve Bourbon 750ml",
+      availabilityStatusV2: { value: "IN_STOCK" },
+      canonicalUrl: "/ip/weller-special-reserve/prod20595259",
+      priceInfo: { linePriceDisplay: "$29.99" },
+      usItemId: "prod20595259",
+      fulfillmentSummary: [{ fulfillment: "Pickup" }],
+    });
+    const match = matchSamsClubProduct(nextData, "Weller Special Reserve");
+    expect(match).not.toBeNull();
+    expect(match.name).toBe("Weller Special Reserve");
+    expect(match.price).toBe("$29.99");
+    expect(match.sku).toBe("prod20595259");
+    expect(match.url).toContain("samsclub.com");
+    expect(match.fulfillment).toBe("Pickup");
+  });
+
+  it("returns null for OUT_OF_STOCK product", () => {
+    const nextData = makeNextData({
+      name: "George T. Stagg Bourbon 750ml",
+      availabilityStatusV2: { value: "OUT_OF_STOCK" },
+      canonicalUrl: "/ip/george-t-stagg/123",
+      priceInfo: { linePriceDisplay: "$99.99" },
+      usItemId: "13735253987",
+    });
+    const match = matchSamsClubProduct(nextData, "George T. Stagg");
+    expect(match).toBeNull();
+  });
+
+  it("returns null when product data is missing", () => {
+    const nextData = { props: { pageProps: { initialData: { data: {} } } } };
+    const match = matchSamsClubProduct(nextData, "Missing Bottle");
+    expect(match).toBeNull();
+  });
+
+  it("falls back to availabilityStatus field", () => {
+    const nextData = makeNextData({
+      name: "Buffalo Trace Bourbon 750ml",
+      availabilityStatus: "IN_STOCK",
+      canonicalUrl: "/ip/buffalo-trace/123",
+      priceInfo: { linePriceDisplay: "$24.99" },
+      usItemId: "13791619865",
+    });
+    const match = matchSamsClubProduct(nextData, "Buffalo Trace");
+    expect(match).not.toBeNull();
+    expect(match.name).toBe("Buffalo Trace");
+  });
+});
+
+describe("scrapeSamsClubViaFetch", () => {
+  it("returns null when proxyAgent is not set (no PROXY_URL)", async () => {
+    const result = await scrapeSamsClubViaFetch();
+    expect(result).toBeNull();
+  });
+});
+
+describe("scrapeSamsClubViaBrowser", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("extracts in-stock products from __NEXT_DATA__", async () => {
+    const page = createMockPage();
+    const productData = {
+      props: { pageProps: { initialData: { data: { product: {
+        name: "Weller Special Reserve Bourbon 750ml",
+        availabilityStatusV2: { value: "IN_STOCK" },
+        canonicalUrl: "/ip/weller/prod20595259",
+        priceInfo: { linePriceDisplay: "$29.99" },
+        usItemId: "prod20595259",
+      } } } } },
+    };
+    // isBlockedPage calls page.evaluate for body text (returns string),
+    // then __NEXT_DATA__ extraction calls page.evaluate (returns object).
+    // Each product in the loop calls evaluate twice. Mock alternating: string, object.
+    let evalCount = 0;
+    page.evaluate.mockImplementation(() => {
+      evalCount++;
+      // Odd calls = isBlockedPage body text, even calls = __NEXT_DATA__
+      if (evalCount % 2 === 1) return Promise.resolve("");
+      return Promise.resolve(productData);
+    });
+    const promise = scrapeSamsClubViaBrowser(page);
+    promise.catch(() => {});
+    await vi.runAllTimersAsync();
+    const found = await promise;
+    expect(found.length).toBeGreaterThan(0);
+    const weller = found.find((b) => b.name === "Weller Special Reserve");
+    expect(weller).toBeDefined();
+    expect(weller.price).toBe("$29.99");
+  });
+
+  it("skips bot detection pages", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Access Denied");
+    page.evaluate.mockResolvedValue("Please verify you are a human");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const promise = scrapeSamsClubViaBrowser(page);
+    promise.catch(() => {});
+    await vi.runAllTimersAsync();
+    const found = await promise;
+    expect(found).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("[samsclub] Bot detection"));
+    warnSpy.mockRestore();
+  });
+
+  it("handles navigation errors gracefully", async () => {
+    const page = createMockPage();
+    page.goto.mockRejectedValue(new Error("Navigation timeout"));
+    page.evaluate.mockResolvedValue("");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const promise = scrapeSamsClubViaBrowser(page);
+    promise.catch(() => {});
+    await vi.runAllTimersAsync();
+    const found = await promise;
+    expect(found).toEqual([]);
+    errSpy.mockRestore();
+  });
+});
+
+describe("scrapeSamsClubStore wrapper", () => {
+  it("falls back to browser when fetch returns null", async () => {
+    // Reset browser state from any prior test that called newPage/launchBrowser
+    setupMockBrowser(); // provides a mock with working .close()
+    await launchBrowser(); // sets module-level browser to the mock
+    await closeBrowser(); // nulls module-level browser
+
+    const { page } = setupMockBrowser();
+    // scrapeSamsClubViaFetch returns null (no proxy), so wrapper creates own page
+    page.evaluate.mockResolvedValue("");
+    mocks.readFile.mockRejectedValue(new Error("no file"));
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const found = await runWithFakeTimers(() => scrapeSamsClubStore());
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(found).toEqual([]);
+    consoleSpy.mockRestore();
+    await closeBrowser();
   });
 });
 

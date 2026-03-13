@@ -62,9 +62,11 @@ vi.mock("../lib/discover-stores.js", () => ({
 import {
   FETCH_HEADERS,
   launchBrowser, closeBrowser,
+  COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   scrapeCostcoViaFetch, scrapeCostcoStore,
   scrapeTotalWineViaFetch, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartStore, scrapeKrogerStore, scrapeSafewayStore,
+  scrapeSamsClubViaFetch,
   getKrogerToken, main, createProxyAgent,
   _resetKrogerToken, _resetPolling, _setStoreCache,
 } from "../scraper.js";
@@ -325,7 +327,7 @@ describe("proxy support", () => {
   });
 
   it("scrapeCostcoViaFetch parses product tiles via proxy", async () => {
-    const html = `<html><body>
+    const tileHtml = `<html><body>
       <div data-testid="ProductTile_12345">
         <a href="https://www.costco.com/weller-sr.product.100123456.html">
           <h3 data-testid="Text_ProductTile_12345_title">Weller Special Reserve Bourbon 750ml</h3>
@@ -333,33 +335,92 @@ describe("proxy support", () => {
         <span data-testid="Text_Price_12345">$29.99</span>
       </div>
     </body></html>`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    const homeRes = { ok: true, text: async () => "<html></html>", headers: { raw: () => ({ "set-cookie": ["ak_bmsc=test123; Path=/"] }) } };
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve(homeRes);
+      return Promise.resolve({ ok: true, text: async () => tileHtml });
+    });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     expect(found).not.toBeNull();
     expect(found.length).toBe(1);
     expect(found[0].name).toBe("Weller Special Reserve");
     expect(found[0].price).toBe("$29.99");
     expect(found[0].sku).toBe("12345");
-    // Verify proxy was used
-    const costcoCalls = mocks.fetch.mock.calls.filter(
-      ([url]) => typeof url === "string" && url.includes("costco.com")
+    // Verify proxy was used on search calls
+    const searchCalls = mocks.fetch.mock.calls.filter(
+      ([url]) => typeof url === "string" && url.includes("costco.com/s?")
     );
-    expect(costcoCalls.length).toBeGreaterThan(0);
-    for (const [, opts] of costcoCalls) {
+    expect(searchCalls.length).toBeGreaterThan(0);
+    for (const [, opts] of searchCalls) {
       expect(opts.agent._isProxy).toBe(true);
     }
   });
 
-  it("scrapeCostcoViaFetch returns null on bot detection", async () => {
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => "<html><title>Access Denied</title><body>robot check</body></html>" });
+  it("scrapeCostcoViaFetch sends cookies from homepage pre-warm", async () => {
+    const homeRes = { ok: true, text: async () => "<html></html>", headers: { raw: () => ({ "set-cookie": ["ak_bmsc=abc123; Path=/", "bm_sv=xyz789; Path=/"] }) } };
+    const emptyHtml = "<html><body>No results</body></html>";
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve(homeRes);
+      return Promise.resolve({ ok: true, text: async () => emptyHtml });
+    });
+    await runWithFakeTimers(() => scrapeCostcoViaFetch());
+    const searchCalls = mocks.fetch.mock.calls.filter(
+      ([url]) => typeof url === "string" && url.includes("costco.com/s?")
+    );
+    expect(searchCalls.length).toBeGreaterThan(0);
+    // Verify cookies from pre-warm are sent on search requests
+    for (const [, opts] of searchCalls) {
+      expect(opts.headers.Cookie).toBe("ak_bmsc=abc123; bm_sv=xyz789");
+    }
+  });
+
+  it("scrapeCostcoViaFetch returns null on bot detection (retries once then gives up)", async () => {
+    const blockedHtml = "<html><title>Access Denied</title><body>robot check</body></html>";
+    mocks.fetch.mockResolvedValue({ ok: true, text: async () => blockedHtml, headers: { raw: () => ({}) } });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     expect(found).toBeNull();
   });
 
-  it("scrapeCostcoViaFetch returns null after 4+ HTTP failures", async () => {
-    mocks.fetch.mockResolvedValue({ ok: false, status: 503 });
+  it("scrapeCostcoViaFetch returns null after 4+ HTTP failures (with retries)", async () => {
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve({ ok: true, text: async () => "", headers: { raw: () => ({}) } });
+      return Promise.resolve({ ok: false, status: 503 });
+    });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     expect(found).toBeNull();
+  });
+
+  it("scrapeCostcoViaFetch recovers on retry after initial block", async () => {
+    const tileHtml = `<html><body>
+      <div data-testid="ProductTile_42">
+        <h3 data-testid="Text_ProductTile_42_title">Weller Special Reserve Bourbon</h3>
+        <span data-testid="Text_Price_42">$29.99</span>
+      </div>
+    </body></html>`;
+    const blockedHtml = "<html><body>Access Denied</body></html>";
+    let searchCallCount = 0;
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve({ ok: true, text: async () => "", headers: { raw: () => ({}) } });
+      searchCallCount++;
+      // First attempt of each query is blocked, retry succeeds
+      if (searchCallCount % 2 === 1) return Promise.resolve({ ok: true, text: async () => blockedHtml });
+      return Promise.resolve({ ok: true, text: async () => tileHtml });
+    });
+    const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
+    expect(found).not.toBeNull();
+    expect(found.length).toBeGreaterThan(0);
+    expect(found[0].name).toBe("Weller Special Reserve");
+  });
+
+  it("scrapeCostcoViaFetch detects all blocked patterns", () => {
+    expect(COSTCO_BLOCKED_PATTERNS).toContain("Access Denied");
+    expect(COSTCO_BLOCKED_PATTERNS).toContain("robot");
+    expect(COSTCO_BLOCKED_PATTERNS).toContain("captcha");
+    expect(COSTCO_BLOCKED_PATTERNS).toContain("_ct_challenge");
+    expect(COSTCO_BLOCKED_PATTERNS).toContain("verify you are human");
+    expect(isCostcoBlocked("<html>Please verify you are human</html>")).toBe(true);
+    expect(isCostcoBlocked("<html>Request unsuccessful</html>")).toBe(true);
+    expect(isCostcoBlocked("<html>Normal product page</html>")).toBe(false);
   });
 
   it("scrapeCostcoStore wrapper uses fetch when proxy is set", async () => {
@@ -369,7 +430,10 @@ describe("proxy support", () => {
         <span data-testid="Text_Price_99">$29.99</span>
       </div>
     </body></html>`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve({ ok: true, text: async () => "", headers: { raw: () => ({}) } });
+      return Promise.resolve({ ok: true, text: async () => html });
+    });
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeCostcoStore());
     expect(found).not.toBeNull();
@@ -378,7 +442,10 @@ describe("proxy support", () => {
   });
 
   it("scrapeCostcoStore wrapper falls back to browser when fetch blocked", async () => {
-    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve({ ok: true, text: async () => "", headers: { raw: () => ({}) } });
+      return Promise.resolve({ ok: false, status: 403 });
+    });
     setupMockBrowser();
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeCostcoStore());
@@ -390,7 +457,10 @@ describe("proxy support", () => {
 
   it("scrapeCostcoViaFetch handles pages with no product tiles (valid empty search)", async () => {
     const html = `<html><body><div class="no-results">No results found</div></body></html>`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve({ ok: true, text: async () => "", headers: { raw: () => ({}) } });
+      return Promise.resolve({ ok: true, text: async () => html });
+    });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     // All queries return valid pages with no tiles — should return empty, not null
     expect(found).not.toBeNull();
@@ -431,6 +501,40 @@ describe("proxy support", () => {
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     expect(found).not.toBeNull();
     expect(found).toEqual([]);
+  });
+});
+
+// ─── Sam's Club Proxy Tests ──────────────────────────────────────────────────
+
+describe("scrapeSamsClubViaFetch proxy", () => {
+  it("passes proxy agent on fetch calls", async () => {
+    const samsclubNextData = {
+      props: { pageProps: { initialData: { data: { product: {
+        name: "Weller Special Reserve Bourbon 750ml",
+        availabilityStatusV2: { value: "IN_STOCK" },
+        canonicalUrl: "/ip/weller/prod20595259",
+        priceInfo: { linePriceDisplay: "$29.99" },
+        usItemId: "prod20595259",
+      } } } } },
+    };
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      text: async () => `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(samsclubNextData)}</script></html>`,
+    });
+    await runWithFakeTimers(() => scrapeSamsClubViaFetch());
+    const samsclubCalls = mocks.fetch.mock.calls.filter(
+      ([url]) => typeof url === "string" && url.includes("samsclub.com")
+    );
+    expect(samsclubCalls.length).toBeGreaterThan(0);
+    for (const [, opts] of samsclubCalls) {
+      expect(opts.agent._isProxy).toBe(true);
+    }
+  });
+
+  it("returns null when all products are blocked", async () => {
+    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    const found = await runWithFakeTimers(() => scrapeSamsClubViaFetch());
+    expect(found).toBeNull();
   });
 });
 

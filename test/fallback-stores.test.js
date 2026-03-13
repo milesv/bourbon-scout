@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { FALLBACK_STORES } from "../lib/fallback-stores.js";
 
 describe("FALLBACK_STORES", () => {
-  const EXPECTED_RETAILERS = ["costco", "totalwine", "walmart", "safeway", "bevmo", "kroger"];
+  const EXPECTED_RETAILERS = ["costco", "totalwine", "walmart", "safeway", "samsclub", "bevmo", "kroger"];
 
   it("contains all expected retailer keys", () => {
     for (const key of EXPECTED_RETAILERS) {
@@ -11,11 +11,12 @@ describe("FALLBACK_STORES", () => {
     }
   });
 
-  it("has stores for costco, totalwine, walmart, safeway", () => {
+  it("has stores for costco, totalwine, walmart, safeway, samsclub", () => {
     expect(FALLBACK_STORES.costco.length).toBeGreaterThan(0);
     expect(FALLBACK_STORES.totalwine.length).toBeGreaterThan(0);
     expect(FALLBACK_STORES.walmart.length).toBeGreaterThan(0);
     expect(FALLBACK_STORES.safeway.length).toBeGreaterThan(0);
+    expect(FALLBACK_STORES.samsclub.length).toBeGreaterThan(0);
   });
 
   it("has empty arrays for bevmo and kroger (no AZ stores / API-only)", () => {

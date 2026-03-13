@@ -277,12 +277,12 @@ const COLORS = {
 
 const SKU_LABELS = {
   costco: "Item #", totalwine: "Item #", walmart: "Item #",
-  kroger: "SKU", safeway: "UPC",
+  kroger: "SKU", safeway: "UPC", samsclub: "Item #",
 };
 
 const STORE_TYPE_LABELS = {
   costco: "Warehouse", totalwine: "Store", walmart: "Store",
-  kroger: "Store", safeway: "Store",
+  kroger: "Store", safeway: "Store", samsclub: "Club",
 };
 
 function parseCity(address) {
@@ -452,8 +452,8 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   return embeds;
 }
 
-const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens"];
-const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens" };
+const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
+const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens", samsclub: "Sam's Club" };
 
 function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {} }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
@@ -746,6 +746,17 @@ function matchCostcoTiles($) {
   return found;
 }
 
+// Akamai challenge patterns to detect blocked responses in fetch HTML.
+const COSTCO_BLOCKED_PATTERNS = [
+  "Access Denied", "robot", "captcha",
+  "Request unsuccessful", "Incapsula",
+  "Enable JavaScript", "verify you are human",
+  "_ct_challenge",
+];
+function isCostcoBlocked(html) {
+  return COSTCO_BLOCKED_PATTERNS.some((p) => html.includes(p));
+}
+
 // Try fetching Costco search HTML directly and parsing with cheerio (no browser needed).
 // Returns found[] on success, null if blocked by Akamai Bot Manager.
 async function scrapeCostcoViaFetch() {
@@ -753,26 +764,56 @@ async function scrapeCostcoViaFetch() {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  // Batch queries (4 concurrent) — balances speed vs bot detection risk
+
+  // Pre-warm: fetch homepage to get session cookies (mirrors browser pre-warm).
+  // Akamai gives lighter treatment to requests with valid session cookies.
+  let cookies = "";
+  try {
+    const homeRes = await fetchRetry("https://www.costco.com/", {
+      headers: FETCH_HEADERS,
+      signal: AbortSignal.timeout(10000),
+      agent: proxyAgent,
+      redirect: "follow",
+    });
+    const setCookies = homeRes.headers.raw?.()["set-cookie"] || [];
+    cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
+  } catch { /* continue without cookies */ }
+
+  // SOCKS5 proxies (e.g. NordVPN) cap concurrent connections — go sequential.
+  const concurrency = PROXY_URL?.startsWith("socks") ? 1 : 4;
+
+  // Batch queries with adaptive concurrency
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(SEARCH_QUERIES).map((query, i) => async () => {
     if (failures > 3) return;
+    // Inter-query delay with jitter to reduce burst detection
+    if (i > 0) await sleep(250 + Math.random() * 250);
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     const headers = { ...FETCH_HEADERS };
+    if (cookies) headers["Cookie"] = cookies;
     if (i > 0) {
       headers["Sec-Fetch-Site"] = "same-origin";
       headers["Referer"] = "https://www.costco.com/";
     }
     try {
-      const res = await fetchRetry(url, {
+      let res = await fetchRetry(url, {
         headers,
         signal: AbortSignal.timeout(15000),
         agent: proxyAgent,
       });
-      if (!res.ok) { failures++; trackHealth("costco", "fail"); return; }
-      const html = await res.text();
-      if (html.includes("Access Denied") || html.includes("robot") || html.includes("captcha")) {
-        failures++; trackHealth("costco", "blocked"); return;
+      let html = res.ok ? await res.text() : "";
+      // Retry once with backoff if blocked (Akamai may unblock after a pause)
+      if (!res.ok || isCostcoBlocked(html)) {
+        await sleep(2000 + Math.random() * 1000);
+        const retryRes = await fetch(url, {
+          headers,
+          signal: AbortSignal.timeout(15000),
+          agent: proxyAgent,
+        }).catch(() => null);
+        if (!retryRes?.ok) { failures++; trackHealth("costco", !res.ok ? "fail" : "blocked"); return; }
+        const retryHtml = await retryRes.text();
+        if (isCostcoBlocked(retryHtml)) { failures++; trackHealth("costco", "blocked"); return; }
+        html = retryHtml;
       }
       const $ = cheerio.load(html);
       const hasTiles = $('[data-testid^="ProductTile_"]').length > 0;
@@ -785,7 +826,7 @@ async function scrapeCostcoViaFetch() {
       trackHealth("costco", "fail");
     }
   });
-  await runWithConcurrency(queryTasks, 4);
+  await runWithConcurrency(queryTasks, concurrency);
   if (validPages === 0) return null;
   return dedupFound(found);
 }
@@ -1319,6 +1360,168 @@ async function scrapeWalgreensStore() {
   }
 }
 
+// ─── Sam's Club: per-product-URL fetch with browser fallback ─────────────────
+// Sam's Club search does NOT return spirits — product pages exist at /ip/{slug}/{id}
+// but are excluded from search. We check each known product page directly.
+
+// Map TARGET_BOTTLES name → Sam's Club product ID (usItemId or prodId).
+// Only bottles with known Sam's Club pages are included.
+const SAMSCLUB_PRODUCTS = {
+  "Blanton's Original":       "prod23140012",
+  "Weller Special Reserve":   "prod20595259",
+  "E.H. Taylor Small Batch":  "prod25791990",
+  "Stagg Jr":                 "prod25430037",
+  "George T. Stagg":          "13735253987",
+  "Eagle Rare 17 Year":       "prod24381479",
+  "Pappy Van Winkle 15 Year": "prod3160426",
+  "Buffalo Trace":            "13791619865",   // canary
+};
+
+// Extract product availability from Sam's Club __NEXT_DATA__ JSON.
+// Product data lives at props.pageProps.initialData.data.product
+// (differs from Walmart's searchResult.itemStacks path).
+function matchSamsClubProduct(nextData, bottleName) {
+  const product = nextData?.props?.pageProps?.initialData?.data?.product;
+  if (!product?.name) return null;
+  const inStock = product.availabilityStatusV2?.value === "IN_STOCK" ||
+    (product.availabilityStatus === "IN_STOCK");
+  if (!inStock) return null;
+  return {
+    name: bottleName,
+    url: product.canonicalUrl ? `https://www.samsclub.com${product.canonicalUrl}` : "",
+    price: product.priceInfo?.linePriceDisplay || "",
+    sku: product.usItemId || product.productId || "",
+    size: parseSize(product.name),
+    fulfillment: (product.fulfillmentSummary || []).map((f) => f.fulfillment).filter(Boolean).join(", "),
+  };
+}
+
+// Fetch-first: check each product page directly via HTTP, extract __NEXT_DATA__.
+// Returns found[] on success, null if blocked (triggers browser fallback).
+async function scrapeSamsClubViaFetch() {
+  if (!proxyAgent) return null;
+  const found = [];
+  let failures = 0;
+  let validPages = 0;
+  const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
+
+  const productTasks = entries.map(([bottleName, productId], i) => async () => {
+    if (failures > Math.floor(entries.length / 2)) return;
+    if (i > 0) await sleep(250 + Math.random() * 250);
+    const url = `https://www.samsclub.com/ip/${productId}`;
+    const headers = { ...FETCH_HEADERS };
+    if (i > 0) {
+      headers["Sec-Fetch-Site"] = "same-origin";
+      headers["Referer"] = "https://www.samsclub.com/";
+    }
+    try {
+      const res = await fetchRetry(url, {
+        headers,
+        signal: AbortSignal.timeout(15000),
+        agent: proxyAgent,
+      });
+      if (!res.ok) { failures++; trackHealth("samsclub", "fail"); return; }
+      const html = await res.text();
+      // Brace-counting JSON extraction (same as Walmart path)
+      const idx = html.indexOf('id="__NEXT_DATA__"');
+      if (idx === -1) { failures++; trackHealth("samsclub", "blocked"); return; }
+      const braceStart = html.indexOf("{", idx);
+      if (braceStart === -1) { failures++; trackHealth("samsclub", "blocked"); return; }
+      let depth = 0, inStr = false, escape = false, end = -1;
+      for (let j = braceStart; j < html.length; j++) {
+        const ch = html[j];
+        if (escape) { escape = false; continue; }
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === "{") depth++;
+        else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
+      }
+      if (end === -1) { failures++; trackHealth("samsclub", "blocked"); return; }
+      const nextData = JSON.parse(html.slice(braceStart, end));
+      const product = nextData?.props?.pageProps?.initialData?.data?.product;
+      if (!product?.name) { failures++; trackHealth("samsclub", "blocked"); return; }
+      validPages++;
+      trackHealth("samsclub", "ok");
+      const match = matchSamsClubProduct(nextData, bottleName);
+      if (match) found.push(match);
+    } catch {
+      failures++;
+      trackHealth("samsclub", "fail");
+    }
+  });
+  await runWithConcurrency(productTasks, 4);
+  if (validPages === 0) return null;
+  return dedupFound(found);
+}
+
+// Browser-based Sam's Club scraper (fallback).
+async function scrapeSamsClubViaBrowser(page) {
+  // Pre-warm: visit homepage to let PerimeterX sensor set cookies
+  await page.goto("https://www.samsclub.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+  await sleep(2000);
+
+  const found = [];
+  const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
+  for (const [bottleName, productId] of entries) {
+    const url = `https://www.samsclub.com/ip/${productId}`;
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForFunction(
+        () => document.querySelector('script#__NEXT_DATA__')?.textContent?.length > 100,
+        { timeout: 10000 },
+      ).catch(() => {});
+
+      if (await isBlockedPage(page)) {
+        console.warn(`[samsclub] Bot detection on product ${productId} — skipping`);
+        trackHealth("samsclub", "blocked");
+        continue;
+      }
+
+      const nextData = await page.evaluate(
+        /* v8 ignore start -- browser-only DOM callback */
+        () => {
+          const el = document.querySelector("script#__NEXT_DATA__");
+          if (el) try { return JSON.parse(el.textContent); } catch {}
+          return null;
+        },
+        /* v8 ignore stop */
+      );
+
+      if (nextData) {
+        const match = matchSamsClubProduct(nextData, bottleName);
+        if (match) found.push(match);
+      }
+      trackHealth("samsclub", "ok");
+    } catch (err) {
+      console.error(`[samsclub] Error checking ${bottleName}: ${err.message}`);
+      trackHealth("samsclub", "fail");
+    }
+    await sleep(750);
+  }
+  return dedupFound(found);
+}
+
+// Wrapper: try fetch-first, fall back to browser.
+async function scrapeSamsClubStore() {
+  const fetchResult = await scrapeSamsClubViaFetch();
+  if (fetchResult !== null) {
+    console.log("[samsclub] Used fast fetch mode (proxied)");
+    return fetchResult;
+  }
+  console.log("[samsclub] Fetch blocked, using browser");
+  const page = await newPage();
+  try {
+    const scraperPromise = scrapeSamsClubViaBrowser(page);
+    scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
+    const result = await withTimeout(scraperPromise, 180000, []);
+    await saveBrowserState(page.context()).catch(() => {});
+    return result;
+  } finally {
+    await page.context().close().catch(() => {});
+  }
+}
+
 // ─── API-based scrapers ─────────────────────────────────────────────────────
 
 // Fetch Kroger OAuth token once, shared across all store scrapers.
@@ -1519,6 +1722,7 @@ const RETAILERS = [
   { key: "kroger",    name: "Kroger",     scrapeOnce: false, needsPage: false, scraper: scrapeKrogerStore },
   { key: "safeway",   name: "Safeway",    scrapeOnce: false, needsPage: false, scraper: scrapeSafewayStore },
   { key: "walgreens", name: "Walgreens",  scrapeOnce: true,  needsPage: false, scraper: scrapeWalgreensStore },
+  { key: "samsclub", name: "Sam's Club",  scrapeOnce: true,  needsPage: false, scraper: scrapeSamsClubStore },
   // BevMo omitted — no AZ locations
 ];
 
@@ -1672,11 +1876,13 @@ export {
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
   createProxyAgent,
+  COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
+  SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
   poll,
 };

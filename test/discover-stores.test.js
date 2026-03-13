@@ -25,7 +25,7 @@ vi.mock("node:fs/promises", () => ({
 import {
   loadCache, saveCache, isCacheValid, cleanStoreEntries,
   locateCostco, locateTotalWine, locateWalmart,
-  locateKroger, locateSafeway, locateWalgreens, locateBevMo,
+  locateKroger, locateSafeway, locateWalgreens, locateSamsClub, locateBevMo,
   discoverStores,
 } from "../lib/discover-stores.js";
 
@@ -675,6 +675,71 @@ describe("locateWalgreens", () => {
       { storeId: "3", name: "Walgreens C", address: "Addr C", distance: 3.0 },
     ]);
     const stores = await locateWalgreens(mockPage, "85283", COORDS, 15, 2);
+    expect(stores).toHaveLength(2);
+  });
+});
+
+// ─── Sam's Club Locator ──────────────────────────────────────────────────────
+
+describe("locateSamsClub", () => {
+  it("extracts clubs from club-finder page", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { storeId: "4956", name: "Sam's Club", address: "2080 E Rio Salado Pkwy, Tempe, AZ 85288", distance: 4.6 },
+      { storeId: "6210", name: "Sam's Club", address: "1240 S Country Club Dr, Mesa, AZ 85210", distance: 7.3 },
+    ]);
+    const stores = await locateSamsClub(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toHaveLength(2);
+    expect(stores[0]).toEqual({
+      storeId: "4956",
+      name: "Sam's Club",
+      address: "2080 E Rio Salado Pkwy, Tempe, AZ 85288",
+      distanceMiles: 4.6,
+    });
+    expect(mockPage.goto).toHaveBeenCalledWith(
+      expect.stringContaining("samsclub.com/club-finder"),
+      expect.any(Object)
+    );
+  });
+
+  it("filters clubs by radius", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { storeId: "4956", name: "Sam's Club", address: "Nearby", distance: 5.0 },
+      { storeId: "9999", name: "Sam's Club", address: "Far Away", distance: 25.0 },
+    ]);
+    const stores = await locateSamsClub(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toHaveLength(1);
+    expect(stores[0].storeId).toBe("4956");
+  });
+
+  it("returns empty array on locator failure", async () => {
+    const mockPage = createMockPage();
+    mockPage.goto.mockRejectedValueOnce(new Error("Navigation timeout"));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stores = await locateSamsClub(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toEqual([]);
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("[discover] Sam's Club locator failed"));
+    errSpy.mockRestore();
+  });
+
+  it("prefixes club name with Sam's Club if missing", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { storeId: "4956", name: "Tempe", address: "2080 E Rio Salado Pkwy", distance: 4.6 },
+    ]);
+    const stores = await locateSamsClub(mockPage, "85283", COORDS, 15, 5);
+    expect(stores[0].name).toBe("Sam's Club Tempe");
+  });
+
+  it("caps at maxStores", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { storeId: "1", name: "Sam's Club A", address: "Addr A", distance: 1.0 },
+      { storeId: "2", name: "Sam's Club B", address: "Addr B", distance: 2.0 },
+      { storeId: "3", name: "Sam's Club C", address: "Addr C", distance: 3.0 },
+    ]);
+    const stores = await locateSamsClub(mockPage, "85283", COORDS, 15, 2);
     expect(stores).toHaveLength(2);
   });
 });

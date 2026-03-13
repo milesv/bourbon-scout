@@ -1,10 +1,10 @@
 # Bourbon Scout
 
-Automated inventory tracker for allocated and rare bourbon. Monitors 5 major retailers near your zip code and sends real-time Discord alerts with SKU/item numbers, store details, and stock status changes when bottles are spotted or go out of stock.
+Automated inventory tracker for allocated and rare bourbon. Monitors 7 major retailers near your zip code and sends real-time Discord alerts with SKU/item numbers, store details, and stock status changes when bottles are spotted or go out of stock.
 
-## Tracked Bottles (40)
+## Tracked Bottles (39)
 
-Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch).
+Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch), Buffalo Trace (canary health check).
 
 ## Supported Retailers
 
@@ -15,13 +15,15 @@ Blanton's (Gold, SFTB, Special Reserve, Red, Green, Black), Weller (Special Rese
 | Walmart | Fetch-first, browser fallback | `__NEXT_DATA__` JSON |
 | Kroger | REST API | Structured JSON |
 | Safeway | REST API | Structured JSON |
+| Walgreens | Browser-only | Server-rendered HTML (CSS selectors) |
+| Sam's Club | Fetch-first, browser fallback | `__NEXT_DATA__` JSON (per-product) |
 
 ## How It Works
 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
-2. **Inventory Scanning** — Scans all stores concurrently (limit 6) using 12 broad search queries that cover all 40 bottles. Prefers fetch-first with structured JSON/HTML extraction over browser scraping — Costco (cheerio), Total Wine (`INITIAL_STATE`), and Walmart (`__NEXT_DATA__`) all try plain HTTP fetch before falling back to Playwright. Detects bot challenge pages and retries transient failures once.
+2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 14 broad search queries that cover all 39 bottles. Prefers fetch-first with structured JSON/HTML extraction over browser scraping — Costco (cheerio), Total Wine (`INITIAL_STATE`), Walmart (`__NEXT_DATA__`), and Sam's Club (`__NEXT_DATA__` per-product) all try plain HTTP fetch before falling back to Playwright. Sam's Club uses per-product-URL scraping since its search excludes spirits. Detects bot challenge pages and retries transient failures once. Includes a canary bottle (Buffalo Trace) as a scraper health check.
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
-4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@everyone` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
+4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@everyone` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 
 ## Setup
 
@@ -65,9 +67,9 @@ SAFEWAY_API_KEY=
 | `KROGER_CLIENT_ID` | No | Kroger API client ID (get from [developer.kroger.com](https://developer.kroger.com)) |
 | `KROGER_CLIENT_SECRET` | No | Kroger API client secret |
 | `SAFEWAY_API_KEY` | No | Safeway product search API key |
-| `PROXY_URL` | No | Residential proxy URL (e.g. `http://host:port`). Enables fetch-first paths for Costco and Total Wine, bypassing browser scraping. |
+| `PROXY_URL` | No | Residential proxy URL (e.g. `http://host:port`). Enables fetch-first paths for Costco, Total Wine, Walmart, and Sam's Club, bypassing browser scraping. |
 
-Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, Costco and Total Wine use browser-only scraping; Walmart's fetch path skips on CI but works locally.
+Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, Costco, Total Wine, and Sam's Club use browser-only scraping; Walmart's fetch path skips on CI but works locally.
 
 ### Run
 
@@ -112,7 +114,7 @@ Four types of color-coded embeds with per-retailer SKU/item numbers and rich sto
 Each embed includes:
 - Store name, number, city/state, and distance
 - Google Maps link to store address
-- Retailer-specific SKU labels (Item # for Costco/Total Wine/Walmart, SKU for Kroger, UPC for Safeway)
+- Retailer-specific SKU labels (Item # for Costco/Total Wine/Walmart/Sam's Club, SKU for Kroger, UPC for Safeway)
 
 ## Generated Files
 
@@ -120,6 +122,7 @@ Each embed includes:
 |------|---------|-----------------|
 | `stores.json` | Cached store discovery results | Yes — triggers re-discovery on next startup |
 | `state.json` | Per-store stock state with timestamps and scan counts | Yes — treats all bottles as new finds on next poll |
+| `browser-state.json` | Playwright browser cookies/storage (reduces bot detection) | Yes — cookies will re-accumulate on next poll |
 | `debug/` | Screenshots and HTML from store locator pages | Yes — regenerate with `node debug-locators.js` |
 
 ## Debugging Store Locators

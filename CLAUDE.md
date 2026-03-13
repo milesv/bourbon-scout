@@ -1,6 +1,6 @@
 # Bourbon Scout
 
-Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 6 retailers for 39 bottles (38 rare/allocated + 1 canary health check) near a zip code, sends per-store Discord alerts with @everyone pings when bottles are found, plus a quiet summary with per-scraper health metrics after each scan.
+Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 7 retailers for 39 bottles (38 rare/allocated + 1 canary health check) near a zip code, sends per-store Discord alerts with @everyone pings when bottles are found, plus a quiet summary with per-scraper health metrics after each scan.
 
 ## Architecture
 
@@ -28,17 +28,19 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 6 reta
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
 - **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a proxy. Supports HTTP/HTTPS and SOCKS5/SOCKS4 protocols — `createProxyAgent()` auto-detects based on URL scheme. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
 - **Query order randomization** — `shuffle(SEARCH_QUERIES)` via Fisher-Yates before every scraper loop to avoid predictable access patterns that anti-bot ML models flag.
-- **Fetch-first with browser fallback** — Walmart, Total Wine, and Costco all try plain HTTP fetch first (via residential proxy) before spinning up a browser page. Walmart parses `__NEXT_DATA__`, Total Wine parses `window.INITIAL_STATE`, Costco parses `data-testid` tiles via `cheerio`. Falls back to Playwright if blocked.
+- **Fetch-first with browser fallback** — Walmart, Total Wine, Costco, and Sam's Club all try plain HTTP fetch first (via residential proxy) before spinning up a browser page. Walmart parses `__NEXT_DATA__`, Total Wine parses `window.INITIAL_STATE`, Costco parses `data-testid` tiles via `cheerio`, Sam's Club parses `__NEXT_DATA__` per-product. Falls back to Playwright if blocked.
+- **Per-product-URL scraping** — Sam's Club search excludes spirits, so `SAMSCLUB_PRODUCTS` maps bottle names to product IDs. Each product page is fetched individually at `/ip/{productId}` instead of using SEARCH_QUERIES. Only bottles with known Sam's Club pages are checked.
 - **Fetch retry** — `fetchRetry()` retries once on network errors (timeouts, DNS failures) with 1s backoff and `console.warn` on first failure. Used by all fetch-based scrapers.
 - **Brace-counting JSON extraction** — Total Wine INITIAL_STATE and Walmart `__NEXT_DATA__` are both extracted from HTML using a character-by-character brace counter that tracks string context and escape characters, safely handling `</script>` inside JSON string values.
-- **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Walgreens uses `USER_LOC` cookie with zip coordinates — nearby stores share results. Both scraped once and broadcast to all stores.
+- **Scrape-once pattern** — Costco search has no store filter, so results are identical across warehouses. Walgreens uses `USER_LOC` cookie with zip coordinates — nearby stores share results. Sam's Club product pages show availability for the nearest club. All three scraped once and broadcast to all stores.
 - **Broad search queries** — 14 queries cover all 39 bottles (38 allocated + 1 canary). API scrapers (Kroger, Safeway) use these instead of per-bottle queries (~60% fewer API calls).
 - **Canary bottle (Buffalo Trace)** — Always-in-stock bottle used as a scraper health check. Found canary = scraper is working. Missing canary = scraper may be broken. Canary results are filtered out before alerts/state — only shown in the health section of the summary embed.
 - **Per-scraper health tracking** — `scraperHealth` module-level object tracks queries succeeded/failed/blocked per retailer per poll. `trackHealth(retailerKey, outcome)` called in every scraper's query loop. Reset each poll. Displayed as inline Discord embed fields (3 per row).
 - **Shared Kroger OAuth token** — Fetched once per poll via singleton promise, shared across all Kroger stores. Clears cached token on 401 for automatic re-auth. Uses promo price when available (falls back to regular).
-- **Per-scraper browser timeout** — `withTimeout(promise, 180000, [])` wraps all browser scraper calls (Costco, Total Wine, Walmart, Walgreens). Returns empty results after 3 min instead of hanging forever. Prevents Akamai challenge pages from stalling concurrency slots and causing CI timeouts.
-- **Homepage pre-warm** — Costco and Walmart browser scrapers visit the retailer homepage before searching. Lets Akamai's sensor script run and set the `_abck` cookie, so subsequent search requests are treated as "proven human" rather than getting challenge pages.
-- **Bot detection** — `isBlockedPage()` checks page title AND body text for challenge/CAPTCHA/access-denied/security-check indicators. Browser scrapers skip queries that hit bot detection instead of recording false "empty" results.
+- **Per-scraper browser timeout** — `withTimeout(promise, 180000, [])` wraps all browser scraper calls (Costco, Total Wine, Walmart, Walgreens, Sam's Club). Returns empty results after 3 min instead of hanging forever. Prevents Akamai challenge pages from stalling concurrency slots and causing CI timeouts.
+- **Homepage pre-warm** — Costco (both fetch and browser paths) and Walmart browser scrapers visit the retailer homepage before searching. Fetch path collects `Set-Cookie` headers and forwards them on subsequent requests. Browser path lets Akamai's sensor script run and set the `_abck` cookie. Both reduce "cold request" bot signals.
+- **Costco fetch resilience** — `scrapeCostcoViaFetch` has layered anti-bot countermeasures: (1) cookie pre-warm from homepage, (2) adaptive concurrency (1 for SOCKS5, 4 for HTTP), (3) inter-query jitter (250-500ms), (4) expanded blocked detection via `isCostcoBlocked()` with 8 Akamai patterns, (5) retry-with-backoff on blocked responses (2-3s pause before retry).
+- **Bot detection** — `isBlockedPage()` checks page title AND body text for challenge/CAPTCHA/access-denied/security-check indicators. Browser scrapers skip queries that hit bot detection instead of recording false "empty" results. Costco fetch path uses `isCostcoBlocked()` with additional Akamai-specific patterns (`_ct_challenge`, `Request unsuccessful`, `Incapsula`, `Enable JavaScript`, `verify you are human`).
 - **Per-retailer Sec-Fetch-Site** — First query per scraper sends `cross-site` + Google Referer (simulating search click). Subsequent queries send `same-origin` + retailer domain Referer (simulating internal navigation). Uses `.map()` index (`i > 0`) instead of runtime flag to avoid race conditions in concurrent task execution.
 - **Chrome-accurate FETCH_HEADERS** — `Accept` header matches real Chrome 145 (includes `image/avif`, `image/webp`, `application/signed-exchange`). `Sec-Fetch-User: ?1` header included. `Accept-Encoding` is `gzip, deflate` only (Brotli removed, `node-fetch` can't decompress it).
 - **State pruning** — `pruneState()` removes stale retailer/store entries from `state.json` on each poll, keeping state clean when stores change.
@@ -75,6 +77,7 @@ All config is in `.env`:
 | Kroger | REST API | JSON | None (API key auth) | Shared OAuth token (singleton promise). Broad SEARCH_QUERIES (12) instead of per-bottle (40). 401 auto-clears token. `filter.limit=50`. Paginates to page 2 when first page is full. |
 | Safeway | REST API | JSON | None (API key auth) | Broad SEARCH_QUERIES. `rows=50`. Paginates to page 2 (`start=50`) when first page is full. Skips silently if API key not set. |
 | Walgreens | Playwright (browser-only) | Server-rendered HTML (CSS selectors) | Akamai Bot Manager | Scrape-once. `USER_LOC` cookie (base64 JSON with lat/lng/zip) sets store context. No embedded JSON — extracts `.card__product` DOM elements. Filters by "Not sold at your store" text. |
+| Sam's Club | Fetch-first / Playwright | `__NEXT_DATA__` JSON (per-product) | PerimeterX | Scrape-once. Per-product-URL approach — search excludes spirits. `SAMSCLUB_PRODUCTS` maps bottle names to product IDs. Checks `availabilityStatusV2.value` on each product page. Same Next.js stack as Walmart (same parent company). |
 
 BevMo is omitted from the poll loop — no Arizona locations exist.
 
@@ -84,17 +87,15 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-420 tests across 5 files using Vitest:
+446 tests across 5 files using Vitest:
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 312 | Bottle matching, scrapers (Costco/TotalWine/Walmart/Kroger/Safeway/Walgreens), Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing/null-inventory guard, TotalWine stock signals/fulfillment filter, Safeway strict inStock/price formatting/pagination, Walmart brace-counting extraction, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks, truncateTitle, parseSize centiliter, formatStoreInfo dedup, fetchRetry logging, Walgreens USER_LOC cookie, poll concurrency limit, canary bottle (Buffalo Trace), scraper health tracking (trackHealth), summary embed health fields + canary indicators, withTimeout, CHROME_PATH/executablePath |
-| `test/proxy.test.js` | 29 | Proxy agent routing, SOCKS5/HTTP protocol auto-detection, fetch-first paths (Costco, Total Wine, Walmart), wrapper fallback logic |
-| `test/discover-stores.test.js` | 64 | Store locator logic per retailer (incl. Walgreens), store name sanitization |
+| `test/scraper.test.js` | 328 | Bottle matching, scrapers (Costco/TotalWine/Walmart/Kroger/Safeway/Walgreens/Sam's Club), Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing/null-inventory guard, TotalWine stock signals/fulfillment filter, Safeway strict inStock/price formatting/pagination, Walmart brace-counting extraction, Sam's Club per-product `__NEXT_DATA__` extraction/availability/browser fallback, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks, isCostcoBlocked patterns, truncateTitle, parseSize centiliter, formatStoreInfo dedup, fetchRetry logging, Walgreens USER_LOC cookie, poll concurrency limit, canary bottle (Buffalo Trace), scraper health tracking (trackHealth), summary embed health fields + canary indicators, withTimeout, CHROME_PATH/executablePath |
+| `test/proxy.test.js` | 34 | Proxy agent routing, SOCKS5/HTTP protocol auto-detection, fetch-first paths (Costco, Total Wine, Walmart, Sam's Club), wrapper fallback logic, Costco cookie pre-warm, Costco blocked retry recovery |
+| `test/discover-stores.test.js` | 69 | Store locator logic per retailer (incl. Walgreens, Sam's Club), store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance, AbortSignal timeout |
 | `test/fallback-stores.test.js` | 6 | Static store data validation |
-
-Coverage: 97.62% statements, 91.42% branches, 94.03% functions, 99.45% lines.
 
 ```sh
 npm test             # Run all tests
@@ -130,5 +131,6 @@ When a retailer's store locator stops finding stores (selectors broke):
 - `stores.json` cache invalidates on zip/radius change or after 7 days.
 - `lib/fallback-stores.js` provides static store data when browser-based locators fail on CI.
 - Walgreens has no embedded JSON (`__NEXT_DATA__`, `INITIAL_STATE`) — server-rendered HTML only. Akamai blocks direct fetch (403), so it's browser-only with no fetch-first path. Store context set via `USER_LOC` cookie (base64 JSON: `{"la":"<lat>","lo":"<lng>","uz":"<zip>"}`).
+- Sam's Club search (`samsclub.com/search?q=`) does NOT return spirits — product pages exist at `/ip/{slug}/{id}` but are excluded from search results. The scraper uses `SAMSCLUB_PRODUCTS` (a static map of bottle→productId) instead of `SEARCH_QUERIES`. Not all 39 bottles have Sam's Club pages — only 8 are currently mapped.
 - NordVPN SOCKS5 proxy (`phoenix.us.socks.nordhold.net:1080`) doesn't work for scraping — it caps concurrent connections, causing `ConnectionRefused`/`ERR_SOCKS_CONNECTION_FAILED` under load. System VPN (NordVPN app) works much better since it tunnels all traffic at OS level with no per-connection limits.
 - `PROXY_URL` supports both HTTP and SOCKS5 via `createProxyAgent()` auto-detection, but SOCKS5 proxies with connection limits (like NordVPN) will fail under concurrent load. Prefer system VPN or a residential HTTP proxy designed for high concurrency.
