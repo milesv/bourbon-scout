@@ -780,6 +780,14 @@ describe("formatStoreInfo", () => {
     expect(formatStoreInfo("kroger", "Kroger", TEST_STORE).skuLabel).toBe("SKU");
     expect(formatStoreInfo("safeway", "Safeway", TEST_STORE).skuLabel).toBe("UPC");
     expect(formatStoreInfo("costco", "Costco", TEST_STORE).skuLabel).toBe("Item #");
+    expect(formatStoreInfo("samsclub", "Sam's Club", TEST_STORE).skuLabel).toBe("Item #");
+  });
+
+  it("uses 'Club' type label for Sam's Club", () => {
+    const info = formatStoreInfo("samsclub", "Sam's Club", TEST_STORE);
+    expect(info.storeLine).toContain("Club #1234");
+    expect(info.storeLine).not.toContain("Store #");
+    expect(info.storeLine).not.toContain("Warehouse #");
   });
 
   it("handles missing distance", () => {
@@ -1005,6 +1013,18 @@ describe("buildStoreEmbeds", () => {
     expect(embeds[0].description).toContain("N/A");
     expect(embeds[0].description).toContain("?");
   });
+
+  it("renders Sam's Club embed with Club type label and correct footer", () => {
+    const samsStore = { ...TEST_STORE, name: "Sam's Club Tempe", storeId: "4956" };
+    const changes = { newFinds: [bottle("Weller Special Reserve")], stillInStock: [], goneOOS: [] };
+    const embeds = buildStoreEmbeds("samsclub", "Sam's Club", samsStore, changes);
+    expect(embeds).toHaveLength(1);
+    expect(embeds[0].title).toContain("Sam's Club Tempe");
+    expect(embeds[0].description).toContain("Club #4956");
+    expect(embeds[0].description).not.toContain("Store #");
+    expect(embeds[0].footer.text).toContain("Sam's Club");
+    expect(embeds[0].description).toContain("Item #");
+  });
 });
 
 describe("buildSummaryEmbed", () => {
@@ -1148,15 +1168,33 @@ describe("buildSummaryEmbed", () => {
 
   it("orders fields by retailer registry order", () => {
     const health = {
+      samsclub: { queries: 8, succeeded: 8, failed: 0, blocked: 0 },
       walgreens: { queries: 14, succeeded: 14, failed: 0, blocked: 0 },
       costco: { queries: 14, succeeded: 14, failed: 0, blocked: 0 },
       kroger: { queries: 14, succeeded: 14, failed: 0, blocked: 0 },
     };
     const embed = buildSummaryEmbed({
-      storesScanned: 3, retailersScanned: 3, totalNewFinds: 0, totalStillInStock: 0,
-      totalGoneOOS: 0, nothingCount: 3, durationSec: 60, health,
+      storesScanned: 4, retailersScanned: 4, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 4, durationSec: 60, health,
     });
-    expect(embed.fields.map((f) => f.name)).toEqual(["Costco", "Kroger", "Walgreens"]);
+    expect(embed.fields.map((f) => f.name)).toEqual(["Costco", "Kroger", "Walgreens", "Sam's Club"]);
+  });
+
+  it("shows Sam's Club health with canary in summary", () => {
+    const health = {
+      samsclub: { queries: 8, succeeded: 6, failed: 2, blocked: 0 },
+    };
+    const canaryResults = { samsclub: true };
+    const embed = buildSummaryEmbed({
+      storesScanned: 1, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 1, durationSec: 30, health, canaryResults,
+    });
+    const sc = embed.fields.find((f) => f.name === "Sam's Club");
+    expect(sc).toBeDefined();
+    expect(sc.value).toContain("✅");
+    expect(sc.value).toContain("6/8");
+    expect(sc.value).toContain("🐤");
+    expect(sc.inline).toBe(true);
   });
 });
 

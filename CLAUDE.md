@@ -87,11 +87,11 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-446 tests across 5 files using Vitest:
+449 tests across 5 files using Vitest:
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 328 | Bottle matching, scrapers (Costco/TotalWine/Walmart/Kroger/Safeway/Walgreens/Sam's Club), Discord embeds, poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing/null-inventory guard, TotalWine stock signals/fulfillment filter, Safeway strict inStock/price formatting/pagination, Walmart brace-counting extraction, Sam's Club per-product `__NEXT_DATA__` extraction/availability/browser fallback, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks, isCostcoBlocked patterns, truncateTitle, parseSize centiliter, formatStoreInfo dedup, fetchRetry logging, Walgreens USER_LOC cookie, poll concurrency limit, canary bottle (Buffalo Trace), scraper health tracking (trackHealth), summary embed health fields + canary indicators, withTimeout, CHROME_PATH/executablePath |
+| `test/scraper.test.js` | 331 | Bottle matching, scrapers (Costco/TotalWine/Walmart/Kroger/Safeway/Walgreens/Sam's Club), Discord embeds (incl. Sam's Club "Club" type label, health+canary), poll orchestration, error isolation, fetch helpers, platform UA, cookie persistence, Kroger pagination/promo pricing/null-inventory guard, TotalWine stock signals/fulfillment filter, Safeway strict inStock/price formatting/pagination, Walmart brace-counting extraction, Sam's Club per-product `__NEXT_DATA__` extraction/availability/browser fallback, state pruning, parseCity regex, Costco URL fallback, isBlockedPage body checks, isCostcoBlocked patterns, truncateTitle, parseSize centiliter, formatStoreInfo dedup, fetchRetry logging, Walgreens USER_LOC cookie, poll concurrency limit, canary bottle (Buffalo Trace), scraper health tracking (trackHealth), summary embed health fields + canary indicators, withTimeout, CHROME_PATH/executablePath |
 | `test/proxy.test.js` | 34 | Proxy agent routing, SOCKS5/HTTP protocol auto-detection, fetch-first paths (Costco, Total Wine, Walmart, Sam's Club), wrapper fallback logic, Costco cookie pre-warm, Costco blocked retry recovery |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer (incl. Walgreens, Sam's Club), store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance, AbortSignal timeout |
