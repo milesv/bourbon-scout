@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => {
   }
   return {
     fetch: vi.fn(),
+    gotScraping: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
     rename: vi.fn(),
@@ -41,6 +42,7 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("dotenv/config", () => ({}));
 vi.mock("node-fetch", () => ({ default: mocks.fetch }));
+vi.mock("got-scraping", () => ({ gotScraping: mocks.gotScraping }));
 vi.mock("rebrowser-playwright-core", () => ({
   chromium: {},
 }));
@@ -107,6 +109,11 @@ function setupMockBrowser() {
   return { browser: mockBrowser, context: mockContext, page: mockPage };
 }
 
+// Helper: create a got-scraping-style response for mocks.gotScraping
+function mockGotResponse(statusCode, body = "", headers = {}) {
+  return { statusCode, body, headers };
+}
+
 async function runWithFakeTimers(fn) {
   const promise = fn();
   promise.catch(() => {});
@@ -119,6 +126,8 @@ async function runWithFakeTimers(fn) {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.resetAllMocks();
+  // Default gotScraping mock returns empty HTML (scraper fetch paths use this)
+  mocks.gotScraping.mockResolvedValue(mockGotResponse(200, "<html></html>"));
   _resetKrogerToken();
   _resetRetailerBrowserCache();
   _resetRetailerFailures();
@@ -144,25 +153,24 @@ describe("proxy support", () => {
     await closeBrowser();
   });
 
-  it("scrapeWalmartViaFetch passes proxy agent on fetch calls", async () => {
+  it("scrapeWalmartViaFetch passes proxyUrl on gotScraping calls", async () => {
     const walmartNextData = {
       props: { pageProps: { initialData: { searchResult: { itemStacks: [{ items: [{
         __typename: "Product", name: "Weller Special Reserve Bourbon",
         availabilityStatusV2: { value: "IN_STOCK" }, sellerName: "Walmart.com",
       }] }] } } } },
     };
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(walmartNextData)}</script>`,
-    });
+    mocks.gotScraping.mockResolvedValue(
+      mockGotResponse(200, `<script id="__NEXT_DATA__">${JSON.stringify(walmartNextData)}</script>`)
+    );
     await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
-    // Every Walmart fetch call should include the proxy agent
-    const walmartCalls = mocks.fetch.mock.calls.filter(
-      ([url]) => typeof url === "string" && url.includes("walmart.com")
+    // Every Walmart gotScraping call should include proxyUrl
+    const walmartCalls = mocks.gotScraping.mock.calls.filter(
+      ([opts]) => typeof opts?.url === "string" && opts.url.includes("walmart.com")
     );
     expect(walmartCalls.length).toBeGreaterThan(0);
-    for (const [, opts] of walmartCalls) {
-      expect(opts.agent._isProxy).toBe(true);
+    for (const [opts] of walmartCalls) {
+      expect(opts.proxyUrl).toBeTruthy();
     }
   });
 
@@ -174,10 +182,9 @@ describe("proxy support", () => {
         availabilityStatusV2: { value: "IN_STOCK" }, sellerName: "Walmart.com",
       }] }] } } } },
     };
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(walmartNextData)}</script>`,
-    });
+    mocks.gotScraping.mockResolvedValue(
+      mockGotResponse(200, `<script id="__NEXT_DATA__">${JSON.stringify(walmartNextData)}</script>`)
+    );
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeWalmartStore(TEST_STORE));
     expect(found).not.toBeNull();
@@ -281,30 +288,30 @@ describe("proxy support", () => {
       }] } },
     };
     const html = `<html><script>window.INITIAL_STATE = ${JSON.stringify(initialState)};</script></html>`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, html));
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     expect(found).not.toBeNull();
     expect(found.length).toBe(1);
     expect(found[0].name).toBe("Weller Special Reserve");
     expect(found[0].price).toBe("$29.99");
-    // Verify proxy was used
-    const twCalls = mocks.fetch.mock.calls.filter(
-      ([url]) => typeof url === "string" && url.includes("totalwine.com")
+    // Verify proxy was used via gotScraping proxyUrl option
+    const twCalls = mocks.gotScraping.mock.calls.filter(
+      ([opts]) => typeof opts?.url === "string" && opts.url.includes("totalwine.com")
     );
     expect(twCalls.length).toBeGreaterThan(0);
-    for (const [, opts] of twCalls) {
-      expect(opts.agent._isProxy).toBe(true);
+    for (const [opts] of twCalls) {
+      expect(opts.proxyUrl).toBeTruthy();
     }
   });
 
   it("scrapeTotalWineViaFetch returns null after 4+ failures", async () => {
-    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(403));
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     expect(found).toBeNull();
   });
 
   it("scrapeTotalWineViaFetch returns null when INITIAL_STATE missing", async () => {
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => "<html><body>Challenge page</body></html>" });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, "<html><body>Challenge page</body></html>"));
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     expect(found).toBeNull();
   });
@@ -327,10 +334,13 @@ describe("proxy support", () => {
         <span data-testid="Text_Price_12345">$29.99</span>
       </div>
     </body></html>`;
-    const homeRes = { ok: true, text: async () => "<html></html>", headers: { raw: () => ({ "set-cookie": ["ak_bmsc=test123; Path=/"] }) } };
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve(homeRes);
-      return Promise.resolve({ ok: true, text: async () => tileHtml });
+    // Homepage pre-warm returns set-cookie headers
+    const homeResponse = mockGotResponse(200, "<html></html>", { "set-cookie": ["ak_bmsc=test123; Path=/"] });
+    let callCount = 0;
+    mocks.gotScraping.mockImplementation((opts) => {
+      callCount++;
+      if (opts?.url === "https://www.costco.com/") return Promise.resolve(homeResponse);
+      return Promise.resolve(mockGotResponse(200, tileHtml));
     });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     expect(found).not.toBeNull();
@@ -338,45 +348,51 @@ describe("proxy support", () => {
     expect(found[0].name).toBe("Weller Special Reserve");
     expect(found[0].price).toBe("$29.99");
     expect(found[0].sku).toBe("12345");
-    // Verify proxy was used on search calls
-    const searchCalls = mocks.fetch.mock.calls.filter(
-      ([url]) => typeof url === "string" && url.includes("costco.com/s?")
+    // Verify proxy was used on search calls via proxyUrl option
+    const searchCalls = mocks.gotScraping.mock.calls.filter(
+      ([opts]) => typeof opts?.url === "string" && opts.url.includes("costco.com/s?")
     );
     expect(searchCalls.length).toBeGreaterThan(0);
-    for (const [, opts] of searchCalls) {
-      expect(opts.agent._isProxy).toBe(true);
+    for (const [opts] of searchCalls) {
+      expect(opts.proxyUrl).toBeTruthy();
     }
   });
 
   it("scrapeCostcoViaFetch sends cookies from homepage pre-warm", async () => {
-    const homeRes = { ok: true, text: async () => "<html></html>", headers: { raw: () => ({ "set-cookie": ["ak_bmsc=abc123; Path=/", "bm_sv=xyz789; Path=/"] }) } };
+    const homeResponse = mockGotResponse(200, "<html></html>", {
+      "set-cookie": ["ak_bmsc=abc123; Path=/", "bm_sv=xyz789; Path=/"],
+    });
     const emptyHtml = "<html><body>No results</body></html>";
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve(homeRes);
-      return Promise.resolve({ ok: true, text: async () => emptyHtml });
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url === "https://www.costco.com/") return Promise.resolve(homeResponse);
+      return Promise.resolve(mockGotResponse(200, emptyHtml));
     });
     await runWithFakeTimers(() => scrapeCostcoViaFetch());
-    const searchCalls = mocks.fetch.mock.calls.filter(
-      ([url]) => typeof url === "string" && url.includes("costco.com/s?")
+    const searchCalls = mocks.gotScraping.mock.calls.filter(
+      ([opts]) => typeof opts?.url === "string" && opts.url.includes("costco.com/s?")
     );
     expect(searchCalls.length).toBeGreaterThan(0);
     // Verify cookies from pre-warm are sent on search requests
-    for (const [, opts] of searchCalls) {
+    for (const [opts] of searchCalls) {
       expect(opts.headers.Cookie).toBe("ak_bmsc=abc123; bm_sv=xyz789");
     }
   });
 
   it("scrapeCostcoViaFetch returns null on bot detection (retries once then gives up)", async () => {
     const blockedHtml = "<html><title>Access Denied</title><body>robot check</body></html>";
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => blockedHtml, headers: { raw: () => ({}) } });
+    const homeResponse = mockGotResponse(200, "<html></html>", {});
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url === "https://www.costco.com/") return Promise.resolve(homeResponse);
+      return Promise.resolve(mockGotResponse(200, blockedHtml));
+    });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     expect(found).toBeNull();
   });
 
   it("scrapeCostcoViaFetch returns null after 4+ HTTP failures (with retries)", async () => {
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve({ ok: true, text: async () => "", headers: { raw: () => ({}) } });
-      return Promise.resolve({ ok: false, status: 503 });
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url === "https://www.costco.com/") return Promise.resolve(mockGotResponse(200, "", {}));
+      return Promise.resolve(mockGotResponse(503));
     });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     expect(found).toBeNull();
@@ -391,12 +407,12 @@ describe("proxy support", () => {
     </body></html>`;
     const blockedHtml = "<html><body>Access Denied</body></html>";
     let searchCallCount = 0;
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve({ ok: true, text: async () => "", headers: { raw: () => ({}) } });
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url === "https://www.costco.com/") return Promise.resolve(mockGotResponse(200, "", {}));
       searchCallCount++;
       // First attempt of each query is blocked, retry succeeds
-      if (searchCallCount % 2 === 1) return Promise.resolve({ ok: true, text: async () => blockedHtml });
-      return Promise.resolve({ ok: true, text: async () => tileHtml });
+      if (searchCallCount % 2 === 1) return Promise.resolve(mockGotResponse(200, blockedHtml));
+      return Promise.resolve(mockGotResponse(200, tileHtml));
     });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     expect(found).not.toBeNull();
@@ -426,9 +442,9 @@ describe("proxy support", () => {
 
   it("scrapeCostcoViaFetch handles pages with no product tiles (valid empty search)", async () => {
     const html = `<html><body><div class="no-results">No results found</div></body></html>`;
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url === "https://www.costco.com/") return Promise.resolve({ ok: true, text: async () => "", headers: { raw: () => ({}) } });
-      return Promise.resolve({ ok: true, text: async () => html });
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url === "https://www.costco.com/") return Promise.resolve(mockGotResponse(200, "", {}));
+      return Promise.resolve(mockGotResponse(200, html));
     });
     const found = await runWithFakeTimers(() => scrapeCostcoViaFetch());
     // All queries return valid pages with no tiles — should return empty, not null
@@ -439,7 +455,7 @@ describe("proxy support", () => {
   it("scrapeTotalWineViaFetch handles malformed INITIAL_STATE (missing braces/script)", async () => {
     // Has marker but no valid JSON structure
     const html = `<html><script>window.INITIAL_STATE = broken`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, html));
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     // Should return null — all queries fail to parse
     expect(found).toBeNull();
@@ -448,14 +464,14 @@ describe("proxy support", () => {
   it("scrapeTotalWineViaFetch handles INITIAL_STATE without search.results", async () => {
     const state = { otherData: true };
     const html = `<html><script>window.INITIAL_STATE = ${JSON.stringify(state)};</script></html>`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, html));
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     expect(found).toBeNull();
   });
 
   it("scrapeTotalWineViaFetch handles fetch exceptions (network errors)", async () => {
-    // fetchRetry will retry once then throw
-    mocks.fetch.mockRejectedValue(new Error("ECONNRESET"));
+    // scraperFetchRetry will retry once then throw
+    mocks.gotScraping.mockRejectedValue(new Error("ECONNRESET"));
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     expect(found).toBeNull();
   });
@@ -466,7 +482,7 @@ describe("proxy support", () => {
       { name: "Jack Daniel's Tennessee Whiskey", productUrl: "/p/1", stockLevel: [{ stock: 5 }] },
     ] } } };
     const html = `<html><script>window.INITIAL_STATE = ${JSON.stringify(state)};</script></html>`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, html));
     const found = await runWithFakeTimers(() => scrapeTotalWineViaFetch(TEST_STORE));
     expect(found).not.toBeNull();
     expect(found).toEqual([]);
@@ -476,7 +492,7 @@ describe("proxy support", () => {
 // ─── Sam's Club Proxy Tests ──────────────────────────────────────────────────
 
 describe("scrapeSamsClubViaFetch proxy", () => {
-  it("passes proxy agent on fetch calls", async () => {
+  it("passes proxyUrl on gotScraping calls", async () => {
     const samsclubNextData = {
       props: { pageProps: { initialData: { data: { product: {
         name: "Weller Special Reserve Bourbon 750ml",
@@ -486,22 +502,21 @@ describe("scrapeSamsClubViaFetch proxy", () => {
         usItemId: "prod20595259",
       } } } } },
     };
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      text: async () => `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(samsclubNextData)}</script></html>`,
-    });
+    mocks.gotScraping.mockResolvedValue(
+      mockGotResponse(200, `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(samsclubNextData)}</script></html>`)
+    );
     await runWithFakeTimers(() => scrapeSamsClubViaFetch());
-    const samsclubCalls = mocks.fetch.mock.calls.filter(
-      ([url]) => typeof url === "string" && url.includes("samsclub.com")
+    const samsclubCalls = mocks.gotScraping.mock.calls.filter(
+      ([opts]) => typeof opts?.url === "string" && opts.url.includes("samsclub.com")
     );
     expect(samsclubCalls.length).toBeGreaterThan(0);
-    for (const [, opts] of samsclubCalls) {
-      expect(opts.agent._isProxy).toBe(true);
+    for (const [opts] of samsclubCalls) {
+      expect(opts.proxyUrl).toBeTruthy();
     }
   });
 
   it("returns null when all products are blocked", async () => {
-    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(403));
     const found = await runWithFakeTimers(() => scrapeSamsClubViaFetch());
     expect(found).toBeNull();
   });

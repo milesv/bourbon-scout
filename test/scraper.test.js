@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => {
 
   return {
     fetch: vi.fn(),
+    gotScraping: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
     rename: vi.fn(),
@@ -28,6 +29,7 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("dotenv/config", () => ({}));
 vi.mock("node-fetch", () => ({ default: mocks.fetch }));
+vi.mock("got-scraping", () => ({ gotScraping: mocks.gotScraping }));
 vi.mock("rebrowser-playwright-core", () => ({
   chromium: {},
 }));
@@ -59,8 +61,8 @@ import {
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
-  getQueriesForScan, parsePollIntervalMs,
+  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry, scraperFetch, scraperFetchRetry,
+  getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
@@ -109,6 +111,11 @@ function setupMockBrowser() {
   return { browser: mockBrowser, context: mockContext, page: mockPage };
 }
 
+// Helper: create a got-scraping-style response for mocks.gotScraping
+function mockGotResponse(statusCode, body = "", headers = {}) {
+  return { statusCode, body, headers };
+}
+
 const TEST_STORE = {
   storeId: "1234",
   name: "Test Store",
@@ -121,6 +128,8 @@ const TEST_STORE = {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.resetAllMocks();
+  // Default gotScraping mock returns empty HTML (scraper fetch paths use this)
+  mocks.gotScraping.mockResolvedValue(mockGotResponse(200, "<html></html>"));
   _resetKrogerToken();
   _resetRetailerBrowserCache();
   _resetRetailerFailures();
@@ -1911,10 +1920,8 @@ describe("scrapeWalmartViaFetch", () => {
   };
 
   it("extracts products from __NEXT_DATA__", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      text: async () => `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(walmartNextData)}</script></html>`,
-    });
+    const html = `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(walmartNextData)}</script></html>`;
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, html));
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     expect(found).not.toBeNull();
     expect(found[0].name).toBe("Weller Special Reserve");
@@ -1922,14 +1929,12 @@ describe("scrapeWalmartViaFetch", () => {
 
   it("continues on partial failures and keeps results", async () => {
     // First query fails, second succeeds — should return results, not null
+    const html = `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(walmartNextData)}</script></html>`;
     let callCount = 0;
-    mocks.fetch.mockImplementation(() => {
+    mocks.gotScraping.mockImplementation(() => {
       callCount++;
-      if (callCount === 1) return Promise.resolve({ ok: false, status: 403 });
-      return Promise.resolve({
-        ok: true,
-        text: async () => `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(walmartNextData)}</script></html>`,
-      });
+      if (callCount === 1) return Promise.resolve(mockGotResponse(403));
+      return Promise.resolve(mockGotResponse(200, html));
     });
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     expect(found).not.toBeNull();
@@ -1937,20 +1942,20 @@ describe("scrapeWalmartViaFetch", () => {
   });
 
   it("returns null when more than 3 queries fail", async () => {
-    mocks.fetch.mockResolvedValue({ ok: false, status: 403 });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(403));
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     expect(found).toBeNull();
   });
 
   it("returns null when all queries fail with no results", async () => {
     // All queries return no __NEXT_DATA__ — failures > 0 && found.length === 0
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => "<html>Blocked</html>" });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, "<html>Blocked</html>"));
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     expect(found).toBeNull();
   });
 
   it("returns null on repeated fetch errors", async () => {
-    mocks.fetch.mockRejectedValue(new Error("Network error"));
+    mocks.gotScraping.mockRejectedValue(new Error("Network error"));
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     expect(found).toBeNull();
   });
@@ -1958,10 +1963,8 @@ describe("scrapeWalmartViaFetch", () => {
   it("returns null when __NEXT_DATA__ exists but has no searchResult (block page)", async () => {
     // Simulates Walmart returning a challenge/geo-block page with __NEXT_DATA__ but no real search results
     const fakeNextData = { props: { pageProps: { initialData: {} } } };
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      text: async () => `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(fakeNextData)}</script></html>`,
-    });
+    const html = `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(fakeNextData)}</script></html>`;
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, html));
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     // Should return null (trigger browser fallback), NOT empty array
     expect(found).toBeNull();
@@ -1973,15 +1976,12 @@ describe("scrapeWalmartViaFetch edge cases", () => {
     // All queries return HTML without __NEXT_DATA__ — failures increment but don't exceed 3
     // However, validPages remains 0
     let callCount = 0;
-    mocks.fetch.mockImplementation(() => {
+    mocks.gotScraping.mockImplementation(() => {
       callCount++;
       // Alternate between no __NEXT_DATA__ and no searchResult
-      if (callCount <= 3) return Promise.resolve({ ok: true, text: async () => "<html>No data</html>" });
+      if (callCount <= 3) return Promise.resolve(mockGotResponse(200, "<html>No data</html>"));
       const fakeData = { props: { pageProps: { initialData: {} } } };
-      return Promise.resolve({
-        ok: true,
-        text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(fakeData)}</script>`,
-      });
+      return Promise.resolve(mockGotResponse(200, `<script id="__NEXT_DATA__">${JSON.stringify(fakeData)}</script>`));
     });
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     expect(found).toBeNull();
@@ -1991,13 +1991,10 @@ describe("scrapeWalmartViaFetch edge cases", () => {
     // Some queries fail, remainder succeed but find no matching bottles
     let callCount = 0;
     const emptyNextData = { props: { pageProps: { initialData: { searchResult: { itemStacks: [{ items: [{ __typename: "Product", name: "Random Non-Bourbon Item", sellerName: "Walmart.com", availabilityStatusV2: { value: "IN_STOCK" } }] }] } } } } };
-    mocks.fetch.mockImplementation(() => {
+    mocks.gotScraping.mockImplementation(() => {
       callCount++;
-      if (callCount === 1) return Promise.resolve({ ok: false, status: 403 });
-      return Promise.resolve({
-        ok: true,
-        text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(emptyNextData)}</script>`,
-      });
+      if (callCount === 1) return Promise.resolve(mockGotResponse(403));
+      return Promise.resolve(mockGotResponse(200, `<script id="__NEXT_DATA__">${JSON.stringify(emptyNextData)}</script>`));
     });
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     // validPages > 0 (some queries succeeded) → returns empty array, not null
@@ -2073,10 +2070,9 @@ describe("scrapeWalmartStore", () => {
   });
 
   it("uses fetch path when successful", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(walmartStoreNextData)}</script>`,
-    });
+    mocks.gotScraping.mockResolvedValue(
+      mockGotResponse(200, `<script id="__NEXT_DATA__">${JSON.stringify(walmartStoreNextData)}</script>`)
+    );
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeWalmartStore(TEST_STORE));
     expect(found).not.toBeNull();
@@ -3238,15 +3234,12 @@ describe("poll error isolation", () => {
       availabilityStatusV2: { value: "IN_STOCK" }, sellerName: "Walmart.com",
       canonicalUrl: "/ip/123", priceInfo: { currentPrice: { priceString: "$29.99" } },
     }] }] } } } } };
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url.includes("walmart.com")) {
-        return Promise.resolve({
-          ok: true,
-          text: async () => `<script id="__NEXT_DATA__">${JSON.stringify(walmartNextData)}</script>`,
-        });
-      }
-      return Promise.resolve({ ok: true });
-    });
+    // gotScraping handles Walmart fetch path
+    mocks.gotScraping.mockResolvedValue(
+      mockGotResponse(200, `<script id="__NEXT_DATA__">${JSON.stringify(walmartNextData)}</script>`)
+    );
+    // node-fetch handles Discord webhooks
+    mocks.fetch.mockResolvedValue({ ok: true });
     await runWithFakeTimers(() => poll());
     // Should log the green new-find message
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("New:"));
@@ -3878,7 +3871,7 @@ describe("Walmart brace-counting __NEXT_DATA__ extraction", () => {
     // The JSON string contains </script> which would break the old regex approach
     const jsonStr = JSON.stringify(nextData);
     const html = `<html><script id="__NEXT_DATA__" type="application/json">${jsonStr}</script></html>`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, html));
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     expect(found).not.toBeNull();
     const weller = found.find((f) => f.name === "Weller Special Reserve");
@@ -3896,7 +3889,7 @@ describe("Walmart brace-counting __NEXT_DATA__ extraction", () => {
       }] }] } } } },
     };
     const html = `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(nextData)}</script></html>`;
-    mocks.fetch.mockResolvedValue({ ok: true, text: async () => html });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, html));
     const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
     expect(found).not.toBeNull();
     expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
@@ -4112,14 +4105,14 @@ describe("checkWalmartKnownUrls", () => {
         },
       },
     };
-    mocks.fetch.mockResolvedValueOnce({
-      ok: true,
-      text: async () => `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(nextData)}</script></html>`,
-    });
+    mocks.gotScraping.mockResolvedValueOnce(
+      mockGotResponse(200, `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(nextData)}</script></html>`)
+    );
 
     const result = await runWithFakeTimers(() => checkWalmartKnownUrls(store));
-    expect(mocks.fetch).toHaveBeenCalledTimes(1);
-    expect(mocks.fetch.mock.calls[0][0]).toContain("store_id=1234");
+    expect(mocks.gotScraping).toHaveBeenCalled();
+    const gotCall = mocks.gotScraping.mock.calls.find(c => c[0]?.url?.includes("walmart.com"));
+    expect(gotCall[0].url).toContain("store_id=1234");
     // Verify the bug fix: matchWalmartNextData now receives parsed JSON, not raw HTML
     expect(result.length).toBeGreaterThan(0);
     expect(result[0].name).toBe("Blanton's Original");
@@ -4132,10 +4125,9 @@ describe("checkWalmartKnownUrls", () => {
       },
     };
     loadKnownProducts(state);
-    mocks.fetch.mockResolvedValueOnce({
-      ok: true,
-      text: async () => `<html><body>No data here</body></html>`,
-    });
+    mocks.gotScraping.mockResolvedValueOnce(
+      mockGotResponse(200, `<html><body>No data here</body></html>`)
+    );
     const result = await runWithFakeTimers(() => checkWalmartKnownUrls(store));
     expect(result).toEqual([]);
   });

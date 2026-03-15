@@ -1,5 +1,6 @@
 import "dotenv/config";
 import fetch from "node-fetch";
+import { gotScraping } from "got-scraping";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { chromium as rebrowserChromium } from "rebrowser-playwright-core";
@@ -101,6 +102,10 @@ function refreshProxySession() {
 }
 function getRetailerProxy(retailerKey) {
   return retailerProxyAgents[retailerKey] || proxyAgent;
+}
+// Get the raw proxy URL string for a retailer (used by got-scraping's proxyUrl option).
+function getRetailerProxyUrl(retailerKey) {
+  return retailerProxyUrls[retailerKey] || proxySessionUrl || null;
 }
 // Build a proxy config object for Playwright browser launch for a specific retailer.
 function getRetailerBrowserProxy(retailerKey) {
@@ -680,6 +685,46 @@ async function fetchRetry(url, opts) {
   }
 }
 
+// Scraper-grade HTTP fetch with Chrome TLS fingerprint impersonation (via got-scraping).
+// Returns a node-fetch-compatible response object { ok, status, text(), json(), headers }.
+// Uses Chrome cipher suites + HTTP/2 to defeat Akamai/PerimeterX TLS fingerprinting that
+// trivially identifies node-fetch's Node.js JA3 hash regardless of HTTP header spoofing.
+// node-fetch is still used for Discord webhooks and API endpoints (no bot detection there).
+async function scraperFetch(url, { headers, timeout = 15000, proxyUrl, redirect } = {}) {
+  const gotOpts = {
+    url,
+    headers: headers || {},
+    throwHttpErrors: false,
+    followRedirect: redirect !== "manual",
+    useHeaderGenerator: false, // We supply our own FETCH_HEADERS (Chrome 145 accurate)
+    timeout: { request: timeout },
+    retry: { limit: 0 }, // We handle retries ourselves via scraperFetchRetry
+  };
+  if (proxyUrl) gotOpts.proxyUrl = proxyUrl;
+  const response = await gotScraping(gotOpts);
+  const statusCode = response.statusCode;
+  return {
+    ok: statusCode >= 200 && statusCode < 300,
+    status: statusCode,
+    statusCode,
+    headers: response.headers,
+    // Mimic node-fetch .text() and .json() async methods
+    text: async () => response.body,
+    json: async () => JSON.parse(response.body),
+  };
+}
+
+// scraperFetch with one retry on transient network errors (mirrors fetchRetry pattern).
+async function scraperFetchRetry(url, opts) {
+  try {
+    return await scraperFetch(url, opts);
+  } catch (err) {
+    console.warn(`[fetchRetry] ${err.message} — retrying in 1s`);
+    await sleep(1000);
+    return await scraperFetch(url, opts);
+  }
+}
+
 // Parse bottle size from product title text (e.g., "750ml", "1.75L", "750 ML")
 function parseSize(text) {
   if (!text) return "";
@@ -1040,7 +1085,7 @@ function isCostcoBlocked(html) {
 // Returns found[] on success, null if blocked by Akamai Bot Manager.
 async function scrapeCostcoViaFetch() {
   if (!proxyAgent) return null; // fetch will always be blocked without proxy
-  const agent = getRetailerProxy("costco");
+  const costcoProxy = getRetailerProxyUrl("costco");
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -1049,13 +1094,14 @@ async function scrapeCostcoViaFetch() {
   // Akamai gives lighter treatment to requests with valid session cookies.
   let cookies = "";
   try {
-    const homeRes = await fetchRetry("https://www.costco.com/", {
+    const homeRes = await scraperFetchRetry("https://www.costco.com/", {
       headers: FETCH_HEADERS,
-      signal: AbortSignal.timeout(10000),
-      agent,
-      redirect: "follow",
+      timeout: 10000,
+      proxyUrl: costcoProxy,
     });
-    const setCookies = homeRes.headers.raw?.()["set-cookie"] || [];
+    // got-scraping returns headers as plain object; set-cookie may be string or array
+    const rawSetCookie = homeRes.headers["set-cookie"];
+    const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
     cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
   } catch { /* continue without cookies */ }
 
@@ -1076,20 +1122,12 @@ async function scrapeCostcoViaFetch() {
       headers["Referer"] = "https://www.costco.com/";
     }
     try {
-      let res = await fetchRetry(url, {
-        headers,
-        signal: AbortSignal.timeout(15000),
-        agent,
-      });
+      let res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: costcoProxy });
       let html = res.ok ? await res.text() : "";
       // Retry once with backoff if blocked (Akamai may unblock after a pause)
       if (!res.ok || isCostcoBlocked(html)) {
         await sleep(2000 + Math.random() * 1000);
-        const retryRes = await fetch(url, {
-          headers,
-          signal: AbortSignal.timeout(15000),
-          agent,
-        }).catch(() => null);
+        const retryRes = await scraperFetch(url, { headers, timeout: 15000, proxyUrl: costcoProxy }).catch(() => null);
         if (!retryRes?.ok) { failures++; trackHealth("costco", !res.ok ? "fail" : "blocked"); return; }
         const retryHtml = await retryRes.text();
         if (isCostcoBlocked(retryHtml)) { failures++; trackHealth("costco", "blocked"); return; }
@@ -1226,7 +1264,7 @@ function matchTotalWineInitialState(state) {
 // Returns { name, url, price, sku, size, fulfillment }[] on success, null if blocked.
 async function scrapeTotalWineViaFetch(store) {
   if (!proxyAgent) return null; // fetch will always be blocked without proxy
-  const agent = getRetailerProxy("totalwine");
+  const twProxy = getRetailerProxyUrl("totalwine");
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -1243,11 +1281,7 @@ async function scrapeTotalWineViaFetch(store) {
       headers["Referer"] = "https://www.totalwine.com/";
     }
     try {
-      const res = await fetchRetry(url, {
-        headers,
-        signal: AbortSignal.timeout(15000),
-        agent,
-      });
+      const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: twProxy });
       if (!res.ok) { failures++; trackHealth("totalwine", "fail"); return; }
       const html = await res.text();
       const idx = html.indexOf("window.INITIAL_STATE");
@@ -1423,6 +1457,7 @@ async function scrapeWalmartViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
+  const wmProxy = getRetailerProxyUrl("walmart");
   // Batch queries (4 concurrent) — balances speed vs Akamai/PerimeterX detection risk
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
@@ -1436,10 +1471,7 @@ async function scrapeWalmartViaFetch(store) {
       headers["Referer"] = "https://www.walmart.com/";
     }
     try {
-      const fetchOpts = { headers, signal: AbortSignal.timeout(15000) };
-      const walmartAgent = getRetailerProxy("walmart");
-      if (walmartAgent) fetchOpts.agent = walmartAgent;
-      const res = await fetchRetry(url, fetchOpts);
+      const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: wmProxy });
       if (!res.ok) { failures++; trackHealth("walmart", "fail"); return; }
       const html = await res.text();
       // Use brace-counting to extract JSON (handles </script> inside JSON strings)
@@ -1545,15 +1577,13 @@ async function scrapeWalmartViaBrowser(store, page) {
 async function checkWalmartKnownUrls(store) {
   const known = knownProducts.walmart || [];
   if (known.length === 0) return [];
-  const walmartAgent = getRetailerProxy("walmart");
+  const wmProxy = getRetailerProxyUrl("walmart");
   const found = [];
   for (const { name, url } of known) {
     if (!url || !url.includes("walmart.com/ip/")) continue;
     try {
       const storeUrl = url.includes("?") ? `${url}&store_id=${store.storeId}` : `${url}?store_id=${store.storeId}`;
-      const fetchOpts = { headers: { ...FETCH_HEADERS }, signal: AbortSignal.timeout(15000) };
-      if (walmartAgent) fetchOpts.agent = walmartAgent;
-      const res = await fetchRetry(storeUrl, fetchOpts);
+      const res = await scraperFetchRetry(storeUrl, { headers: { ...FETCH_HEADERS }, timeout: 15000, proxyUrl: wmProxy });
       if (!res.ok) continue;
       const html = await res.text();
       // Use same brace-counting extraction as scrapeWalmartViaFetch
@@ -1757,7 +1787,7 @@ function matchSamsClubProduct(nextData, bottleName) {
 // Returns found[] on success, null if blocked (triggers browser fallback).
 async function scrapeSamsClubViaFetch() {
   if (!proxyAgent) return null;
-  const agent = getRetailerProxy("samsclub");
+  const scProxy = getRetailerProxyUrl("samsclub");
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -1773,11 +1803,7 @@ async function scrapeSamsClubViaFetch() {
       headers["Referer"] = "https://www.samsclub.com/";
     }
     try {
-      const res = await fetchRetry(url, {
-        headers,
-        signal: AbortSignal.timeout(15000),
-        agent,
-      });
+      const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: scProxy });
       if (!res.ok) { failures++; trackHealth("samsclub", "fail"); return; }
       const html = await res.text();
       // Brace-counting JSON extraction (same as Walmart path)
@@ -2263,8 +2289,8 @@ export {
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
-  createProxyAgent, refreshProxySession, getQueriesForScan, parsePollIntervalMs,
+  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry, scraperFetch, scraperFetchRetry,
+  createProxyAgent, refreshProxySession, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
