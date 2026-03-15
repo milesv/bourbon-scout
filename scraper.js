@@ -43,18 +43,52 @@ let proxyAgent = createProxyAgent(PROXY_URL);
 
 // Sticky session support for residential proxies (e.g., DataImpulse).
 // DataImpulse uses port-based sticky sessions: ports 10000-20000 each get a
-// dedicated IP that persists for ~30 min. Each poll() picks a random port so all
-// requests in that scan share one residential IP. Prevents IP rotation from
-// breaking cookie chains (e.g., Costco pre-warm cookies on IP A, searches from IP B).
+// dedicated IP that persists for ~30 min. Each retailer gets its own sticky port
+// so they each have a different residential IP — if one retailer's IP gets flagged,
+// it doesn't cascade to other retailers. Prevents IP rotation from breaking cookie
+// chains (e.g., Costco pre-warm cookies on IP A, searches from IP B).
 let proxySessionUrl = PROXY_URL;
+const retailerProxyAgents = {};
+function makeStickyProxyUrl(port) {
+  if (!PROXY_URL) return null;
+  const url = new URL(PROXY_URL);
+  url.port = String(port);
+  return url.toString();
+}
 function refreshProxySession() {
   if (!PROXY_URL) return;
-  const url = new URL(PROXY_URL);
-  // Switch to a random sticky port (10000-20000) for this scan session
-  const stickyPort = 10000 + Math.floor(Math.random() * 10001);
-  url.port = String(stickyPort);
-  proxySessionUrl = url.toString();
+  // Assign each retailer its own sticky port (= its own residential IP)
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
+  const basePort = 10000 + Math.floor(Math.random() * 9000); // leave room for 7 retailers
+  for (let i = 0; i < retailers.length; i++) {
+    const url = makeStickyProxyUrl(basePort + i);
+    retailerProxyAgents[retailers[i]] = createProxyAgent(url);
+  }
+  // Default proxyAgent uses the first port (for any non-retailer-specific fetch calls)
+  proxySessionUrl = makeStickyProxyUrl(basePort);
   proxyAgent = createProxyAgent(proxySessionUrl);
+}
+function getRetailerProxy(retailerKey) {
+  return retailerProxyAgents[retailerKey] || proxyAgent;
+}
+// Build a proxy config object for Playwright browser launch for a specific retailer.
+function getRetailerBrowserProxy(retailerKey) {
+  if (!PROXY_URL) return null;
+  const port = retailerProxyAgents[retailerKey] ? null : null; // need the URL, not the agent
+  // Reconstruct the URL from the agent's port — find the retailer's sticky port
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
+  const idx = retailers.indexOf(retailerKey);
+  if (idx === -1 || !proxySessionUrl) return null;
+  // The retailer's port is basePort + idx. We can derive basePort from proxySessionUrl (which is basePort).
+  const baseUrl = new URL(proxySessionUrl);
+  const basePort = parseInt(baseUrl.port, 10);
+  const retailerUrl = makeStickyProxyUrl(basePort + idx);
+  if (!retailerUrl) return null;
+  const parsed = new URL(retailerUrl);
+  const config = { server: `${parsed.protocol}//${parsed.host}` };
+  if (parsed.username) config.username = decodeURIComponent(parsed.username);
+  if (parsed.password) config.password = decodeURIComponent(parsed.password);
+  return config;
 }
 
 // Per-poll health metrics per retailer. Reset each poll().
@@ -681,6 +715,7 @@ async function launchBrowser() {
   };
   if (CHROME_PATH) launchOpts.executablePath = CHROME_PATH;
   if (proxySessionUrl) {
+    // Default browser proxy — individual scrapers can override via newPageForRetailer()
     const proxyUrl = new URL(proxySessionUrl);
     launchOpts.proxy = { server: `${proxyUrl.protocol}//${proxyUrl.host}` };
     if (proxyUrl.username) launchOpts.proxy.username = decodeURIComponent(proxyUrl.username);
@@ -695,6 +730,48 @@ async function closeBrowser() {
     await browser.close().catch(() => {});
     browser = null;
   }
+}
+
+// Launch a dedicated browser with a retailer-specific proxy IP.
+// Each retailer gets its own residential IP to prevent cross-retailer IP flagging.
+// Returns { browser, page } — caller must close browser when done.
+async function launchRetailerBrowser(retailerKey) {
+  const launchOpts = {
+    headless: true,
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--disable-dev-shm-usage",
+      "--no-first-run",
+      "--disable-extensions",
+      "--disable-component-update",
+    ],
+    ignoreDefaultArgs: ["--enable-automation"],
+  };
+  if (CHROME_PATH) launchOpts.executablePath = CHROME_PATH;
+  const proxyConfig = getRetailerBrowserProxy(retailerKey);
+  if (proxyConfig) launchOpts.proxy = proxyConfig;
+  const retailerBrowser = await chromium.launch(launchOpts);
+  const viewports = [
+    { width: 1366, height: 768 },
+    { width: 1440, height: 900 },
+    { width: 1280, height: 720 },
+    { width: 1536, height: 864 },
+  ];
+  const viewport = viewports[Math.floor(Math.random() * viewports.length)];
+  const storedState = await loadBrowserState();
+  const context = await retailerBrowser.newContext({
+    viewport,
+    locale: "en-US",
+    userAgent: FETCH_HEADERS["User-Agent"],
+    extraHTTPHeaders: {
+      "Sec-CH-UA": FETCH_HEADERS["Sec-CH-UA"],
+      "Sec-CH-UA-Mobile": FETCH_HEADERS["Sec-CH-UA-Mobile"],
+      "Sec-CH-UA-Platform": FETCH_HEADERS["Sec-CH-UA-Platform"],
+    },
+    ...(storedState || {}),
+  });
+  const page = await context.newPage();
+  return { browser: retailerBrowser, page };
 }
 
 async function newPage() {
@@ -782,6 +859,7 @@ function isCostcoBlocked(html) {
 // Returns found[] on success, null if blocked by Akamai Bot Manager.
 async function scrapeCostcoViaFetch() {
   if (!proxyAgent) return null; // fetch will always be blocked without proxy
+  const agent = getRetailerProxy("costco");
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -793,7 +871,7 @@ async function scrapeCostcoViaFetch() {
     const homeRes = await fetchRetry("https://www.costco.com/", {
       headers: FETCH_HEADERS,
       signal: AbortSignal.timeout(10000),
-      agent: proxyAgent,
+      agent,
       redirect: "follow",
     });
     const setCookies = homeRes.headers.raw?.()["set-cookie"] || [];
@@ -820,7 +898,7 @@ async function scrapeCostcoViaFetch() {
       let res = await fetchRetry(url, {
         headers,
         signal: AbortSignal.timeout(15000),
-        agent: proxyAgent,
+        agent,
       });
       let html = res.ok ? await res.text() : "";
       // Retry once with backoff if blocked (Akamai may unblock after a pause)
@@ -829,7 +907,7 @@ async function scrapeCostcoViaFetch() {
         const retryRes = await fetch(url, {
           headers,
           signal: AbortSignal.timeout(15000),
-          agent: proxyAgent,
+          agent,
         }).catch(() => null);
         if (!retryRes?.ok) { failures++; trackHealth("costco", !res.ok ? "fail" : "blocked"); return; }
         const retryHtml = await retryRes.text();
@@ -854,9 +932,10 @@ async function scrapeCostcoViaFetch() {
 
 // Browser-based Costco scraper (fallback). Uses stable MUI data-testid attributes.
 async function scrapeCostcoOnce(page) {
-  // Pre-warm: visit homepage to let Akamai sensor set _abck cookie
-  await page.goto("https://www.costco.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-  await sleep(2000);
+  // Pre-warm: visit homepage to let Akamai sensor set _abck cookie.
+  // Use networkidle + longer dwell so sensor scripts fully execute and phone home.
+  await page.goto("https://www.costco.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  await sleep(3000 + Math.random() * 2000);
 
   const found = [];
   for (const query of shuffle(SEARCH_QUERIES)) {
@@ -909,13 +988,10 @@ async function scrapeCostcoOnce(page) {
 
 // Wrapper: try fetch+cheerio first, fall back to browser if blocked by Akamai.
 async function scrapeCostcoStore() {
-  const fetchResult = await scrapeCostcoViaFetch();
-  if (fetchResult !== null) {
-    console.log("[costco] Used fast fetch mode (proxied)");
-    return fetchResult;
-  }
-  console.log("[costco] Fetch blocked, using browser");
-  const page = await newPage();
+  // Skip fetch-first — Costco's Akamai consistently blocks node-fetch (TLS fingerprint).
+  // Go straight to browser with a dedicated retailer IP.
+  console.log("[costco] Using browser (dedicated IP)");
+  const { browser: retailerBrowser, page } = await launchRetailerBrowser("costco");
   try {
     const scraperPromise = scrapeCostcoOnce(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -923,7 +999,7 @@ async function scrapeCostcoStore() {
     await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close().catch(() => {});
+    await retailerBrowser.close().catch(() => {});
   }
 }
 
@@ -965,6 +1041,7 @@ function matchTotalWineInitialState(state) {
 // Returns { name, url, price, sku, size, fulfillment }[] on success, null if blocked.
 async function scrapeTotalWineViaFetch(store) {
   if (!proxyAgent) return null; // fetch will always be blocked without proxy
+  const agent = getRetailerProxy("totalwine");
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -982,7 +1059,7 @@ async function scrapeTotalWineViaFetch(store) {
       const res = await fetchRetry(url, {
         headers,
         signal: AbortSignal.timeout(15000),
-        agent: proxyAgent,
+        agent,
       });
       if (!res.ok) { failures++; trackHealth("totalwine", "fail"); return; }
       const html = await res.text();
@@ -1020,6 +1097,10 @@ async function scrapeTotalWineViaFetch(store) {
 // Browser-based Total Wine scraper (fallback). Accepts a shared Playwright page.
 // Product data is in window.INITIAL_STATE.search.results.products (structured JSON).
 async function scrapeTotalWineViaBrowser(store, page) {
+  // Pre-warm: visit homepage to let PerimeterX sensor set cookies before searching.
+  await page.goto("https://www.totalwine.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  await sleep(3000 + Math.random() * 2000);
+
   const found = [];
   for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
@@ -1088,15 +1169,11 @@ async function scrapeTotalWineViaBrowser(store, page) {
   return dedupFound(found);
 }
 
-// Wrapper: try fetch-first, fall back to browser if blocked by PerimeterX.
+// Wrapper: skip fetch-first (PerimeterX blocks node-fetch TLS fingerprint consistently),
+// go straight to browser with a dedicated retailer IP.
 async function scrapeTotalWineStore(store) {
-  const fetchResult = await scrapeTotalWineViaFetch(store);
-  if (fetchResult !== null) {
-    console.log(`[totalwine:${store.storeId}] Used fast fetch mode (proxied)`);
-    return fetchResult;
-  }
-  console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser`);
-  const page = await newPage();
+  console.log(`[totalwine:${store.storeId}] Using browser (dedicated IP)`);
+  const { browser: retailerBrowser, page } = await launchRetailerBrowser("totalwine");
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -1104,7 +1181,7 @@ async function scrapeTotalWineStore(store) {
     await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close().catch(() => {});
+    await retailerBrowser.close().catch(() => {});
   }
 }
 
@@ -1166,7 +1243,8 @@ async function scrapeWalmartViaFetch(store) {
     }
     try {
       const fetchOpts = { headers, signal: AbortSignal.timeout(15000) };
-      if (proxyAgent) fetchOpts.agent = proxyAgent;
+      const walmartAgent = getRetailerProxy("walmart");
+      if (walmartAgent) fetchOpts.agent = walmartAgent;
       const res = await fetchRetry(url, fetchOpts);
       if (!res.ok) { failures++; trackHealth("walmart", "fail"); return; }
       const html = await res.text();
@@ -1205,8 +1283,8 @@ async function scrapeWalmartViaFetch(store) {
 // Browser-based Walmart scraper (fallback). Accepts a shared page.
 async function scrapeWalmartViaBrowser(store, page) {
   // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies
-  await page.goto("https://www.walmart.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-  await sleep(2000);
+  await page.goto("https://www.walmart.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  await sleep(3000 + Math.random() * 2000);
 
   const found = [];
   for (const query of shuffle(SEARCH_QUERIES)) {
@@ -1276,8 +1354,8 @@ async function scrapeWalmartStore(store) {
       return fetchResult;
     }
   }
-  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser`);
-  const page = await newPage();
+  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser (dedicated IP)`);
+  const { browser: retailerBrowser, page } = await launchRetailerBrowser("walmart");
   try {
     const scraperPromise = scrapeWalmartViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -1285,7 +1363,7 @@ async function scrapeWalmartStore(store) {
     await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close().catch(() => {});
+    await retailerBrowser.close().catch(() => {});
   }
 }
 
@@ -1315,6 +1393,10 @@ async function scrapeWalgreensViaBrowser(page) {
     domain: ".walgreens.com",
     path: "/",
   }]);
+
+  // Pre-warm: visit homepage to let Akamai sensor set _abck cookie before searching.
+  await page.goto("https://www.walgreens.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  await sleep(3000 + Math.random() * 2000);
 
   for (const query of shuffle(SEARCH_QUERIES)) {
     const url = `https://www.walgreens.com/search/results.jsp?Ntt=${encodeURIComponent(query)}`;
@@ -1369,7 +1451,8 @@ async function scrapeWalgreensViaBrowser(page) {
 
 // Wrapper: browser-only (no fetch-first — Akamai blocks direct HTTP).
 async function scrapeWalgreensStore() {
-  const page = await newPage();
+  console.log("[walgreens] Using browser (dedicated IP)");
+  const { browser: retailerBrowser, page } = await launchRetailerBrowser("walgreens");
   try {
     const scraperPromise = scrapeWalgreensViaBrowser(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -1377,7 +1460,7 @@ async function scrapeWalgreensStore() {
     await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close().catch(() => {});
+    await retailerBrowser.close().catch(() => {});
   }
 }
 
@@ -1421,6 +1504,7 @@ function matchSamsClubProduct(nextData, bottleName) {
 // Returns found[] on success, null if blocked (triggers browser fallback).
 async function scrapeSamsClubViaFetch() {
   if (!proxyAgent) return null;
+  const agent = getRetailerProxy("samsclub");
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -1439,7 +1523,7 @@ async function scrapeSamsClubViaFetch() {
       const res = await fetchRetry(url, {
         headers,
         signal: AbortSignal.timeout(15000),
-        agent: proxyAgent,
+        agent,
       });
       if (!res.ok) { failures++; trackHealth("samsclub", "fail"); return; }
       const html = await res.text();
@@ -1479,8 +1563,8 @@ async function scrapeSamsClubViaFetch() {
 // Browser-based Sam's Club scraper (fallback).
 async function scrapeSamsClubViaBrowser(page) {
   // Pre-warm: visit homepage to let PerimeterX sensor set cookies
-  await page.goto("https://www.samsclub.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-  await sleep(2000);
+  await page.goto("https://www.samsclub.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  await sleep(3000 + Math.random() * 2000);
 
   const found = [];
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
@@ -1530,8 +1614,8 @@ async function scrapeSamsClubStore() {
     console.log("[samsclub] Used fast fetch mode (proxied)");
     return fetchResult;
   }
-  console.log("[samsclub] Fetch blocked, using browser");
-  const page = await newPage();
+  console.log("[samsclub] Fetch blocked, using browser (dedicated IP)");
+  const { browser: retailerBrowser, page } = await launchRetailerBrowser("samsclub");
   try {
     const scraperPromise = scrapeSamsClubViaBrowser(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -1539,7 +1623,7 @@ async function scrapeSamsClubStore() {
     await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
-    await page.context().close().catch(() => {});
+    await retailerBrowser.close().catch(() => {});
   }
 }
 
@@ -1563,7 +1647,8 @@ async function getKrogerToken() {
         body: "grant_type=client_credentials&scope=product.compact",
         signal: AbortSignal.timeout(15000),
       };
-      if (proxyAgent) tokenOpts.agent = proxyAgent;
+      const krogerAgent = getRetailerProxy("kroger");
+      if (krogerAgent) tokenOpts.agent = krogerAgent;
       const res = await fetch("https://api.kroger.com/v1/connect/oauth2/token", tokenOpts);
       if (!res.ok) throw new Error(`OAuth HTTP ${res.status}`);
       krogerToken = (await res.json()).access_token;
@@ -1635,7 +1720,8 @@ async function scrapeKrogerStore(store) {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
         signal: AbortSignal.timeout(15000),
       };
-      if (proxyAgent) krogerOpts.agent = proxyAgent;
+      const krogerAgent2 = getRetailerProxy("kroger");
+      if (krogerAgent2) krogerOpts.agent = krogerAgent2;
       const res = await fetchRetry(baseUrl, krogerOpts);
       // Clear cached token on 401 so next call re-authenticates
       if (res.status === 401) { krogerToken = null; throw new Error("Token expired (401)"); }
@@ -1705,7 +1791,8 @@ async function scrapeSafewayStore(store) {
         },
         signal: AbortSignal.timeout(15000),
       };
-      if (proxyAgent) safewayOpts.agent = proxyAgent;
+      const safewayAgent = getRetailerProxy("safeway");
+      if (safewayAgent) safewayOpts.agent = safewayAgent;
       const res = await fetchRetry(url, safewayOpts);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();

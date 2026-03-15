@@ -10,18 +10,18 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 | Retailer | Method | Data Source |
 |----------|--------|-------------|
-| Costco | Fetch-first (cheerio), browser fallback | MUI `data-testid` attributes |
-| Total Wine | Fetch-first (`INITIAL_STATE`), browser fallback | `window.INITIAL_STATE` JSON |
+| Costco | Dedicated browser (per-retailer IP) | MUI `data-testid` attributes |
+| Total Wine | Dedicated browser (per-retailer IP) | `window.INITIAL_STATE` JSON |
 | Walmart | Fetch-first, browser fallback | `__NEXT_DATA__` JSON |
 | Kroger | REST API | Structured JSON |
 | Safeway | REST API | Structured JSON |
-| Walgreens | Browser-only | Server-rendered HTML (CSS selectors) |
+| Walgreens | Dedicated browser (per-retailer IP) | Server-rendered HTML (CSS selectors) |
 | Sam's Club | Fetch-first, browser fallback | `__NEXT_DATA__` JSON (per-product) |
 
 ## How It Works
 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
-2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 14 broad search queries that cover all 39 bottles. Prefers fetch-first with structured JSON/HTML extraction over browser scraping — Costco (cheerio), Total Wine (`INITIAL_STATE`), Walmart (`__NEXT_DATA__`), and Sam's Club (`__NEXT_DATA__` per-product) all try plain HTTP fetch before falling back to Playwright. Sam's Club uses per-product-URL scraping since its search excludes spirits. Detects bot challenge pages and retries transient failures once. Includes a canary bottle (Buffalo Trace) as a scraper health check.
+2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 14 broad search queries that cover all 39 bottles. Each retailer gets a dedicated residential IP via per-retailer sticky proxy sessions. Costco, Total Wine, and Walgreens use dedicated browser instances (Akamai/PerimeterX block plain fetch). Walmart and Sam's Club try fetch-first (`__NEXT_DATA__` extraction) with browser fallback. All browser scrapers pre-warm the homepage with `networkidle` + randomized dwell time to let anti-bot sensors execute. Sam's Club uses per-product-URL scraping since its search excludes spirits. Includes a canary bottle (Buffalo Trace) as a scraper health check.
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
 4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@everyone` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 

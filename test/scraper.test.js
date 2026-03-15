@@ -1862,33 +1862,24 @@ describe("scrapeCostcoViaFetch", () => {
 });
 
 describe("scrapeCostcoStore wrapper", () => {
-  it("falls back to browser when fetch returns null", async () => {
+  it("uses browser with dedicated IP (skips fetch-first)", async () => {
     setupMockBrowser();
-    const { page } = setupMockBrowser();
-    // scrapeCostcoViaFetch returns null (no proxy), so wrapper creates own page
-    page.$$eval.mockResolvedValue([]);
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeCostcoStore());
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Using browser (dedicated IP)"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
-    await closeBrowser();
   });
 });
 
 describe("scrapeTotalWineStore wrapper", () => {
-  it("falls back to browser when fetch returns null", async () => {
+  it("uses browser with dedicated IP (skips fetch-first)", async () => {
     setupMockBrowser();
-    const { page } = setupMockBrowser();
-    // scrapeTotalWineViaFetch returns null (no proxy), so wrapper creates own page
-    page.evaluate.mockResolvedValue([]);
-    page.$$eval.mockResolvedValue([]);
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Using browser (dedicated IP)"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
-    await closeBrowser();
   });
 });
 
