@@ -991,7 +991,7 @@ async function isBlockedPage(page) {
     return true;
   }
   // Check body text for challenges that use normal-looking titles
-  const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || "").catch(() => "");
+  const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 5000) || "").catch(() => "");
   const bodyLower = bodyText.toLowerCase();
   return bodyLower.includes("please verify") || bodyLower.includes("are you a robot") ||
     bodyLower.includes("security check") || bodyLower.includes("one more step") ||
@@ -1122,7 +1122,7 @@ async function scrapeCostcoOnce(page) {
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      const tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 8000 }).then(() => true).catch(() => false);
+      const tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 15000 }).then(() => true).catch(() => false);
       if (!tilesLoaded && await isBlockedPage(page)) {
         console.warn(`[costco] Bot detection page for query "${query}" — skipping`);
         trackHealth("costco", "blocked");
@@ -1539,7 +1539,24 @@ async function checkWalmartKnownUrls(store) {
       const res = await fetchRetry(storeUrl, fetchOpts);
       if (!res.ok) continue;
       const html = await res.text();
-      const matched = matchWalmartNextData(html);
+      // Use same brace-counting extraction as scrapeWalmartViaFetch
+      const idx = html.indexOf('id="__NEXT_DATA__"');
+      if (idx === -1) continue;
+      const braceStart = html.indexOf("{", idx);
+      if (braceStart === -1) continue;
+      let depth = 0, inStr = false, escape = false, end = -1;
+      for (let j = braceStart; j < html.length; j++) {
+        const ch = html[j];
+        if (escape) { escape = false; continue; }
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === "{") depth++;
+        else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
+      }
+      if (end === -1) continue;
+      const nextData = JSON.parse(html.slice(braceStart, end));
+      const matched = matchWalmartNextData(nextData);
       if (matched.length > 0) {
         found.push(...matched);
         console.log(`[walmart:${store.storeId}] Known URL check: ${name} still in stock`);

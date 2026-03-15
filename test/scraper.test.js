@@ -4090,26 +4090,23 @@ describe("checkWalmartKnownUrls", () => {
     loadKnownProducts(state);
 
     // Mock fetch returning valid __NEXT_DATA__ with in-stock product
+    // matchWalmartNextData reads: nextData.props.pageProps.initialData.searchResult.itemStacks
     const nextData = {
       props: {
         pageProps: {
           initialData: {
-            data: {
-              search: {
-                searchResult: {
-                  itemStacks: [{
-                    items: [{
-                      __typename: "Product",
-                      name: "Blanton's Original Single Barrel Bourbon",
-                      canonicalUrl: "/ip/blantons/123",
-                      priceInfo: { currentPrice: { priceString: "$59.99" } },
-                      fulfillmentBadge: "In stores",
-                      availabilityStatusV2: { value: "IN_STOCK" },
-                      id: "123",
-                    }],
-                  }],
-                },
-              },
+            searchResult: {
+              itemStacks: [{
+                items: [{
+                  __typename: "Product",
+                  name: "Blanton's Original Single Barrel Bourbon",
+                  canonicalUrl: "/ip/blantons/123",
+                  priceInfo: { currentPrice: { priceString: "$59.99" } },
+                  fulfillmentBadge: "In stores",
+                  availabilityStatusV2: { value: "IN_STOCK" },
+                  id: "123",
+                }],
+              }],
             },
           },
         },
@@ -4123,6 +4120,24 @@ describe("checkWalmartKnownUrls", () => {
     const result = await runWithFakeTimers(() => checkWalmartKnownUrls(store));
     expect(mocks.fetch).toHaveBeenCalledTimes(1);
     expect(mocks.fetch.mock.calls[0][0]).toContain("store_id=1234");
+    // Verify the bug fix: matchWalmartNextData now receives parsed JSON, not raw HTML
+    expect(result.length).toBeGreaterThan(0);
+    expect(result[0].name).toBe("Blanton's Original");
+  });
+
+  it("returns empty for pages without __NEXT_DATA__", async () => {
+    const state = {
+      walmart: {
+        s1: { bottles: { "Blanton's": { url: "https://www.walmart.com/ip/blantons/123" } } },
+      },
+    };
+    loadKnownProducts(state);
+    mocks.fetch.mockResolvedValueOnce({
+      ok: true,
+      text: async () => `<html><body>No data here</body></html>`,
+    });
+    const result = await runWithFakeTimers(() => checkWalmartKnownUrls(store));
+    expect(result).toEqual([]);
   });
 
   it("skips non-Walmart URLs", async () => {
