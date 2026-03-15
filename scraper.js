@@ -1207,9 +1207,19 @@ async function scrapeCostcoOnce(page) {
   return dedupFound(found);
 }
 
-// Wrapper: browser with dedicated IP (Akamai blocks node-fetch TLS fingerprint).
+// Wrapper: try got-scraping fetch-first (Chrome TLS fingerprint), fall back to browser.
+// Akamai injects sensor JS (_abck cookie) that requires a real browser, but got-scraping
+// may pass the initial request before sensors detect it — worth trying for speed.
 async function scrapeCostcoStore() {
-  console.log("[costco] Using browser (dedicated IP)");
+  // Try fetch-first with got-scraping (Chrome TLS fingerprint)
+  const fetchResult = await scrapeCostcoViaFetch();
+  if (fetchResult !== null) {
+    console.log("[costco] ✓ fast fetch succeeded");
+    return fetchResult;
+  }
+
+  // Fetch blocked or no proxy — fall back to browser
+  console.log("[costco] Fetch blocked, using browser (dedicated IP)");
   const { page } = await launchRetailerBrowser("costco");
   try {
     const scraperPromise = scrapeCostcoOnce(page);
@@ -1352,8 +1362,12 @@ async function scrapeTotalWineViaBrowser(store, page) {
       const matched = matchTotalWineInitialState(state);
       if (matched.length > 0) {
         found.push(...matched);
+        trackHealth("totalwine", "ok");
+      } else if (state?.search?.results) {
+        // INITIAL_STATE present with valid search results structure — just no matching bottles
+        trackHealth("totalwine", "ok");
       } else {
-        // Fallback: if INITIAL_STATE isn't available, try CSS selectors
+        // INITIAL_STATE missing or malformed — try CSS selectors as fallback
         const items = await page.$$eval(
           '[class*="productCard"], [data-testid="product-card"], .product-card',
           /* v8 ignore start -- browser-only DOM callback */
@@ -1366,23 +1380,29 @@ async function scrapeTotalWineViaBrowser(store, page) {
             }))
           /* v8 ignore stop */
         );
-        for (const p of items) {
-          if (!p.inStock) continue;
-          for (const bottle of TARGET_BOTTLES) {
-            if (matchesBottle(p.name, bottle)) {
-              found.push({
-                name: bottle.name,
-                url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.totalwine.com${p.url}`) : "",
-                price: p.price,
-                sku: "",
-                size: parseSize(p.name),
-                fulfillment: "",
-              });
+        if (items.length > 0) {
+          for (const p of items) {
+            if (!p.inStock) continue;
+            for (const bottle of TARGET_BOTTLES) {
+              if (matchesBottle(p.name, bottle)) {
+                found.push({
+                  name: bottle.name,
+                  url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.totalwine.com${p.url}`) : "",
+                  price: p.price,
+                  sku: "",
+                  size: parseSize(p.name),
+                  fulfillment: "",
+                });
+              }
             }
           }
+          trackHealth("totalwine", "ok");
+        } else {
+          // No INITIAL_STATE and no CSS products — likely a degraded/blocked page
+          console.warn(`[totalwine:${store.storeId}] No INITIAL_STATE or CSS products for query — marking degraded`);
+          trackHealth("totalwine", "blocked");
         }
       }
-      trackHealth("totalwine", "ok");
     } catch (err) {
       console.error(`[totalwine:${store.storeId}] Error searching "${query}": ${err.message}`);
       trackHealth("totalwine", "fail");
@@ -1392,9 +1412,19 @@ async function scrapeTotalWineViaBrowser(store, page) {
   return dedupFound(found);
 }
 
-// Wrapper: browser with dedicated IP (PerimeterX blocks node-fetch TLS fingerprint).
+// Wrapper: try got-scraping fetch-first (Chrome TLS fingerprint), fall back to browser.
+// PerimeterX injects sensor JS (_px* cookies) that requires a real browser, but got-scraping
+// may pass the initial requests before sensors detect it — worth trying for speed.
 async function scrapeTotalWineStore(store) {
-  console.log(`[totalwine:${store.storeId}] Using browser (dedicated IP)`);
+  // Try fetch-first with got-scraping (Chrome TLS fingerprint)
+  const fetchResult = await scrapeTotalWineViaFetch(store);
+  if (fetchResult !== null) {
+    console.log(`[totalwine:${store.storeId}] ✓ fast fetch succeeded`);
+    return fetchResult;
+  }
+
+  // Fetch blocked or no proxy — fall back to browser
+  console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser (dedicated IP)`);
   const { page } = await launchRetailerBrowser("totalwine");
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page);
@@ -1656,7 +1686,14 @@ async function scrapeWalgreensViaBrowser(page) {
   const found = [];
 
   // Cache zip coordinates for USER_LOC cookie (same zip every poll)
-  if (!walgreensCoords) walgreensCoords = await zipToCoords(ZIP_CODE);
+  if (!walgreensCoords) {
+    try {
+      walgreensCoords = await zipToCoords(ZIP_CODE);
+    } catch (err) {
+      console.warn(`[walgreens] Failed to resolve zip ${ZIP_CODE}: ${err.message} — skipping`);
+      return [];
+    }
+  }
 
   // Set location cookie so search results reflect nearest store inventory
   const locPayload = JSON.stringify({
@@ -1681,7 +1718,7 @@ async function scrapeWalgreensViaBrowser(page) {
     const url = `https://www.walgreens.com/search/results.jsp?Ntt=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForSelector(".card__product", { timeout: 10000 }).catch(() => {});
+      await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 10000 }).catch(() => {});
 
       if (await isBlockedPage(page)) {
         console.warn(`[walgreens] Bot detection page for query "${query}" — skipping`);
@@ -1690,15 +1727,22 @@ async function scrapeWalgreensViaBrowser(page) {
       }
 
       const products = await page.$$eval(
-        ".card__product",
+        ".card__product, [class*='card__product'], [data-testid*='product']",
         /* v8 ignore start -- browser-only DOM callback */
         (cards) =>
-          cards.map((el) => ({
-            title: (el.querySelector(".product__title, [class*='product__title']") || {}).textContent?.trim() || "",
-            price: (el.querySelector(".product__price-contain, [class*='product__price']") || {}).textContent?.trim() || "",
-            url: (el.querySelector('a[href*="ID="]') || {}).href || "",
-            outOfStock: (el.textContent || "").includes("Not sold at your store"),
-          }))
+          cards.map((el) => {
+            const text = (el.textContent || "").toLowerCase();
+            return {
+              title: (el.querySelector(".product__title, [class*='product__title'], [class*='productTitle']") || {}).textContent?.trim() || "",
+              price: (el.querySelector(".product__price-contain, [class*='product__price'], [class*='productPrice']") || {}).textContent?.trim() || "",
+              url: (el.querySelector('a[href*="ID="], a[href*="/store/product/"]') || {}).href || "",
+              // Match multiple OOS text variants to survive copy changes
+              outOfStock: text.includes("not sold at your store") ||
+                          text.includes("not available at this store") ||
+                          text.includes("out of stock") ||
+                          text.includes("unavailable"),
+            };
+          })
         /* v8 ignore stop */
       );
 
@@ -1835,7 +1879,9 @@ async function scrapeSamsClubViaFetch() {
     }
   });
   await runWithConcurrency(productTasks, 4);
-  if (validPages === 0) return null;
+  // Require at least half the products to succeed — a 1/8 success rate shouldn't suppress browser fallback
+  const minValid = Math.max(1, Math.ceil(entries.length / 4));
+  if (validPages < minValid) return null;
   return dedupFound(found);
 }
 

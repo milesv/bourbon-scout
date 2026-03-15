@@ -316,11 +316,13 @@ describe("proxy support", () => {
     expect(found).toBeNull();
   });
 
-  it("scrapeTotalWineStore wrapper uses browser with dedicated IP (skips fetch)", async () => {
+  it("scrapeTotalWineStore wrapper tries fetch-first then falls back to browser", async () => {
+    // With PROXY_URL set, fetch-first runs but default mock returns empty HTML (no INITIAL_STATE)
+    // → all queries fail to find INITIAL_STATE → returns null → falls back to browser
     setupMockBrowser();
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Using browser (dedicated IP)"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });
@@ -431,11 +433,13 @@ describe("proxy support", () => {
     expect(isCostcoBlocked("<html>Normal product page</html>")).toBe(false);
   });
 
-  it("scrapeCostcoStore wrapper uses browser with dedicated IP (skips fetch)", async () => {
+  it("scrapeCostcoStore wrapper tries fetch-first with proxy", async () => {
+    // With PROXY_URL set, Costco fetch-first runs. Default mock returns empty HTML (no tiles)
+    // → validPages increments (non-blocked) → returns [] (empty, not null) → fetch succeeded
     setupMockBrowser();
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeCostcoStore());
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Using browser (dedicated IP)"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("fast fetch"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });

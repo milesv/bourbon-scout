@@ -1887,22 +1887,24 @@ describe("scrapeCostcoViaFetch", () => {
 });
 
 describe("scrapeCostcoStore wrapper", () => {
-  it("uses browser with dedicated IP (skips fetch-first)", async () => {
+  it("falls back to browser when fetch returns null (no proxy)", async () => {
     setupMockBrowser();
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeCostcoStore());
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Using browser (dedicated IP)"));
+    // No PROXY_URL in scraper.test.js → fetch returns null → falls back to browser
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });
 });
 
 describe("scrapeTotalWineStore wrapper", () => {
-  it("uses browser with dedicated IP (skips fetch-first)", async () => {
+  it("falls back to browser when fetch returns null (no proxy)", async () => {
     setupMockBrowser();
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Using browser (dedicated IP)"));
+    // No PROXY_URL in scraper.test.js → fetch returns null → falls back to browser
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });
@@ -2559,6 +2561,16 @@ describe("scrapeWalgreensViaBrowser", () => {
     ]);
     const result = await runWithFakeTimers(() => scrapeWalgreensViaBrowser(page));
     expect(result[0].url).toBe("https://www.walgreens.com/store/c/elmer-t-lee/ID=500-product");
+  });
+
+  it("returns empty array when zipToCoords fails", async () => {
+    mocks.zipToCoords.mockRejectedValue(new Error("ECONNRESET"));
+    const page = createWalgreensPage([]);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await runWithFakeTimers(() => scrapeWalgreensViaBrowser(page));
+    expect(result).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to resolve zip"));
+    warnSpy.mockRestore();
   });
 });
 
