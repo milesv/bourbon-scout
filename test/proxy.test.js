@@ -89,7 +89,10 @@ function setupMockBrowser() {
     title: vi.fn().mockResolvedValue(""),
     evaluate: vi.fn().mockResolvedValue([]),
     $$eval: vi.fn().mockResolvedValue([]),
+    $$: vi.fn().mockResolvedValue([]),
     $eval: vi.fn().mockResolvedValue(null),
+    close: vi.fn().mockResolvedValue(undefined),
+    mouse: { wheel: vi.fn().mockResolvedValue(undefined) },
     context: vi.fn(() => ({ close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }) })),
   };
   const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }) };

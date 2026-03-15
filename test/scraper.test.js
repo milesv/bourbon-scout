@@ -55,7 +55,8 @@ import {
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
+  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
+  getQueriesForScan,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
@@ -66,7 +67,7 @@ import {
   trackHealth,
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
-  _getScraperHealth, _resetScraperHealth,
+  _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
 } from "../scraper.js";
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────
@@ -80,7 +81,10 @@ function createMockPage() {
     title: vi.fn().mockResolvedValue(""),
     evaluate: vi.fn().mockResolvedValue([]),
     $$eval: vi.fn().mockResolvedValue([]),
+    $$: vi.fn().mockResolvedValue([]),
     $eval: vi.fn().mockResolvedValue(null),
+    close: vi.fn().mockResolvedValue(undefined),
+    mouse: { wheel: vi.fn().mockResolvedValue(undefined) },
     context: vi.fn(() => ({
       close: vi.fn().mockResolvedValue(undefined),
       storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }),
@@ -110,6 +114,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.resetAllMocks();
   _resetKrogerToken();
+  _resetRetailerBrowserCache();
 });
 
 afterEach(() => {
@@ -1532,8 +1537,9 @@ describe("scrapeCostcoOnce", () => {
       { title: "Weller Special Reserve Bourbon 750ml", url: "https://costco.com/weller.product.html", price: "$29.99" },
     ]);
     const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
-    // +1 for homepage pre-warm visit
-    expect(mockPage.goto).toHaveBeenCalledTimes(SEARCH_QUERIES.length + 1);
+    // +1 for homepage pre-warm visit; query rotation means only a subset runs per scan
+    const expectedQueries = getQueriesForScan(SEARCH_QUERIES).length;
+    expect(mockPage.goto).toHaveBeenCalledTimes(expectedQueries + 1);
     expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
   });
 

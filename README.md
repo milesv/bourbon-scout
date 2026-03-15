@@ -67,9 +67,11 @@ SAFEWAY_API_KEY=
 | `KROGER_CLIENT_ID` | No | Kroger API client ID (get from [developer.kroger.com](https://developer.kroger.com)) |
 | `KROGER_CLIENT_SECRET` | No | Kroger API client secret |
 | `SAFEWAY_API_KEY` | No | Safeway product search API key |
-| `PROXY_URL` | No | Residential proxy URL (e.g. `http://user:pass@gw.dataimpulse.com:823`). Enables fetch-first paths for Costco, Total Wine, Walmart, and Sam's Club. DataImpulse ($1/GB) recommended — sticky sessions auto-configured via port rotation. |
+| `PROXY_URL` | No | Residential proxy URL (e.g. `http://user:pass@gw.dataimpulse.com:823`). Each retailer gets a dedicated IP via per-retailer sticky sessions. DataImpulse ($1/GB) recommended. |
+| `BACKUP_PROXY_URL` | No | Backup proxy URL (e.g. IPRoyal). Used by retailers listed in `BACKUP_PROXY_RETAILERS` when primary proxy IPs are burned. |
+| `BACKUP_PROXY_RETAILERS` | No | Comma-separated retailer keys to route through backup proxy (e.g. `costco,totalwine`). |
 
-Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, Costco, Total Wine, and Sam's Club use browser-only scraping; Walmart's fetch path skips on CI but works locally. With `PROXY_URL` set, each scan uses a sticky session (same residential IP for ~30 min) to maintain cookie consistency across requests.
+Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, Costco, Total Wine, and Sam's Club use browser-only scraping; Walmart's fetch path skips on CI but works locally. With `PROXY_URL` set, each retailer gets its own sticky session IP. Queries are rotated across scans (half per scan) with human-like pacing to reduce bot detection signals.
 
 ### Run
 
