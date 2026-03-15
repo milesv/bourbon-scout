@@ -17,9 +17,10 @@ const mocks = vi.hoisted(() => {
     readFile: vi.fn(),
     writeFile: vi.fn(),
     rename: vi.fn(),
+    mkdir: vi.fn().mockResolvedValue(undefined),
     chromiumLaunch: vi.fn(),
+    chromiumLaunchPersistentContext: vi.fn(),
     chromiumUse: vi.fn(),
-    cronSchedule: vi.fn(),
     discoverStores: vi.fn(),
     zipToCoords: vi.fn().mockResolvedValue({ lat: 33.4152, lng: -111.8315 }),
   };
@@ -28,16 +29,16 @@ const mocks = vi.hoisted(() => {
 vi.mock("dotenv/config", () => ({}));
 vi.mock("node-fetch", () => ({ default: mocks.fetch }));
 vi.mock("playwright-extra", () => ({
-  chromium: { use: mocks.chromiumUse, launch: mocks.chromiumLaunch },
+  chromium: { use: mocks.chromiumUse, launch: mocks.chromiumLaunch, launchPersistentContext: mocks.chromiumLaunchPersistentContext },
 }));
 vi.mock("puppeteer-extra-plugin-stealth", () => ({ default: vi.fn() }));
 vi.mock("https-proxy-agent", () => ({ HttpsProxyAgent: vi.fn() }));
 vi.mock("cheerio", async () => await vi.importActual("cheerio"));
-vi.mock("node-cron", () => ({ default: { schedule: mocks.cronSchedule } }));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
   writeFile: mocks.writeFile,
   rename: mocks.rename,
+  mkdir: mocks.mkdir,
 }));
 vi.mock("../lib/discover-stores.js", () => ({
   discoverStores: mocks.discoverStores,
@@ -56,7 +57,8 @@ import {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
-  getQueriesForScan,
+  getQueriesForScan, parsePollIntervalMs,
+  shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
@@ -68,6 +70,7 @@ import {
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
   _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
+  _resetRetailerFailures, _resetKnownProducts,
 } from "../scraper.js";
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────
@@ -79,7 +82,7 @@ function createMockPage() {
     waitForTimeout: vi.fn().mockResolvedValue(undefined),
     waitForFunction: vi.fn().mockResolvedValue(undefined),
     title: vi.fn().mockResolvedValue(""),
-    evaluate: vi.fn().mockResolvedValue([]),
+    evaluate: vi.fn().mockResolvedValue(""),
     $$eval: vi.fn().mockResolvedValue([]),
     $$: vi.fn().mockResolvedValue([]),
     $eval: vi.fn().mockResolvedValue(null),
@@ -97,7 +100,9 @@ function setupMockBrowser() {
   const mockPage = createMockPage();
   const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }), addCookies: vi.fn().mockResolvedValue(undefined) };
   const mockBrowser = { newContext: vi.fn().mockResolvedValue(mockContext), close: vi.fn().mockResolvedValue(undefined) };
+  // Mock both launch (shared browser) and launchPersistentContext (retailer browsers)
   mocks.chromiumLaunch.mockResolvedValue(mockBrowser);
+  mocks.chromiumLaunchPersistentContext.mockResolvedValue(mockContext);
   return { browser: mockBrowser, context: mockContext, page: mockPage };
 }
 
@@ -115,6 +120,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   _resetKrogerToken();
   _resetRetailerBrowserCache();
+  _resetRetailerFailures();
+  _resetKnownProducts();
 });
 
 afterEach(() => {
@@ -1537,9 +1544,9 @@ describe("scrapeCostcoOnce", () => {
       { title: "Weller Special Reserve Bourbon 750ml", url: "https://costco.com/weller.product.html", price: "$29.99" },
     ]);
     const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
-    // +1 for homepage pre-warm visit; query rotation means only a subset runs per scan
+    // +2 for homepage pre-warm + category navigation; query rotation means only a subset runs per scan
     const expectedQueries = getQueriesForScan(SEARCH_QUERIES).length;
-    expect(mockPage.goto).toHaveBeenCalledTimes(expectedQueries + 1);
+    expect(mockPage.goto).toHaveBeenCalledTimes(expectedQueries + 2);
     expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
   });
 
@@ -2896,11 +2903,16 @@ describe("main", () => {
   it("discovers stores and starts polling", async () => {
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     mocks.discoverStores.mockResolvedValueOnce({
-      retailers: { costco: [TEST_STORE], totalwine: [], walmart: [], kroger: [], safeway: [], walgreens: [] },
+      retailers: { costco: [], totalwine: [], walmart: [], kroger: [], safeway: [], walgreens: [] },
     });
-    await runWithFakeTimers(() => main());
+    // main() uses setTimeout chain — poll with no stores completes quickly,
+    // then scheduleNextPoll logs "Next poll in" and sets a setTimeout
+    const promise = main();
+    promise.catch(() => {});
+    // Advance enough for initial poll to complete + schedule log
+    await vi.advanceTimersByTimeAsync(5000);
     expect(mocks.discoverStores).toHaveBeenCalled();
-    expect(mocks.cronSchedule).toHaveBeenCalled();
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Next poll in"));
     consoleSpy.mockRestore();
   });
 
@@ -2911,6 +2923,7 @@ describe("main", () => {
     mocks.discoverStores.mockResolvedValueOnce({
       retailers: { costco: [], totalwine: [], walmart: [], kroger: [], safeway: [], walgreens: [] },
     });
+    // RUN_ONCE path calls poll() then process.exit(0) — no setTimeout chain
     await runWithFakeTimers(() => main());
     expect(exitSpy).toHaveBeenCalledWith(0);
     delete process.env.RUN_ONCE;
@@ -3117,16 +3130,15 @@ describe("poll error isolation", () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
-    const { page: mockPage, browser: mockBrowser, context: mockContext } = setupMockBrowser();
-    // Make newPage fail on the first call (simulates browser crash for store 1)
+    const { page: mockPage, context: mockContext } = setupMockBrowser();
+    // Make launchPersistentContext fail on first call (simulates browser crash for store 1)
     // then succeed for store 2
-    let contextCalls = 0;
-    mockBrowser.newContext.mockImplementation(() => {
-      contextCalls++;
-      if (contextCalls === 1) return Promise.reject(new Error("Context crash"));
+    let launchCalls = 0;
+    mocks.chromiumLaunchPersistentContext.mockImplementation(() => {
+      launchCalls++;
+      if (launchCalls === 1) return Promise.reject(new Error("Context crash"));
       return Promise.resolve(mockContext);
     });
-    mockPage.evaluate.mockResolvedValue([]);
     const store1 = { ...TEST_STORE, storeId: "tw1", name: "TW Store 1" };
     const store2 = { ...TEST_STORE, storeId: "tw2", name: "TW Store 2" };
     _setStoreCache({

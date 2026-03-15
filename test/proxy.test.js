@@ -27,9 +27,10 @@ const mocks = vi.hoisted(() => {
     readFile: vi.fn(),
     writeFile: vi.fn(),
     rename: vi.fn(),
+    mkdir: vi.fn().mockResolvedValue(undefined),
     chromiumLaunch: vi.fn(),
+    chromiumLaunchPersistentContext: vi.fn(),
     chromiumUse: vi.fn(),
-    cronSchedule: vi.fn(),
     discoverStores: vi.fn(),
     HttpsProxyAgent: MockHttpsProxyAgent,
     HttpsProxyAgentInstance,
@@ -41,17 +42,17 @@ const mocks = vi.hoisted(() => {
 vi.mock("dotenv/config", () => ({}));
 vi.mock("node-fetch", () => ({ default: mocks.fetch }));
 vi.mock("playwright-extra", () => ({
-  chromium: { use: mocks.chromiumUse, launch: mocks.chromiumLaunch },
+  chromium: { use: mocks.chromiumUse, launch: mocks.chromiumLaunch, launchPersistentContext: mocks.chromiumLaunchPersistentContext },
 }));
 vi.mock("puppeteer-extra-plugin-stealth", () => ({ default: vi.fn() }));
 vi.mock("https-proxy-agent", () => ({ HttpsProxyAgent: mocks.HttpsProxyAgent }));
 vi.mock("socks-proxy-agent", () => ({ SocksProxyAgent: mocks.SocksProxyAgent }));
 vi.mock("cheerio", async () => await vi.importActual("cheerio"));
-vi.mock("node-cron", () => ({ default: { schedule: mocks.cronSchedule } }));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
   writeFile: mocks.writeFile,
   rename: mocks.rename,
+  mkdir: mocks.mkdir,
 }));
 vi.mock("../lib/discover-stores.js", () => ({
   discoverStores: mocks.discoverStores,
@@ -69,6 +70,7 @@ import {
   scrapeSamsClubViaFetch,
   getKrogerToken, main, createProxyAgent,
   _resetKrogerToken, _resetPolling, _setStoreCache,
+  _resetRetailerBrowserCache, _resetRetailerFailures, _resetKnownProducts,
 } from "../scraper.js";
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────
@@ -87,7 +89,7 @@ function setupMockBrowser() {
     waitForTimeout: vi.fn().mockResolvedValue(undefined),
     waitForFunction: vi.fn().mockResolvedValue(undefined),
     title: vi.fn().mockResolvedValue(""),
-    evaluate: vi.fn().mockResolvedValue([]),
+    evaluate: vi.fn().mockResolvedValue(""),
     $$eval: vi.fn().mockResolvedValue([]),
     $$: vi.fn().mockResolvedValue([]),
     $eval: vi.fn().mockResolvedValue(null),
@@ -95,9 +97,10 @@ function setupMockBrowser() {
     mouse: { wheel: vi.fn().mockResolvedValue(undefined) },
     context: vi.fn(() => ({ close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }) })),
   };
-  const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }) };
+  const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }), addCookies: vi.fn().mockResolvedValue(undefined) };
   const mockBrowser = { newContext: vi.fn().mockResolvedValue(mockContext), close: vi.fn().mockResolvedValue(undefined) };
   mocks.chromiumLaunch.mockResolvedValue(mockBrowser);
+  mocks.chromiumLaunchPersistentContext.mockResolvedValue(mockContext);
   return { browser: mockBrowser, context: mockContext, page: mockPage };
 }
 
@@ -114,6 +117,9 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.resetAllMocks();
   _resetKrogerToken();
+  _resetRetailerBrowserCache();
+  _resetRetailerFailures();
+  _resetKnownProducts();
 });
 
 afterEach(() => {

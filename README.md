@@ -21,7 +21,7 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 ## How It Works
 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
-2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 14 broad search queries that cover all 39 bottles. Each retailer gets a dedicated residential IP via per-retailer sticky proxy sessions. Costco, Total Wine, and Walgreens use dedicated browser instances (Akamai/PerimeterX block plain fetch). Walmart and Sam's Club try fetch-first (`__NEXT_DATA__` extraction) with browser fallback. All browser scrapers pre-warm the homepage with `networkidle` + randomized dwell time to let anti-bot sensors execute. Sam's Club uses per-product-URL scraping since its search excludes spirits. Includes a canary bottle (Buffalo Trace) as a scraper health check.
+2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 14 broad search queries that cover all 39 bottles. Each retailer gets a dedicated residential IP via per-retailer sticky proxy sessions. Retailers are staggered 10-30s apart to avoid simultaneous launches. Costco, Total Wine, and Walgreens use persistent browser profiles (HTTP cache, service workers, IndexedDB persist on disk). Walmart and Sam's Club try fetch-first (`__NEXT_DATA__` extraction) with browser fallback. Browser scrapers follow a human-like flow: homepage → category page → search queries. Known bottle URLs from previous finds are checked directly before searching. Includes a canary bottle (Buffalo Trace) as a scraper health check. Retailers that fail 3 consecutive scans are automatically backed off for 30 minutes.
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
 4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@everyone` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 
@@ -62,7 +62,7 @@ SAFEWAY_API_KEY=
 | `ZIP_CODE` | Yes | Your zip code for store discovery |
 | `SEARCH_RADIUS_MILES` | No | Search radius in miles (default: 15) |
 | `MAX_STORES_PER_RETAILER` | No | Max stores per retailer chain (default: 5) |
-| `POLL_INTERVAL` | No | Cron expression for poll frequency (default: every 15 min) |
+| `POLL_INTERVAL` | No | Base poll interval as cron expression (default: `*/15 * * * *`). Parsed to minutes; actual intervals vary ±3 min with jitter. |
 | `REALERT_EVERY_N_SCANS` | No | Re-alert interval for bottles still in stock (default: 4, meaning every ~1hr at 15-min polls) |
 | `KROGER_CLIENT_ID` | No | Kroger API client ID (get from [developer.kroger.com](https://developer.kroger.com)) |
 | `KROGER_CLIENT_SECRET` | No | Kroger API client secret |
@@ -71,7 +71,7 @@ SAFEWAY_API_KEY=
 | `BACKUP_PROXY_URL` | No | Backup proxy URL (e.g. IPRoyal). Used by retailers listed in `BACKUP_PROXY_RETAILERS` when primary proxy IPs are burned. |
 | `BACKUP_PROXY_RETAILERS` | No | Comma-separated retailer keys to route through backup proxy (e.g. `costco,totalwine`). |
 
-Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, Costco, Total Wine, and Sam's Club use browser-only scraping; Walmart's fetch path skips on CI but works locally. With `PROXY_URL` set, each retailer gets its own sticky session IP. Queries are rotated across scans (half per scan) with human-like pacing to reduce bot detection signals.
+Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, Costco, Total Wine, and Sam's Club use browser-only scraping; Walmart's fetch path skips on CI but works locally. With `PROXY_URL` set, each retailer gets its own sticky session IP. Queries are rotated across scans (half per scan) with human-like pacing to reduce bot detection signals. Retailers that fail 3+ consecutive scans are automatically backed off for 30 minutes.
 
 ### Run
 
@@ -125,6 +125,7 @@ Each embed includes:
 | `stores.json` | Cached store discovery results | Yes — triggers re-discovery on next startup |
 | `state.json` | Per-store stock state with timestamps and scan counts | Yes — treats all bottles as new finds on next poll |
 | `browser-state.json` | Playwright browser cookies/storage (reduces bot detection) | Yes — cookies will re-accumulate on next poll |
+| `browser-profiles/` | Per-retailer persistent Chrome profiles (HTTP cache, service workers, IndexedDB) | Yes — profiles rebuild from scratch on next poll |
 | `debug/` | Screenshots and HTML from store locator pages | Yes — regenerate with `node debug-locators.js` |
 
 ## Debugging Store Locators

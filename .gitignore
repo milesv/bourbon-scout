@@ -3,6 +3,7 @@ node_modules/
 state.json
 stores.json
 debug/
+browser-profiles/
 coverage/
 preview-embeds.html
 .claude/

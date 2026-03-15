@@ -4,9 +4,10 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { chromium } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
-import cron from "node-cron";
-import { readFile, writeFile, rename } from "node:fs/promises";
+// node-cron removed — replaced with setTimeout + jitter for variable scan intervals
+import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { join, dirname } from "node:path";
 import * as cheerio from "cheerio";
 import { discoverStores } from "./lib/discover-stores.js";
 import { zipToCoords } from "./lib/geo.js";
@@ -29,6 +30,14 @@ const {
   PROXY_URL,
   BACKUP_PROXY_URL,
 } = process.env;
+
+// Parse cron-style POLL_INTERVAL into milliseconds for setTimeout-based scheduling.
+// Supports "*/N * * * *" (every N minutes) format. Falls back to 15 min.
+function parsePollIntervalMs(cronExpr) {
+  const match = cronExpr?.match(/^\*\/(\d+)\s/);
+  if (match) return parseInt(match[1], 10) * 60 * 1000;
+  return 15 * 60 * 1000;
+}
 
 // Residential proxy agent for fetch-based scrapers (Walmart fetch path, Kroger, Safeway).
 // Only created when PROXY_URL is set. Discord webhook calls intentionally skip the proxy.
@@ -118,6 +127,70 @@ function trackHealth(key, outcome) {
 }
 
 const STATE_FILE = new URL("./state.json", import.meta.url);
+
+// Per-retailer persistent browser profile directories. Full Chrome profiles
+// (HTTP cache, service workers, IndexedDB, visited history) accumulate on disk,
+// making the scraper look like a returning visitor rather than a fresh bot.
+const PROFILES_DIR = join(dirname(fileURLToPath(import.meta.url)), "browser-profiles");
+
+// ─── Adaptive Retailer Skipping ──────────────────────────────────────────────
+// Back off from retailers that fail repeatedly. After MAX_CONSECUTIVE_FAILURES,
+// skip scans for SKIP_COOLDOWN_MS to let IP reputation recover.
+const retailerFailures = {};
+const MAX_CONSECUTIVE_FAILURES = 3;
+const SKIP_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
+
+function shouldSkipRetailer(key) {
+  const f = retailerFailures[key];
+  if (!f || !f.skipUntil) return false;
+  if (Date.now() >= f.skipUntil) {
+    f.skipUntil = null;
+    f.consecutive = 0;
+    console.log(`[${key}] Cooldown expired, resuming scans`);
+    return false;
+  }
+  const remaining = Math.round((f.skipUntil - Date.now()) / 60000);
+  console.log(`[${key}] Skipping (${remaining}min cooldown remaining)`);
+  return true;
+}
+
+function recordRetailerOutcome(key, success) {
+  if (!retailerFailures[key]) retailerFailures[key] = { consecutive: 0, skipUntil: null };
+  if (success) {
+    retailerFailures[key].consecutive = 0;
+    retailerFailures[key].skipUntil = null;
+  } else {
+    retailerFailures[key].consecutive++;
+    if (retailerFailures[key].consecutive >= MAX_CONSECUTIVE_FAILURES) {
+      retailerFailures[key].skipUntil = Date.now() + SKIP_COOLDOWN_MS;
+      console.log(`[${key}] ${MAX_CONSECUTIVE_FAILURES} consecutive failures — backing off for 30min`);
+    }
+  }
+}
+
+// ─── Known Product URL Tracking ──────────────────────────────────────────────
+// Bottles previously found in state.json have product URLs. Checking these directly
+// is less suspicious than searching (it's just visiting a product page) and catches
+// bottles that search might miss due to anti-bot blocking.
+let knownProducts = {};
+
+function loadKnownProducts(state) {
+  knownProducts = {};
+  for (const [retailerKey, stores] of Object.entries(state)) {
+    const urls = new Set();
+    const products = [];
+    for (const storeData of Object.values(stores)) {
+      if (!storeData?.bottles) continue;
+      for (const [name, bottle] of Object.entries(storeData.bottles)) {
+        if (bottle.url && !urls.has(bottle.url)) {
+          urls.add(bottle.url);
+          products.push({ name, url: bottle.url, sku: bottle.sku, price: bottle.price });
+        }
+      }
+    }
+    if (products.length > 0) knownProducts[retailerKey] = products;
+  }
+}
 
 // ─── Query Rotation ─────────────────────────────────────────────────────────
 // Instead of running all 14 queries every scan, alternate halves to cut per-scan
@@ -758,30 +831,41 @@ async function closeBrowser() {
   }
 }
 
-// Per-retailer browser cache for session reuse across scans.
-// Keeps browser + context alive between polls so cookies, localStorage, and service
-// workers accumulate — the scraper looks like a returning user, not a fresh bot.
-// Browsers are only closed when closeRetailerBrowsers() is called (end of poll)
-// or when an error forces re-creation.
+// Per-retailer persistent context cache for session reuse within a poll.
+// Each retailer gets a persistent Chrome profile (browser-profiles/{key}/) that
+// keeps HTTP cache, service workers, IndexedDB, and visited history on disk.
+// Within a poll, multiple stores share the same browser via cached context.
+// Between polls, profile data persists even after context.close().
 const retailerBrowserCache = {};
 
-// Launch (or reuse) a dedicated browser with a retailer-specific proxy IP.
-// Each retailer gets its own residential IP to prevent cross-retailer IP flagging.
-// Returns { browser, page } — caller should close the PAGE when done (not the browser).
+// Launch (or reuse) a persistent browser context with a retailer-specific proxy IP.
+// Uses launchPersistentContext to maintain a full Chrome profile on disk per retailer.
+// Returns { page } — caller should close the PAGE when done (not the context).
 async function launchRetailerBrowser(retailerKey) {
-  // Reuse existing browser+context if available
+  // Reuse existing persistent context if available
   if (retailerBrowserCache[retailerKey]) {
     try {
       const cached = retailerBrowserCache[retailerKey];
       const page = await cached.context.newPage();
-      return { browser: cached.browser, page };
+      return { page };
     } catch {
-      // Browser died — clear cache and re-create below
+      // Context died — clear cache and re-create below
       delete retailerBrowserCache[retailerKey];
     }
   }
 
-  const launchOpts = {
+  const profileDir = join(PROFILES_DIR, retailerKey);
+  await mkdir(profileDir, { recursive: true });
+
+  const viewports = [
+    { width: 1366, height: 768 },
+    { width: 1440, height: 900 },
+    { width: 1280, height: 720 },
+    { width: 1536, height: 864 },
+  ];
+  const viewport = viewports[Math.floor(Math.random() * viewports.length)];
+
+  const contextOpts = {
     headless: true,
     args: [
       "--disable-blink-features=AutomationControlled",
@@ -791,20 +875,6 @@ async function launchRetailerBrowser(retailerKey) {
       "--disable-component-update",
     ],
     ignoreDefaultArgs: ["--enable-automation"],
-  };
-  if (CHROME_PATH) launchOpts.executablePath = CHROME_PATH;
-  const proxyConfig = getRetailerBrowserProxy(retailerKey);
-  if (proxyConfig) launchOpts.proxy = proxyConfig;
-  const retailerBrowser = await chromium.launch(launchOpts);
-  const viewports = [
-    { width: 1366, height: 768 },
-    { width: 1440, height: 900 },
-    { width: 1280, height: 720 },
-    { width: 1536, height: 864 },
-  ];
-  const viewport = viewports[Math.floor(Math.random() * viewports.length)];
-  const storedState = await loadBrowserState();
-  const context = await retailerBrowser.newContext({
     viewport,
     locale: "en-US",
     userAgent: FETCH_HEADERS["User-Agent"],
@@ -813,18 +883,23 @@ async function launchRetailerBrowser(retailerKey) {
       "Sec-CH-UA-Mobile": FETCH_HEADERS["Sec-CH-UA-Mobile"],
       "Sec-CH-UA-Platform": FETCH_HEADERS["Sec-CH-UA-Platform"],
     },
-    ...(storedState || {}),
-  });
-  retailerBrowserCache[retailerKey] = { browser: retailerBrowser, context };
+  };
+  if (CHROME_PATH) contextOpts.executablePath = CHROME_PATH;
+  const proxyConfig = getRetailerBrowserProxy(retailerKey);
+  if (proxyConfig) contextOpts.proxy = proxyConfig;
+
+  const context = await chromium.launchPersistentContext(profileDir, contextOpts);
+  retailerBrowserCache[retailerKey] = { context };
   const page = await context.newPage();
-  return { browser: retailerBrowser, page };
+  return { page };
 }
 
-// Close all cached retailer browsers (called at end of poll).
+// Close all cached retailer browser contexts (called at end of poll).
+// Profile data remains on disk for next poll.
 async function closeRetailerBrowsers() {
   for (const key of Object.keys(retailerBrowserCache)) {
-    const { browser: b } = retailerBrowserCache[key];
-    await b.close().catch(() => {});
+    const { context } = retailerBrowserCache[key];
+    await context.close().catch(() => {});
     delete retailerBrowserCache[key];
   }
 }
@@ -851,6 +926,27 @@ async function humanizePage(page) {
     await page.evaluate(() => window.scrollTo(0, 0));
     await sleep(300 + Math.random() * 300);
   } catch { /* non-critical — don't break the scraper */ }
+}
+
+// Navigate to a spirits/liquor category page before searching.
+// Simulates a real user flow: homepage → browse category → search.
+// Anti-bot systems track navigation patterns — direct search is suspicious.
+const CATEGORY_URLS = {
+  costco: "https://www.costco.com/liquor.html",
+  totalwine: "https://www.totalwine.com/spirits/c/spirits",
+  walmart: "https://www.walmart.com/browse/food/wine-beer-spirits/976759_1085633",
+  walgreens: "https://www.walgreens.com/store/c/wine-beer-and-spirits/ID=360442-tier2general",
+  samsclub: "https://www.samsclub.com/b/spirits/2020102",
+};
+
+async function navigateCategory(page, retailerKey) {
+  const url = CATEGORY_URLS[retailerKey];
+  if (!url) return;
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await sleep(2000 + Math.random() * 2000);
+    await humanizePage(page);
+  } catch { /* non-critical — continue to search even if category nav fails */ }
 }
 
 async function newPage() {
@@ -1016,6 +1112,7 @@ async function scrapeCostcoOnce(page) {
   await page.goto("https://www.costco.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
   await humanizePage(page);
+  await navigateCategory(page, "costco");
 
   const found = [];
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
@@ -1066,17 +1163,14 @@ async function scrapeCostcoOnce(page) {
   return dedupFound(found);
 }
 
-// Wrapper: try fetch+cheerio first, fall back to browser if blocked by Akamai.
+// Wrapper: browser with dedicated IP (Akamai blocks node-fetch TLS fingerprint).
 async function scrapeCostcoStore() {
-  // Skip fetch-first — Costco's Akamai consistently blocks node-fetch (TLS fingerprint).
-  // Go straight to browser with a dedicated retailer IP.
   console.log("[costco] Using browser (dedicated IP)");
-  const { browser: retailerBrowser, page } = await launchRetailerBrowser("costco");
+  const { page } = await launchRetailerBrowser("costco");
   try {
     const scraperPromise = scrapeCostcoOnce(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
     const result = await withTimeout(scraperPromise, 180000, []);
-    await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
     await page.close().catch(() => {});
@@ -1181,6 +1275,7 @@ async function scrapeTotalWineViaBrowser(store, page) {
   await page.goto("https://www.totalwine.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
   await humanizePage(page);
+  await navigateCategory(page, "totalwine");
 
   const found = [];
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
@@ -1250,16 +1345,14 @@ async function scrapeTotalWineViaBrowser(store, page) {
   return dedupFound(found);
 }
 
-// Wrapper: skip fetch-first (PerimeterX blocks node-fetch TLS fingerprint consistently),
-// go straight to browser with a dedicated retailer IP.
+// Wrapper: browser with dedicated IP (PerimeterX blocks node-fetch TLS fingerprint).
 async function scrapeTotalWineStore(store) {
   console.log(`[totalwine:${store.storeId}] Using browser (dedicated IP)`);
-  const { browser: retailerBrowser, page } = await launchRetailerBrowser("totalwine");
+  const { page } = await launchRetailerBrowser("totalwine");
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
     const result = await withTimeout(scraperPromise, 180000, []);
-    await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
     await page.close().catch(() => {});
@@ -1367,6 +1460,7 @@ async function scrapeWalmartViaBrowser(store, page) {
   await page.goto("https://www.walmart.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
   await humanizePage(page);
+  await navigateCategory(page, "walmart");
 
   const found = [];
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
@@ -1426,24 +1520,53 @@ async function scrapeWalmartViaBrowser(store, page) {
   return dedupFound(found);
 }
 
+// Check known Walmart product URLs from previous finds. Less suspicious than search
+// (just visiting a product page) and catches bottles that search might miss.
+async function checkWalmartKnownUrls(store) {
+  const known = knownProducts.walmart || [];
+  if (known.length === 0) return [];
+  const walmartAgent = getRetailerProxy("walmart");
+  const found = [];
+  for (const { name, url } of known) {
+    if (!url || !url.includes("walmart.com/ip/")) continue;
+    try {
+      const storeUrl = url.includes("?") ? `${url}&store_id=${store.storeId}` : `${url}?store_id=${store.storeId}`;
+      const fetchOpts = { headers: { ...FETCH_HEADERS }, signal: AbortSignal.timeout(15000) };
+      if (walmartAgent) fetchOpts.agent = walmartAgent;
+      const res = await fetchRetry(storeUrl, fetchOpts);
+      if (!res.ok) continue;
+      const html = await res.text();
+      const matched = matchWalmartNextData(html);
+      if (matched.length > 0) {
+        found.push(...matched);
+        console.log(`[walmart:${store.storeId}] Known URL check: ${name} still in stock`);
+      }
+    } catch { /* best-effort */ }
+    await sleep(500 + Math.random() * 500);
+  }
+  return found;
+}
+
 async function scrapeWalmartStore(store) {
+  // Check known product URLs first (less suspicious, supplements search results)
+  const knownFound = await checkWalmartKnownUrls(store).catch(() => []);
+
   // Skip fetch attempt on CI unless a proxy is configured (datacenter IPs are blocked)
   const isCI = process.env.CI === "true" || process.env.GITHUB_ACTIONS === "true";
   if (!isCI || proxyAgent) {
     const fetchResult = await scrapeWalmartViaFetch(store);
     if (fetchResult !== null) {
       console.log(`[walmart:${store.storeId}] Used fast fetch mode${proxyAgent ? " (proxied)" : ""}`);
-      return fetchResult;
+      return dedupFound([...knownFound, ...fetchResult]);
     }
   }
   console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser (dedicated IP)`);
-  const { browser: retailerBrowser, page } = await launchRetailerBrowser("walmart");
+  const { page } = await launchRetailerBrowser("walmart");
   try {
     const scraperPromise = scrapeWalmartViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
     const result = await withTimeout(scraperPromise, 180000, []);
-    await saveBrowserState(page.context()).catch(() => {});
-    return result;
+    return dedupFound([...knownFound, ...result]);
   } finally {
     await page.close().catch(() => {});
   }
@@ -1480,6 +1603,7 @@ async function scrapeWalgreensViaBrowser(page) {
   await page.goto("https://www.walgreens.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
   await humanizePage(page);
+  await navigateCategory(page, "walgreens");
 
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
     const url = `https://www.walgreens.com/search/results.jsp?Ntt=${encodeURIComponent(query)}`;
@@ -1535,12 +1659,11 @@ async function scrapeWalgreensViaBrowser(page) {
 // Wrapper: browser-only (no fetch-first — Akamai blocks direct HTTP).
 async function scrapeWalgreensStore() {
   console.log("[walgreens] Using browser (dedicated IP)");
-  const { browser: retailerBrowser, page } = await launchRetailerBrowser("walgreens");
+  const { page } = await launchRetailerBrowser("walgreens");
   try {
     const scraperPromise = scrapeWalgreensViaBrowser(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
     const result = await withTimeout(scraperPromise, 180000, []);
-    await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
     await page.close().catch(() => {});
@@ -1649,6 +1772,7 @@ async function scrapeSamsClubViaBrowser(page) {
   await page.goto("https://www.samsclub.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
   await humanizePage(page);
+  await navigateCategory(page, "samsclub");
 
   const found = [];
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
@@ -1699,12 +1823,11 @@ async function scrapeSamsClubStore() {
     return fetchResult;
   }
   console.log("[samsclub] Fetch blocked, using browser (dedicated IP)");
-  const { browser: retailerBrowser, page } = await launchRetailerBrowser("samsclub");
+  const { page } = await launchRetailerBrowser("samsclub");
   try {
     const scraperPromise = scrapeSamsClubViaBrowser(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
     const result = await withTimeout(scraperPromise, 180000, []);
-    await saveBrowserState(page.context()).catch(() => {});
     return result;
   } finally {
     await page.close().catch(() => {});
@@ -1950,6 +2073,7 @@ async function poll() {
   scraperHealth = {};
   const canaryResults = {};
   scanCounter++;
+  loadKnownProducts(state);
 
   // Helper to record results for a store and send alerts
   async function recordResult(retailer, store, inStock) {
@@ -1987,13 +2111,21 @@ async function poll() {
   }
 
   const tasks = [];
-  for (const retailer of RETAILERS) {
+  for (const [ri, retailer] of RETAILERS.entries()) {
     const stores = storeCache.retailers[retailer.key] || [];
     if (stores.length === 0) continue;
+
+    // Adaptive skipping: back off from retailers with repeated failures
+    if (shouldSkipRetailer(retailer.key)) continue;
+
+    // Stagger retailer start times so all 7 don't hit the internet simultaneously.
+    // First retailer starts immediately; subsequent ones wait 10-30s each.
+    const staggerMs = ri > 0 ? 10000 + Math.floor(Math.random() * 20000) : 0;
 
     if (retailer.scrapeOnce) {
       // Scrape once, broadcast results to all stores (e.g., Costco has no per-store filter)
       tasks.push(async () => {
+        if (staggerMs) await sleep(staggerMs);
         try {
           console.log(`[poll] Checking ${retailer.name} (once for ${stores.length} stores)...`);
           // Wrapper handles its own browser page if needed (fetch-first with browser fallback)
@@ -2011,8 +2143,9 @@ async function poll() {
         }
       });
     } /* v8 ignore start -- no retailers currently use needsPage */ else if (retailer.needsPage) {
-      for (const store of stores) {
+      for (const [si, store] of stores.entries()) {
         tasks.push(async () => {
+          if (si === 0 && staggerMs) await sleep(staggerMs);
           let page;
           try {
             console.log(`[poll] Checking ${retailer.name} — ${store.name}...`);
@@ -2028,8 +2161,9 @@ async function poll() {
       }
     } /* v8 ignore stop */ else {
       // API/fetch-based scrapers: no browser page needed
-      for (const store of stores) {
+      for (const [si, store] of stores.entries()) {
         tasks.push(async () => {
+          if (si === 0 && staggerMs) await sleep(staggerMs);
           try {
             console.log(`[poll] Checking ${retailer.name} — ${store.name}...`);
             const inStock = await retailer.scraper(store);
@@ -2044,6 +2178,14 @@ async function poll() {
 
   // Run all stores concurrently (limit 8 — 6 retailers, fetch-first scrapers are lightweight)
   await runWithConcurrency(tasks, 8);
+
+  // Record retailer outcomes for adaptive skipping (based on health metrics)
+  for (const retailer of RETAILERS) {
+    const h = scraperHealth[retailer.key];
+    if (!h || h.queries === 0) continue;
+    const successRate = h.succeeded / h.queries;
+    recordRetailerOutcome(retailer.key, successRate >= 0.25);
+  }
 
   await closeBrowser().catch((err) => console.error(`[poll] closeBrowser failed: ${err.message}`));
   await closeRetailerBrowsers().catch((err) => console.error(`[poll] closeRetailerBrowsers failed: ${err.message}`));
@@ -2070,7 +2212,8 @@ export {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
-  createProxyAgent, refreshProxySession, getQueriesForScan,
+  createProxyAgent, refreshProxySession, getQueriesForScan, parsePollIntervalMs,
+  shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
@@ -2093,6 +2236,8 @@ export function _getScraperHealth() { return scraperHealth; }
 export function _resetScraperHealth() { scraperHealth = {}; }
 export function _setScanCounter(n) { scanCounter = n; }
 export function _getScanCounter() { return scanCounter; }
+export function _resetRetailerFailures() { for (const k of Object.keys(retailerFailures)) delete retailerFailures[k]; }
+export function _resetKnownProducts() { knownProducts = {}; }
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
@@ -2121,15 +2266,32 @@ async function main() {
       console.log("Single-run mode (RUN_ONCE=true)\n");
       await poll();
       process.exit(0);
+      return; // Prevent fall-through when process.exit is mocked in tests
     }
 
-    console.log(`Poll schedule: ${POLL_INTERVAL}\n`);
-    /* v8 ignore next -- fire-and-forget initial poll */
-    poll().catch((err) => console.error("[startup] Initial poll failed:", err));
+    // Variable scan intervals: base interval ± 3 min jitter.
+    // Avoids perfectly periodic access patterns that anti-bot ML models detect.
+    // Uses setTimeout chain instead of fixed cron so intervals vary each cycle.
+    const BASE_INTERVAL_MS = parsePollIntervalMs(POLL_INTERVAL);
+    const JITTER_MS = 3 * 60 * 1000; // ±3 min
 
-    cron.schedule(POLL_INTERVAL, /* v8 ignore next */ () => {
-      poll().catch((err) => console.error("[cron] Poll failed:", err));
-    });
+    function scheduleNextPoll() {
+      const jitter = (Math.random() - 0.5) * 2 * JITTER_MS;
+      const nextMs = Math.max(60000, BASE_INTERVAL_MS + jitter); // min 1 min
+      console.log(`[scheduler] Next poll in ${Math.round(nextMs / 1000)}s`);
+      /* v8 ignore next -- setTimeout scheduling */
+      setTimeout(() => {
+        poll()
+          .catch((err) => console.error("[scheduler] Poll failed:", err))
+          .finally(() => scheduleNextPoll());
+      }, nextMs);
+    }
+
+    console.log(`Poll interval: ~${Math.round(BASE_INTERVAL_MS / 60000)}min (±3min jitter)\n`);
+    /* v8 ignore next -- fire-and-forget initial poll */
+    poll()
+      .catch((err) => console.error("[startup] Initial poll failed:", err))
+      .finally(() => scheduleNextPoll());
   } catch (err) {
     console.error(`[startup] Store discovery failed: ${err.message}`);
     process.exit(1);
