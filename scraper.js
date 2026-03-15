@@ -925,9 +925,12 @@ async function humanizePage(page) {
       await target.hover().catch(() => {});
       await sleep(300 + Math.random() * 400);
     }
-    // Scroll back to top
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await sleep(300 + Math.random() * 300);
+    // Scroll back to top using wheel events (not scrollTo — that's a JS teleport
+    // detectable by anti-bot sensors that monitor scroll event patterns)
+    for (let i = 0; i < scrollSteps; i++) {
+      await page.mouse.wheel(0, -(300 + Math.random() * 200));
+      await sleep(400 + Math.random() * 400);
+    }
   } catch { /* non-critical — don't break the scraper */ }
 }
 
@@ -1062,7 +1065,7 @@ async function scrapeCostcoViaFetch() {
   // Batch queries with adaptive concurrency
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
-    if (failures > 3) return;
+    if (failures > 3) { trackHealth("costco", "blocked"); return; }
     // Inter-query delay with jitter to reduce burst detection
     if (i > 0) await sleep(1000 + Math.random() * 1000);
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
@@ -1173,7 +1176,12 @@ async function scrapeCostcoStore() {
   try {
     const scraperPromise = scrapeCostcoOnce(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, []);
+    const result = await withTimeout(scraperPromise, 180000, null);
+    if (result === null) {
+      console.warn("[costco] Browser scraper timed out (180s)");
+      trackHealth("costco", "blocked");
+      return [];
+    }
     return result;
   } finally {
     await page.close().catch(() => {});
@@ -1225,7 +1233,9 @@ async function scrapeTotalWineViaFetch(store) {
   // Batch queries (4 concurrent) — balances speed vs PerimeterX detection risk
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
-    if (failures > 3) return;
+    if (failures > 3) { trackHealth("totalwine", "blocked"); return; }
+    // Inter-query delay with jitter to reduce burst detection (matches Costco/Sam's Club fetch)
+    if (i > 0) await sleep(1000 + Math.random() * 1000);
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
     const headers = { ...FETCH_HEADERS };
     if (i > 0) {
@@ -1355,7 +1365,12 @@ async function scrapeTotalWineStore(store) {
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, []);
+    const result = await withTimeout(scraperPromise, 180000, null);
+    if (result === null) {
+      console.warn(`[totalwine:${store.storeId}] Browser scraper timed out (180s)`);
+      trackHealth("totalwine", "blocked");
+      return [];
+    }
     return result;
   } finally {
     await page.close().catch(() => {});
@@ -1411,7 +1426,9 @@ async function scrapeWalmartViaFetch(store) {
   // Batch queries (4 concurrent) — balances speed vs Akamai/PerimeterX detection risk
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
-    if (failures > 3) return;
+    if (failures > 3) { trackHealth("walmart", "blocked"); return; }
+    // Inter-query delay with jitter to reduce burst detection (matches Costco/Sam's Club fetch)
+    if (i > 0) await sleep(1000 + Math.random() * 1000);
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
     const headers = { ...FETCH_HEADERS };
     if (i > 0) {
@@ -1585,7 +1602,12 @@ async function scrapeWalmartStore(store) {
   try {
     const scraperPromise = scrapeWalmartViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, []);
+    const result = await withTimeout(scraperPromise, 180000, null);
+    if (result === null) {
+      console.warn(`[walmart:${store.storeId}] Browser scraper timed out (180s)`);
+      trackHealth("walmart", "blocked");
+      return dedupFound(knownFound);
+    }
     return dedupFound([...knownFound, ...result]);
   } finally {
     await page.close().catch(() => {});
@@ -1683,7 +1705,12 @@ async function scrapeWalgreensStore() {
   try {
     const scraperPromise = scrapeWalgreensViaBrowser(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, []);
+    const result = await withTimeout(scraperPromise, 180000, null);
+    if (result === null) {
+      console.warn("[walgreens] Browser scraper timed out (180s)");
+      trackHealth("walgreens", "blocked");
+      return [];
+    }
     return result;
   } finally {
     await page.close().catch(() => {});
@@ -1737,7 +1764,7 @@ async function scrapeSamsClubViaFetch() {
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
 
   const productTasks = entries.map(([bottleName, productId], i) => async () => {
-    if (failures > Math.floor(entries.length / 2)) return;
+    if (failures > Math.floor(entries.length / 2)) { trackHealth("samsclub", "blocked"); return; }
     if (i > 0) await sleep(1000 + Math.random() * 1000);
     const url = `https://www.samsclub.com/ip/${productId}`;
     const headers = { ...FETCH_HEADERS };
@@ -1847,7 +1874,12 @@ async function scrapeSamsClubStore() {
   try {
     const scraperPromise = scrapeSamsClubViaBrowser(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, []);
+    const result = await withTimeout(scraperPromise, 180000, null);
+    if (result === null) {
+      console.warn("[samsclub] Browser scraper timed out (180s)");
+      trackHealth("samsclub", "blocked");
+      return [];
+    }
     return result;
   } finally {
     await page.close().catch(() => {});
