@@ -26,7 +26,8 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 7 reta
 - **Kroger null-inventory guard** — Requires `stockLevel != null` in addition to checking for `TEMPORARILY_OUT_OF_STOCK`. Prevents false positives when Kroger API returns products with null/missing inventory data.
 - **Concurrent scanning** — All stores run concurrently via `runWithConcurrency(tasks, 8)`. Browser and API scrapers are unified in the same task queue.
 - **Structured data extraction over CSS selectors** — Scrapers prefer embedded JSON (Walmart `__NEXT_DATA__`, Total Wine `window.INITIAL_STATE`) over fragile CSS selectors. Costco uses stable MUI `data-testid` attributes. CSS selector fallbacks exist but are last resort.
-- **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a proxy. Supports HTTP/HTTPS and SOCKS5/SOCKS4 protocols — `createProxyAgent()` auto-detects based on URL scheme. Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
+- **Residential proxy support** — Optional `PROXY_URL` env var routes all scraper traffic (browser + fetch) through a proxy. Supports HTTP/HTTPS and SOCKS5/SOCKS4 protocols — `createProxyAgent()` auto-detects based on URL scheme. Playwright browser proxy requires URL parsing into `{ server, username, password }` (can't pass the full URL). Discord webhooks skip the proxy. With proxy set, Walmart fetch-first works on CI too.
+- **Sticky proxy sessions** — `refreshProxySession()` called at the start of each `poll()`. For DataImpulse, switches to a random sticky port (10000-20000) so all requests in a scan share one residential IP for ~30 min. Prevents IP rotation from breaking cookie chains (e.g., Costco homepage pre-warm cookies tied to one IP, search requests from another).
 - **Query order randomization** — `shuffle(SEARCH_QUERIES)` via Fisher-Yates before every scraper loop to avoid predictable access patterns that anti-bot ML models flag.
 - **Fetch-first with browser fallback** — Walmart, Total Wine, Costco, and Sam's Club all try plain HTTP fetch first (via residential proxy) before spinning up a browser page. Walmart parses `__NEXT_DATA__`, Total Wine parses `window.INITIAL_STATE`, Costco parses `data-testid` tiles via `cheerio`, Sam's Club parses `__NEXT_DATA__` per-product. Falls back to Playwright if blocked.
 - **Per-product-URL scraping** — Sam's Club search excludes spirits, so `SAMSCLUB_PRODUCTS` maps bottle names to product IDs. Each product page is fetched individually at `/ip/{productId}` instead of using SEARCH_QUERIES. Only bottles with known Sam's Club pages are checked.
@@ -64,7 +65,7 @@ All config is in `.env`:
 - `KROGER_CLIENT_ID`, `KROGER_CLIENT_SECRET` — Kroger API OAuth credentials
 - `SAFEWAY_API_KEY` — Safeway product search API key
 - `DISCORD_WEBHOOK_URL` — Discord webhook for alerts
-- `PROXY_URL` — Proxy URL. Supports HTTP (`http://user:pass@gate.example.com:12321`) and SOCKS5 (`socks5://user:pass@host:1080`). Routes browser and fetch scraper traffic through proxy. Discord webhooks are NOT proxied.
+- `PROXY_URL` — Residential proxy URL. Supports HTTP (`http://user:pass@gw.dataimpulse.com:823`) and SOCKS5 (`socks5://user:pass@host:1080`). Routes browser and fetch scraper traffic through proxy. Discord webhooks are NOT proxied. DataImpulse sticky sessions use ports 10000-20000 (auto-configured by `refreshProxySession()`).
 - `RUN_ONCE` — Set to `true` for single-run mode (used by GitHub Actions)
 
 ## Retailers
@@ -132,5 +133,7 @@ When a retailer's store locator stops finding stores (selectors broke):
 - `lib/fallback-stores.js` provides static store data when browser-based locators fail on CI.
 - Walgreens has no embedded JSON (`__NEXT_DATA__`, `INITIAL_STATE`) — server-rendered HTML only. Akamai blocks direct fetch (403), so it's browser-only with no fetch-first path. Store context set via `USER_LOC` cookie (base64 JSON: `{"la":"<lat>","lo":"<lng>","uz":"<zip>"}`).
 - Sam's Club search (`samsclub.com/search?q=`) does NOT return spirits — product pages exist at `/ip/{slug}/{id}` but are excluded from search results. The scraper uses `SAMSCLUB_PRODUCTS` (a static map of bottle→productId) instead of `SEARCH_QUERIES`. Not all 39 bottles have Sam's Club pages — only 8 are currently mapped.
-- NordVPN SOCKS5 proxy (`phoenix.us.socks.nordhold.net:1080`) doesn't work for scraping — it caps concurrent connections, causing `ConnectionRefused`/`ERR_SOCKS_CONNECTION_FAILED` under load. System VPN (NordVPN app) works much better since it tunnels all traffic at OS level with no per-connection limits.
-- `PROXY_URL` supports both HTTP and SOCKS5 via `createProxyAgent()` auto-detection, but SOCKS5 proxies with connection limits (like NordVPN) will fail under concurrent load. Prefer system VPN or a residential HTTP proxy designed for high concurrency.
+- NordVPN SOCKS5 proxy (`phoenix.us.socks.nordhold.net:1080`) doesn't work for scraping — it caps concurrent connections, causing `ConnectionRefused`/`ERR_SOCKS_CONNECTION_FAILED` under load.
+- `PROXY_URL` supports both HTTP and SOCKS5 via `createProxyAgent()` auto-detection, but SOCKS5 proxies with connection limits (like NordVPN) will fail under concurrent load. Use a residential HTTP proxy (DataImpulse at $1/GB recommended).
+- DataImpulse sticky sessions are **port-based** (10000-20000), NOT username-suffix-based. Appending `-sessid-{id}` to the username breaks authentication. `refreshProxySession()` handles this automatically.
+- Playwright requires proxy credentials as separate `{ server, username, password }` fields — passing the full URL (like `HttpsProxyAgent` accepts) causes `ERR_INVALID_AUTH_CREDENTIALS`.
