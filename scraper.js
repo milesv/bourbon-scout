@@ -39,7 +39,23 @@ function createProxyAgent(url) {
   }
   return new HttpsProxyAgent(url);
 }
-const proxyAgent = createProxyAgent(PROXY_URL);
+let proxyAgent = createProxyAgent(PROXY_URL);
+
+// Sticky session support for residential proxies (e.g., DataImpulse).
+// DataImpulse uses port-based sticky sessions: ports 10000-20000 each get a
+// dedicated IP that persists for ~30 min. Each poll() picks a random port so all
+// requests in that scan share one residential IP. Prevents IP rotation from
+// breaking cookie chains (e.g., Costco pre-warm cookies on IP A, searches from IP B).
+let proxySessionUrl = PROXY_URL;
+function refreshProxySession() {
+  if (!PROXY_URL) return;
+  const url = new URL(PROXY_URL);
+  // Switch to a random sticky port (10000-20000) for this scan session
+  const stickyPort = 10000 + Math.floor(Math.random() * 10001);
+  url.port = String(stickyPort);
+  proxySessionUrl = url.toString();
+  proxyAgent = createProxyAgent(proxySessionUrl);
+}
 
 // Per-poll health metrics per retailer. Reset each poll().
 // Structure: { retailerKey: { queries: 0, succeeded: 0, failed: 0, blocked: 0 } }
@@ -664,7 +680,12 @@ async function launchBrowser() {
     ignoreDefaultArgs: ["--enable-automation"],
   };
   if (CHROME_PATH) launchOpts.executablePath = CHROME_PATH;
-  if (PROXY_URL) launchOpts.proxy = { server: PROXY_URL };
+  if (proxySessionUrl) {
+    const proxyUrl = new URL(proxySessionUrl);
+    launchOpts.proxy = { server: `${proxyUrl.protocol}//${proxyUrl.host}` };
+    if (proxyUrl.username) launchOpts.proxy.username = decodeURIComponent(proxyUrl.username);
+    if (proxyUrl.password) launchOpts.proxy.password = decodeURIComponent(proxyUrl.password);
+  }
   browser = await chromium.launch(launchOpts);
   return browser;
 }
@@ -1752,6 +1773,7 @@ async function poll() {
   const scannedStores = [];
 
   // Reset per-poll state
+  refreshProxySession();
   krogerToken = null;
   browserStateCache = null;
   scraperHealth = {};
@@ -1875,7 +1897,7 @@ export {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry,
-  createProxyAgent,
+  createProxyAgent, refreshProxySession,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
