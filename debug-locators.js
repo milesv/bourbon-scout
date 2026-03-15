@@ -1,9 +1,11 @@
-import { chromium } from "playwright-extra";
+import { chromium as rebrowserChromium } from "rebrowser-playwright-core";
+import { addExtra } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+const chromium = addExtra(rebrowserChromium);
 chromium.use(StealthPlugin());
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

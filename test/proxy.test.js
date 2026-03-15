@@ -41,8 +41,11 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("dotenv/config", () => ({}));
 vi.mock("node-fetch", () => ({ default: mocks.fetch }));
+vi.mock("rebrowser-playwright-core", () => ({
+  chromium: {},
+}));
 vi.mock("playwright-extra", () => ({
-  chromium: { use: mocks.chromiumUse, launch: mocks.chromiumLaunch, launchPersistentContext: mocks.chromiumLaunchPersistentContext },
+  addExtra: () => ({ use: mocks.chromiumUse, launch: mocks.chromiumLaunch, launchPersistentContext: mocks.chromiumLaunchPersistentContext }),
 }));
 vi.mock("puppeteer-extra-plugin-stealth", () => ({ default: vi.fn() }));
 vi.mock("https-proxy-agent", () => ({ HttpsProxyAgent: mocks.HttpsProxyAgent }));

@@ -2,7 +2,8 @@ import "dotenv/config";
 import fetch from "node-fetch";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
-import { chromium } from "playwright-extra";
+import { chromium as rebrowserChromium } from "rebrowser-playwright-core";
+import { addExtra } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 // node-cron removed — replaced with setTimeout + jitter for variable scan intervals
 import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
@@ -12,7 +13,9 @@ import * as cheerio from "cheerio";
 import { discoverStores } from "./lib/discover-stores.js";
 import { zipToCoords } from "./lib/geo.js";
 
-// Stealth plugin makes Playwright bypass bot detection fingerprinting
+// rebrowser-patches: patched CDP commands to evade Akamai/PerimeterX automation detection
+// Stealth plugin: higher-level browser fingerprint spoofing (navigator.webdriver, etc.)
+const chromium = addExtra(rebrowserChromium);
 chromium.use(StealthPlugin());
 
 // ─── Configuration ───────────────────────────────────────────────────────────
