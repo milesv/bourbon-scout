@@ -111,7 +111,7 @@ Four types of color-coded embeds with per-retailer SKU/item numbers and rich sto
 **🟣 Scan Summary** (purple, quiet)
 - Posted after every scan with counts: new finds, still in stock, went OOS, nothing found
 - Shows total stores, retailers, and scan duration
-- Per-retailer health metrics: ✅ (≥75% success), ⚠️ (25-74%), ❌ (<25%) with 🐤 canary indicator
+- All 7 retailers always shown: ✅ (≥75% success), ⚠️ (25-74%), ❌ (<25%), ⏭️ (skipped/no data), with 🐤 canary indicator
 - When no allocations are found, lists all scanned stores grouped by retailer
 
 Each embed includes:
@@ -141,7 +141,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-531 tests across 5 files using [Vitest](https://vitest.dev/):
+532 tests across 5 files using [Vitest](https://vitest.dev/):
 
 ```sh
 npm test                # Run all tests
@@ -150,7 +150,7 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 415 | Bottle matching, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management |
+| `test/scraper.test.js` | 416 | Bottle matching, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management |
 | `test/proxy.test.js` | 32 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |
