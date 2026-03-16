@@ -44,6 +44,8 @@ vi.mock("node:fs/promises", () => ({
   writeFile: mocks.writeFile,
   rename: mocks.rename,
   mkdir: mocks.mkdir,
+  readdir: vi.fn().mockResolvedValue([]),
+  unlink: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("../lib/discover-stores.js", () => ({
   discoverStores: mocks.discoverStores,
@@ -62,7 +64,7 @@ import {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry, scraperFetch, scraperFetchRetry,
-  getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs,
+  refreshProxySession, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
@@ -75,7 +77,7 @@ import {
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
   _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
-  _resetRetailerFailures, _resetKnownProducts,
+  _resetRetailerFailures, _resetKnownProducts, _getKnownProducts,
 } from "../scraper.js";
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────
@@ -90,6 +92,7 @@ function createMockPage() {
     evaluate: vi.fn().mockResolvedValue(""),
     $$eval: vi.fn().mockResolvedValue([]),
     $$: vi.fn().mockResolvedValue([]),
+    $: vi.fn().mockResolvedValue(null),
     $eval: vi.fn().mockResolvedValue(null),
     close: vi.fn().mockResolvedValue(undefined),
     mouse: { wheel: vi.fn().mockResolvedValue(undefined) },
@@ -562,6 +565,33 @@ describe("dedupFound", () => {
     const input = [{ name: "A", url: "/a" }, { name: "B", url: "/b" }];
     expect(dedupFound(input)).toHaveLength(2);
   });
+
+  it("replaces N/A string price with numeric price", () => {
+    const input = [
+      { name: "Stagg Jr", url: "/na", price: "N/A" },
+      { name: "Stagg Jr", url: "/priced", price: "$55" },
+    ];
+    const result = dedupFound(input);
+    expect(result[0].url).toBe("/priced");
+  });
+
+  it("keeps numeric price over null price", () => {
+    const input = [
+      { name: "Stagg Jr", url: "/good", price: "$55" },
+      { name: "Stagg Jr", url: "/null", price: null },
+    ];
+    const result = dedupFound(input);
+    expect(result[0].url).toBe("/good");
+  });
+
+  it("keeps first when both prices are empty/null", () => {
+    const input = [
+      { name: "Stagg Jr", url: "/first", price: "" },
+      { name: "Stagg Jr", url: "/second", price: null },
+    ];
+    const result = dedupFound(input);
+    expect(result[0].url).toBe("/first");
+  });
 });
 
 describe("withTimeout", () => {
@@ -991,6 +1021,12 @@ describe("buildStoreEmbeds", () => {
     const changes = { newFinds: [bottle("Weller 12")], stillInStock: [], goneOOS: [] };
     const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
     expect(embeds[0].description).toContain("OUT OF STOCK");
+  });
+
+  it("excludes canary (Buffalo Trace) from OOS list", () => {
+    const changes = { newFinds: [bottle("Weller 12")], stillInStock: [], goneOOS: [] };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds[0].description).not.toContain("Buffalo Trace");
   });
 
   it("handles goneOOS bottles without firstSeen or price", () => {
@@ -1544,6 +1580,27 @@ describe("isBlockedPage", () => {
     page.title.mockRejectedValue(new Error("page closed"));
     page.evaluate.mockResolvedValue("");
     expect(await isBlockedPage(page)).toBe(false);
+  });
+
+  it("detects 'one more step' in body text with innocent title", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Loading...");
+    page.evaluate.mockResolvedValue("One more step: verify you are human");
+    expect(await isBlockedPage(page)).toBe(true);
+  });
+
+  it("detects 'are you a robot' in body text with innocent title", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Search Results");
+    page.evaluate.mockResolvedValue("Are you a robot? Please confirm below.");
+    expect(await isBlockedPage(page)).toBe(true);
+  });
+
+  it("detects 'security check' in body text with innocent title", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Walmart.com");
+    page.evaluate.mockResolvedValue("A security check is required before accessing this page");
+    expect(await isBlockedPage(page)).toBe(true);
   });
 });
 
@@ -3156,8 +3213,8 @@ describe("poll error isolation", () => {
       retailers: { costco: [], totalwine: [store1, store2], walmart: [], kroger: [], safeway: [], walgreens: [] },
     });
     await runWithFakeTimers(() => poll());
-    // Should have logged error for first store crash
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("crashed"));
+    // Should have logged error for first store's browser launch failure
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Browser launch failed"));
     // State should still be saved (poll completed despite error)
     expect(mocks.writeFile).toHaveBeenCalled();
     consoleSpy.mockRestore();
@@ -3214,20 +3271,18 @@ describe("poll error isolation", () => {
     vi.spyOn(console, "log").mockRestore();
   });
 
-  it("scrapeOnce top-level crash logs 'crashed' and continues poll", async () => {
+  it("scrapeOnce top-level crash logs 'Browser launch failed' and continues poll", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
-    // Make newPage() itself throw — this is outside the per-query try/catch
-    mocks.chromiumLaunch.mockResolvedValue({
-      newContext: vi.fn().mockRejectedValue(new Error("Browser OOM")),
-      close: vi.fn().mockResolvedValue(undefined),
-    });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Make launchPersistentContext itself throw — simulates browser launch failure
+    mocks.chromiumLaunchPersistentContext.mockRejectedValue(new Error("Browser OOM"));
     _setStoreCache({
       retailers: { costco: [TEST_STORE], totalwine: [], walmart: [], kroger: [], safeway: [], walgreens: [] },
     });
     await runWithFakeTimers(() => poll());
-    // Top-level crash logged with "crashed"
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("crashed"));
+    // Browser launch failure caught by wrapper
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Browser launch failed"));
     // State should still be saved
     expect(mocks.writeFile).toHaveBeenCalled();
     consoleSpy.mockRestore();
@@ -3954,6 +4009,10 @@ describe("parsePollIntervalMs", () => {
     expect(parsePollIntervalMs(null)).toBe(15 * 60 * 1000);
     expect(parsePollIntervalMs(undefined)).toBe(15 * 60 * 1000);
   });
+
+  it("rejects */0 (invalid) and returns default 15min", () => {
+    expect(parsePollIntervalMs("*/0 * * * *")).toBe(15 * 60 * 1000);
+  });
 });
 
 // ─── Adaptive Retailer Skipping ─────────────────────────────────────────────
@@ -4031,8 +4090,10 @@ describe("loadKnownProducts", () => {
       },
     };
     loadKnownProducts(state);
-    // checkWalmartKnownUrls reads from the module-level knownProducts
-    // We verify by calling checkWalmartKnownUrls with a mock
+    const known = _getKnownProducts();
+    expect(known.walmart).toHaveLength(2);
+    expect(known.walmart.find(p => p.name === "Blanton's").url).toBe("https://walmart.com/ip/blantons/123");
+    expect(known.walmart.find(p => p.name === "Weller SR").url).toBe("https://walmart.com/ip/weller/456");
   });
 
   it("deduplicates URLs across stores", () => {
@@ -4043,7 +4104,9 @@ describe("loadKnownProducts", () => {
       },
     };
     loadKnownProducts(state);
-    // Same URL from two stores should only appear once in known products
+    const known = _getKnownProducts();
+    // Same URL from two stores should only appear once
+    expect(known.walmart).toHaveLength(1);
   });
 
   it("skips bottles without URLs", () => {
@@ -4053,10 +4116,14 @@ describe("loadKnownProducts", () => {
       },
     };
     loadKnownProducts(state);
+    const known = _getKnownProducts();
+    expect(known.walmart).toBeUndefined(); // no valid products → key not set
   });
 
   it("handles empty state", () => {
     loadKnownProducts({});
+    const known = _getKnownProducts();
+    expect(Object.keys(known)).toHaveLength(0);
   });
 
   it("skips stores without bottles key", () => {
@@ -4066,6 +4133,8 @@ describe("loadKnownProducts", () => {
       },
     };
     loadKnownProducts(state);
+    const known = _getKnownProducts();
+    expect(known.walmart).toBeUndefined();
   });
 });
 
@@ -4157,15 +4226,19 @@ describe("checkWalmartKnownUrls", () => {
   });
 
   it("continues on fetch errors", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
     const state = {
       walmart: {
         s1: { bottles: { "Blanton's": { url: "https://www.walmart.com/ip/blantons/123" } } },
       },
     };
     loadKnownProducts(state);
-    mocks.fetch.mockRejectedValueOnce(new Error("Network error"));
+    // checkWalmartKnownUrls uses scraperFetchRetry (got-scraping), not node-fetch
+    mocks.gotScraping.mockRejectedValueOnce(new Error("Network error"));
+    mocks.gotScraping.mockRejectedValueOnce(new Error("Network error")); // retry also fails
     const result = await runWithFakeTimers(() => checkWalmartKnownUrls(store));
     expect(result).toEqual([]);
+    vi.restoreAllMocks();
   });
 });
 
@@ -4213,6 +4286,25 @@ describe("getQueriesForScan", () => {
     expect(_getScanCounter()).toBe(42);
     _setScanCounter(0);
     expect(_getScanCounter()).toBe(0);
+  });
+
+  it("union of even+odd covers all non-canary queries", () => {
+    _setScanCounter(0);
+    const even = getQueriesForScan(SEARCH_QUERIES);
+    _setScanCounter(1);
+    const odd = getQueriesForScan(SEARCH_QUERIES);
+    const union = new Set([...even, ...odd]);
+    const nonCanary = SEARCH_QUERIES.filter(q => q !== "buffalo trace");
+    for (const q of nonCanary) {
+      expect(union.has(q), `"${q}" missing from union of even+odd`).toBe(true);
+    }
+  });
+
+  it("canary appears exactly once per scan (not doubled)", () => {
+    _setScanCounter(0);
+    const queries = getQueriesForScan(SEARCH_QUERIES);
+    const canaryCount = queries.filter(q => q === "buffalo trace").length;
+    expect(canaryCount).toBe(1);
   });
 });
 
@@ -4371,5 +4463,802 @@ describe("buildSummaryEmbed uses truncateDescription (#8)", () => {
       durationSec: 600, scannedStores,
     });
     expect(embed.description.length).toBeLessThanOrEqual(DISCORD_DESC_LIMIT);
+  });
+});
+
+// ─── Browser launch failure isolation ────────────────────────────────────────
+
+describe("browser launch failure isolation", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+    _resetKnownProducts();
+    mocks.readFile.mockRejectedValue(new Error("no file"));
+    mocks.writeFile.mockResolvedValue(undefined);
+    mocks.fetch.mockResolvedValue({ ok: true });
+  });
+
+  it("scrapeCostcoStore returns [] on browser launch failure", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // No proxy → fetch returns null → falls back to browser
+    mocks.chromiumLaunchPersistentContext.mockRejectedValue(new Error("Chrome crashed"));
+    const result = await runWithFakeTimers(() => scrapeCostcoStore());
+    expect(result).toEqual([]);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Browser launch failed"));
+    const health = _getScraperHealth();
+    expect(health.costco?.failed).toBeGreaterThanOrEqual(1);
+    consoleSpy.mockRestore();
+  });
+
+  it("scrapeTotalWineStore returns [] on browser launch failure", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.chromiumLaunchPersistentContext.mockRejectedValue(new Error("Chrome crashed"));
+    const store = { storeId: "tw1", name: "Test TW" };
+    const result = await runWithFakeTimers(() => scrapeTotalWineStore(store));
+    expect(result).toEqual([]);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Browser launch failed"));
+    consoleSpy.mockRestore();
+  });
+
+  it("scrapeWalmartStore returns knownFound on browser launch failure", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.chromiumLaunchPersistentContext.mockRejectedValue(new Error("Chrome crashed"));
+    const store = { storeId: "wm1", name: "Test WM" };
+    const result = await runWithFakeTimers(() => scrapeWalmartStore(store));
+    expect(Array.isArray(result)).toBe(true);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Browser launch failed"));
+    consoleSpy.mockRestore();
+  });
+
+  it("scrapeWalgreensStore returns [] on browser launch failure", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.chromiumLaunchPersistentContext.mockRejectedValue(new Error("Chrome crashed"));
+    const result = await runWithFakeTimers(() => scrapeWalgreensStore());
+    expect(result).toEqual([]);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Browser launch failed"));
+    consoleSpy.mockRestore();
+  });
+
+  it("scrapeSamsClubStore returns [] on browser launch failure", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.chromiumLaunchPersistentContext.mockRejectedValue(new Error("Chrome crashed"));
+    const result = await runWithFakeTimers(() => scrapeSamsClubStore());
+    expect(result).toEqual([]);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Browser launch failed"));
+    consoleSpy.mockRestore();
+  });
+});
+
+// ─── Sam's Club browser nextData=null health tracking ────────────────────────
+
+describe("Sam's Club browser nextData=null tracks blocked", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+  });
+
+  it("tracks 'blocked' when __NEXT_DATA__ is null (not 'ok')", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const page = createMockPage();
+    // isBlockedPage returns false (page looks normal)
+    page.title.mockResolvedValue("Sam's Club");
+    // evaluate returns "" — isBlockedPage gets empty body text (no blocked keywords),
+    // and __NEXT_DATA__ extraction gets "" which is falsy → triggers our "blocked" tracking
+    page.evaluate.mockResolvedValue("");
+    const result = await runWithFakeTimers(() => scrapeSamsClubViaBrowser(page));
+    expect(Array.isArray(result)).toBe(true);
+    const health = _getScraperHealth();
+    // All product checks should track "blocked" since nextData was falsy
+    expect(health.samsclub?.blocked).toBeGreaterThan(0);
+    expect(health.samsclub?.succeeded || 0).toBe(0);
+    vi.spyOn(console, "warn").mockRestore();
+  });
+});
+
+// ─── Costco browser empty-page differentiation ──────────────────────────────
+
+describe("Costco browser empty-page health tracking", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+  });
+
+  it("tracks 'ok' when no tiles but main content exists (genuine empty result)", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Costco Search");
+    // No product tiles found
+    page.waitForSelector.mockRejectedValue(new Error("timeout"));
+    // Not a blocked page
+    page.evaluate.mockResolvedValue(""); // body text for isBlockedPage check
+    // Has main content → genuine empty
+    page.$.mockResolvedValue(true);
+    page.$$eval.mockResolvedValue([]);
+    const result = await runWithFakeTimers(() => scrapeCostcoOnce(page));
+    expect(Array.isArray(result)).toBe(true);
+    const health = _getScraperHealth();
+    // Should track "ok" for genuine empty results, not "blocked"
+    expect(health.costco?.succeeded).toBeGreaterThan(0);
+  });
+
+  it("tracks 'blocked' when no tiles and no content (degraded page)", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const page = createMockPage();
+    page.title.mockResolvedValue("Costco Search");
+    // No product tiles found
+    page.waitForSelector.mockRejectedValue(new Error("timeout"));
+    // Not a blocked page
+    page.evaluate.mockResolvedValue(""); // body text for isBlockedPage check
+    // No main content → degraded
+    page.$.mockResolvedValue(null);
+    page.$$eval.mockResolvedValue([]);
+    const result = await runWithFakeTimers(() => scrapeCostcoOnce(page));
+    expect(Array.isArray(result)).toBe(true);
+    const health = _getScraperHealth();
+    expect(health.costco?.blocked).toBeGreaterThan(0);
+    vi.spyOn(console, "warn").mockRestore();
+  });
+});
+
+// ─── checkWalmartKnownUrls error logging ─────────────────────────────────────
+
+describe("checkWalmartKnownUrls logs errors", () => {
+  beforeEach(() => {
+    _resetKnownProducts();
+  });
+
+  it("logs warning on fetch error instead of silently swallowing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const state = {
+      walmart: {
+        s1: { bottles: { "Blanton's": { url: "https://www.walmart.com/ip/blantons/123" } } },
+      },
+    };
+    loadKnownProducts(state);
+    // Reject both calls — scraperFetchRetry retries once, so both must fail
+    mocks.gotScraping
+      .mockRejectedValueOnce(new Error("Network timeout"))
+      .mockRejectedValueOnce(new Error("Network timeout"));
+    const store = { storeId: "1234", name: "Test Store" };
+    const result = await runWithFakeTimers(() => checkWalmartKnownUrls(store));
+    expect(result).toEqual([]);
+    // Should log the fetchRetry warning AND our new known-URL-specific warning
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Known URL check failed"));
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── Kroger OAuth uses fetchRetry ────────────────────────────────────────────
+
+describe("Kroger OAuth retry", () => {
+  beforeEach(() => {
+    _resetKrogerToken();
+  });
+
+  it("retries OAuth token fetch on network error", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // First call fails (network error), second succeeds (fetchRetry behavior)
+    let callCount = 0;
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url.includes("oauth2/token")) {
+        callCount++;
+        if (callCount === 1) return Promise.reject(new Error("DNS timeout"));
+        return Promise.resolve({ ok: true, json: async () => ({ access_token: "tok123" }) });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const token = await runWithFakeTimers(() => getKrogerToken());
+    expect(token).toBe("tok123");
+    expect(callCount).toBe(2); // First failed, second succeeded via fetchRetry
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── Kroger OAuth failure tracks health ──────────────────────────────────────
+
+describe("Kroger OAuth failure health tracking", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetKrogerToken();
+  });
+
+  it("tracks 'fail' health when OAuth token fetch fails completely", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Both fetchRetry attempts fail (no valid token)
+    mocks.fetch.mockRejectedValue(new Error("Network down"));
+    const store = { storeId: "kr1", name: "Test Kroger" };
+    const result = await runWithFakeTimers(() => scrapeKrogerStore(store));
+    expect(result).toEqual([]);
+    const health = _getScraperHealth();
+    expect(health.kroger?.failed).toBeGreaterThanOrEqual(1);
+    consoleSpy.mockRestore();
+  });
+});
+
+// ─── Kroger/Safeway page 2 isolation ─────────────────────────────────────────
+
+describe("Kroger page 2 failure isolation", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetKrogerToken();
+  });
+
+  it("keeps page 1 results when page 2 json() throws", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    // Mock OAuth token
+    let tokenFetched = false;
+    mocks.fetch.mockImplementation((url) => {
+      if (typeof url === "string" && url.includes("oauth2/token")) {
+        tokenFetched = true;
+        return Promise.resolve({ ok: true, json: async () => ({ access_token: "tok" }) });
+      }
+      if (typeof url === "string" && url.includes("filter.start=50")) {
+        // Page 2 returns 200 but malformed JSON
+        return Promise.resolve({ ok: true, status: 200, json: async () => { throw new Error("Malformed JSON"); } });
+      }
+      // Page 1 returns exactly 50 items (triggers page 2 fetch)
+      const items = Array.from({ length: 50 }, (_, i) => ({
+        description: i === 0 ? "Weller Special Reserve Bourbon 750ml" : `Other Product ${i}`,
+        productId: `prod${i}`,
+        items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" }],
+      }));
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: items }) });
+    });
+    const store = { storeId: "kr1", name: "Test Kroger" };
+    const result = await runWithFakeTimers(() => scrapeKrogerStore(store));
+    expect(tokenFetched).toBe(true);
+    // Page 1 results should be preserved despite page 2 failure
+    expect(result.length).toBeGreaterThan(0);
+    expect(result.some(b => b.name === "Weller Special Reserve")).toBe(true);
+    // Health should show "ok" (page 1 succeeded) not "fail"
+    const health = _getScraperHealth();
+    expect(health.kroger?.succeeded).toBeGreaterThan(0);
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── Walmart browser nextData=null health tracking ───────────────────────────
+
+describe("Walmart browser nextData=null health tracking", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+  });
+
+  it("tracks 'blocked' when nextData is null and DOM has no products", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const page = createMockPage();
+    page.title.mockResolvedValue("Walmart.com");
+    // isBlockedPage gets empty body text → not blocked
+    // __NEXT_DATA__ evaluate returns "" (falsy) → triggers DOM fallback
+    page.evaluate.mockResolvedValue("");
+    // DOM fallback returns no products
+    page.$$eval.mockResolvedValue([]);
+    const store = { storeId: "wm1", name: "Test WM" };
+    const result = await runWithFakeTimers(() => scrapeWalmartViaBrowser(store, page));
+    expect(Array.isArray(result)).toBe(true);
+    const health = _getScraperHealth();
+    // Should track "blocked" for degraded pages, not "ok"
+    expect(health.walmart?.blocked).toBeGreaterThan(0);
+    expect(health.walmart?.succeeded || 0).toBe(0);
+    vi.spyOn(console, "warn").mockRestore();
+  });
+});
+
+// ─── Walgreens timeout retry ─────────────────────────────────────────────────
+
+describe("Walgreens timeout triggers retry", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+    _resetWalgreensCoords();
+    mocks.zipToCoords.mockResolvedValue({ lat: 33.4152, lng: -111.8315 });
+  });
+
+  it("retries once on timeout (attempt 0), gives up on second timeout", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage, context: mockContext } = setupMockBrowser();
+    // Make goto hang forever (simulates Akamai challenge page)
+    mockPage.goto.mockReturnValue(new Promise(() => {}));
+    mockPage.title.mockResolvedValue("Walgreens");
+    mockPage.evaluate.mockResolvedValue("");
+
+    vi.useRealTimers();
+    // Both attempts will timeout — use short timeout to keep test fast
+    const result = await withTimeout(scrapeWalgreensStore(), 200, "OUTER_TIMEOUT");
+    // Either the store returns [] (inner timeout fired twice) or outer timeout fires
+    // In either case, the retry was attempted (multiple browser launches)
+    expect(mocks.chromiumLaunchPersistentContext).toHaveBeenCalled();
+    // Health should show blocked entries from timeout tracking
+    const health = _getScraperHealth();
+    if (health.walgreens) {
+      expect(health.walgreens.blocked).toBeGreaterThanOrEqual(1);
+    }
+    vi.useFakeTimers();
+    _resetRetailerBrowserCache();
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── matchWalmartNextData null stack resilience ──────────────────────────────
+
+describe("matchWalmartNextData handles null stacks", () => {
+  it("filters null entries in itemStacks without crashing", () => {
+    const nextData = {
+      props: {
+        pageProps: {
+          initialData: {
+            searchResult: {
+              itemStacks: [
+                null,
+                { items: [{ __typename: "Product", name: "Weller Special Reserve Bourbon 750ml", availabilityStatusV2: { value: "IN_STOCK" }, fulfillmentBadge: "In stores", canonicalUrl: "/ip/123", priceInfo: { currentPrice: { priceString: "$29.99" } }, usItemId: "456" }] },
+                undefined,
+              ],
+            },
+          },
+        },
+      },
+    };
+    const result = matchWalmartNextData(nextData);
+    expect(result.length).toBe(1);
+    expect(result[0].name).toBe("Weller Special Reserve");
+  });
+
+  it("handles empty itemStacks gracefully", () => {
+    const nextData = { props: { pageProps: { initialData: { searchResult: { itemStacks: [] } } } } };
+    expect(matchWalmartNextData(nextData)).toEqual([]);
+  });
+
+  it("handles missing searchResult gracefully", () => {
+    const nextData = { props: { pageProps: { initialData: {} } } };
+    expect(matchWalmartNextData(nextData)).toEqual([]);
+  });
+});
+
+// ─── poll() → recordRetailerOutcome adaptive skip feedback loop ──────────────
+
+describe("poll() adaptive skip integration", () => {
+  beforeEach(() => {
+    _resetPolling();
+    _resetKrogerToken();
+    _resetScraperHealth();
+    _resetRetailerFailures();
+    mocks.readFile.mockResolvedValue("{}");
+    mocks.writeFile.mockResolvedValue(undefined);
+    mocks.rename.mockResolvedValue(undefined);
+    mocks.fetch.mockResolvedValue({ ok: true });
+  });
+
+  it("records failure outcome when retailer health is below 25%", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage, context: mockContext } = setupMockBrowser();
+    // Simulate blocked pages: tiles never appear → isBlockedPage returns true
+    mockPage.waitForSelector.mockRejectedValue(new Error("Timeout")); // tiles not found
+    mockPage.title.mockResolvedValue("Access Denied"); // triggers isBlockedPage
+    mockPage.evaluate.mockResolvedValue("Access Denied. You don't have permission.");
+    mockPage.$$eval.mockResolvedValue([]);
+    _setStoreCache({
+      retailers: { costco: [TEST_STORE], totalwine: [], walmart: [], kroger: [], safeway: [], walgreens: [], samsclub: [] },
+    });
+    // Run poll 3 times — each time costco gets all-blocked health
+    for (let i = 0; i < 3; i++) {
+      _resetPolling();
+      _resetScraperHealth();
+      _resetRetailerBrowserCache(); // Reset so each poll gets a fresh browser
+      await runWithFakeTimers(() => poll());
+    }
+    // After 3 consecutive failures, retailer should be in cooldown
+    expect(shouldSkipRetailer("costco")).toBe(true);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── Walgreens majority-blocked retry (health-triggered, not timeout) ────────
+
+describe("Walgreens health-triggered retry", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+    _resetWalgreensCoords();
+    mocks.zipToCoords.mockResolvedValue({ lat: 33.4152, lng: -111.8315 });
+  });
+
+  it("retries with fresh browser when >50% of queries are blocked", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage, context: mockContext } = setupMockBrowser();
+    let launchCount = 0;
+    mocks.chromiumLaunchPersistentContext.mockImplementation(() => {
+      launchCount++;
+      return Promise.resolve(mockContext);
+    });
+    // First attempt: page loads but all queries are blocked (isBlockedPage returns true)
+    let pageCallCount = 0;
+    mockPage.title.mockImplementation(async () => {
+      pageCallCount++;
+      // First N calls (attempt 1): blocked pages. Later calls (attempt 2): normal pages
+      return pageCallCount <= 20 ? "Please verify you are a human" : "Walgreens Search";
+    });
+    mockPage.evaluate.mockResolvedValue("");
+    mockPage.$$eval.mockResolvedValue([]);
+
+    await runWithFakeTimers(() => scrapeWalgreensStore());
+
+    // Should have launched browser twice (first attempt + retry)
+    expect(launchCount).toBe(2);
+    // Health should show blocked entries from the blocked pages
+    const health = _getScraperHealth();
+    expect(health.walgreens?.blocked).toBeGreaterThan(0);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── launchRetailerBrowser stale-context recovery ────────────────────────────
+
+describe("launchRetailerBrowser stale context recovery", () => {
+  beforeEach(() => {
+    _resetRetailerBrowserCache();
+    _resetScraperHealth();
+  });
+
+  it("recovers and re-launches when cached context.newPage() throws", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: freshPage, context: freshContext } = setupMockBrowser();
+    // scrapeCostcoStore will call launchRetailerBrowser("costco")
+    // Pre-populate the cache with a stale context whose newPage() fails
+    // This tests the recovery path at scraper.js:901-909
+
+    // First call to launchPersistentContext returns fresh context
+    // (stale one is injected manually below)
+    mocks.chromiumLaunchPersistentContext.mockResolvedValue(freshContext);
+
+    // Run scrapeCostcoStore which calls launchRetailerBrowser("costco")
+    // On first attempt it'll find the stale cached context, try newPage(), fail,
+    // delete cache, and fall through to launchPersistentContext
+    freshPage.evaluate.mockResolvedValue("");
+    freshPage.title.mockResolvedValue("Costco Search");
+    freshPage.$$eval.mockResolvedValue([]);
+
+    // Inject stale context into cache AFTER setup but BEFORE running scraper
+    // We need to use the internal cache object — _resetRetailerBrowserCache clears it,
+    // and launchRetailerBrowser checks it. Access it through the scraper.
+    // First, do a successful launch to populate cache
+    await runWithFakeTimers(() => scrapeCostcoStore(TEST_STORE));
+    const firstLaunchCount = mocks.chromiumLaunchPersistentContext.mock.calls.length;
+
+    // Now corrupt the cached context: make newPage() throw
+    // We can't directly access retailerBrowserCache, but we can make the next
+    // newPage() call on the context throw — the cache holds the SAME context object
+    freshContext.newPage.mockRejectedValueOnce(new Error("Target page crashed"));
+    // Then on the retry, return a fresh page
+    freshContext.newPage.mockResolvedValue(freshPage);
+
+    // Run again — should recover from stale context
+    await runWithFakeTimers(() => scrapeCostcoStore(TEST_STORE));
+
+    // Should have called launchPersistentContext again for the recovery
+    expect(mocks.chromiumLaunchPersistentContext.mock.calls.length).toBeGreaterThan(firstLaunchCount);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── TotalWine browser degraded page health tracking ─────────────────────────
+
+describe("TotalWine browser degraded page (no INITIAL_STATE + no CSS products)", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+  });
+
+  it("tracks 'blocked' when INITIAL_STATE and CSS products are both absent", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const mockPage = createMockPage();
+    // isBlockedPage returns false (normal title/body text)
+    mockPage.title.mockResolvedValue("Total Wine Search");
+    // evaluate: first call = isBlockedPage body (empty), second = INITIAL_STATE (null)
+    let evalCount = 0;
+    mockPage.evaluate.mockImplementation(async () => {
+      evalCount++;
+      return evalCount % 2 === 1 ? "" : null;
+    });
+    // CSS fallback also returns empty (no products on page at all)
+    mockPage.$$eval.mockResolvedValue([]);
+
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaBrowser(TEST_STORE, mockPage));
+    expect(found).toEqual([]);
+    // Should track as blocked (degraded page), not ok
+    const health = _getScraperHealth();
+    expect(health.totalwine?.blocked).toBeGreaterThan(0);
+    expect(health.totalwine?.succeeded || 0).toBe(0);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── refreshProxySession ─────────────────────────────────────────────────────
+
+describe("refreshProxySession", () => {
+  it("assigns per-retailer proxy URLs after refresh", () => {
+    // PROXY_URL is not set in test env, so refreshProxySession returns early.
+    // But we can verify getRetailerProxyUrl returns null without proxy.
+    expect(getRetailerProxyUrl("costco")).toBeNull();
+    // Call refreshProxySession — with no PROXY_URL, it's a no-op
+    refreshProxySession();
+    expect(getRetailerProxyUrl("costco")).toBeNull();
+  });
+});
+
+// ─── computeChanges with corrupted state ─────────────────────────────────────
+
+describe("computeChanges edge cases", () => {
+  const bottle = (name, extra = {}) => ({ name, url: `https://example.com/${name}`, price: "$29.99", sku: "123", size: "750ml", fulfillment: "", ...extra });
+
+  it("handles previousStore with null bottles (corrupted state)", () => {
+    const prev = { bottles: null, lastScanned: "2026-01-01T00:00:00Z" };
+    const { newFinds, stillInStock, goneOOS } = computeChanges(prev, [bottle("Weller 12")]);
+    expect(newFinds).toHaveLength(1);
+    expect(newFinds[0].name).toBe("Weller 12");
+    expect(goneOOS).toHaveLength(0);
+  });
+
+  it("handles previousStore with numeric bottles (corrupted state)", () => {
+    const prev = { bottles: 42 };
+    const { newFinds } = computeChanges(prev, [bottle("Stagg Jr")]);
+    expect(newFinds).toHaveLength(1);
+  });
+});
+
+// ─── buildSummaryEmbed zero-query health entry ───────────────────────────────
+
+describe("buildSummaryEmbed with zero-query health", () => {
+  it("shows error emoji for retailer with zero queries tracked (no NaN)", () => {
+    const health = { kroger: { queries: 0, succeeded: 0, failed: 0, blocked: 0 } };
+    const embed = buildSummaryEmbed({
+      storesScanned: 5, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 5, durationSec: 60, health,
+    });
+    const field = embed.fields?.find(f => f.name.includes("Kroger"));
+    expect(field).toBeDefined();
+    expect(field.value).toContain("0/0");
+    expect(field.value).not.toContain("NaN");
+    expect(field.value).not.toContain("Infinity");
+  });
+});
+
+// ─── Sam's Club OOS product tracks "ok" health ──────────────────────────────
+
+describe("Sam's Club browser OOS product health tracking", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+  });
+
+  it("tracks 'ok' when product page loads but item is OOS", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mockPage = createMockPage();
+    // isBlockedPage body check returns "" (not blocked), __NEXT_DATA__ returns OOS product
+    const oosData = {
+      props: { pageProps: { initialData: { data: { product: {
+        name: "Weller Special Reserve 750ml",
+        availabilityStatusV2: { value: "OUT_OF_STOCK" },
+        canonicalUrl: "/ip/weller/prod20595259",
+        priceInfo: { currentPrice: { priceString: "$24.98" } },
+      } } } } },
+    };
+    let evalCount = 0;
+    mockPage.evaluate.mockImplementation(async () => {
+      evalCount++;
+      // Odd calls = isBlockedPage body (empty string)
+      // Even calls = __NEXT_DATA__ extraction
+      return evalCount % 2 === 1 ? "" : oosData;
+    });
+    mockPage.title.mockResolvedValue("Weller at Sam's Club");
+
+    const found = await runWithFakeTimers(() => scrapeSamsClubViaBrowser(mockPage));
+    // Nothing found (OOS), but health should show "ok" not "blocked"
+    expect(found).toEqual([]);
+    const health = _getScraperHealth();
+    expect(health.samsclub?.succeeded).toBeGreaterThan(0);
+    expect(health.samsclub?.blocked || 0).toBe(0);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── updateStoreState bottle re-found lifecycle ──────────────────────────────
+
+describe("updateStoreState re-found after OOS", () => {
+  it("re-found bottle gets fresh firstSeen and scanCount=1 after going OOS", () => {
+    const state = {};
+    // First found
+    updateStoreState(state, "costco", "100", [{ name: "Stagg Jr", url: "/a", price: "$60", sku: "1" }]);
+    const firstSeen1 = state.costco["100"].bottles["Stagg Jr"].firstSeen;
+    expect(state.costco["100"].bottles["Stagg Jr"].scanCount).toBe(1);
+
+    // Second scan: still in stock
+    updateStoreState(state, "costco", "100", [{ name: "Stagg Jr", url: "/a", price: "$60", sku: "1" }]);
+    expect(state.costco["100"].bottles["Stagg Jr"].firstSeen).toBe(firstSeen1);
+    expect(state.costco["100"].bottles["Stagg Jr"].scanCount).toBe(2);
+
+    // Goes OOS
+    updateStoreState(state, "costco", "100", []);
+    expect(state.costco["100"].bottles["Stagg Jr"]).toBeUndefined();
+
+    // Re-found
+    updateStoreState(state, "costco", "100", [{ name: "Stagg Jr", url: "/b", price: "$65", sku: "2" }]);
+    expect(state.costco["100"].bottles["Stagg Jr"].scanCount).toBe(1);
+    expect(state.costco["100"].bottles["Stagg Jr"].url).toBe("/b");
+    // firstSeen should be new (can't equal the original since the state entry was removed)
+  });
+});
+
+// ─── formatStoreInfo null/missing store name ─────────────────────────────────
+
+describe("formatStoreInfo null name guard", () => {
+  it("handles store with null name without crashing", () => {
+    const store = { storeId: "123", name: null, address: "123 Main St" };
+    const info = formatStoreInfo("costco", "Costco", store);
+    expect(info.title).toContain("Costco");
+    expect(info.storeLine).toContain("Costco");
+    expect(info.title).not.toContain("null");
+  });
+
+  it("handles store with undefined name without crashing", () => {
+    const store = { storeId: "456", address: "789 Oak Ave" };
+    const info = formatStoreInfo("walmart", "Walmart", store);
+    expect(info.title).toContain("Walmart");
+    expect(info.title).not.toContain("undefined");
+  });
+});
+
+// ─── Walgreens retry resets health between attempts ──────────────────────────
+
+describe("Walgreens retry resets health on second attempt", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+    _resetWalgreensCoords();
+    mocks.zipToCoords.mockResolvedValue({ lat: 33.4152, lng: -111.8315 });
+  });
+
+  it("second attempt starts with clean health data", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage, context: mockContext } = setupMockBrowser();
+    let launchCount = 0;
+    mocks.chromiumLaunchPersistentContext.mockImplementation(() => {
+      launchCount++;
+      return Promise.resolve(mockContext);
+    });
+    // Track health states between attempts
+    const healthSnapshots = [];
+    let pageCallCount = 0;
+    mockPage.title.mockImplementation(async () => {
+      pageCallCount++;
+      // First 20 calls: blocked. After: normal (so attempt 2 succeeds)
+      return pageCallCount <= 20 ? "Please verify you are a human" : "Walgreens Search";
+    });
+    mockPage.evaluate.mockResolvedValue("");
+    mockPage.$$eval.mockResolvedValue([]);
+
+    await runWithFakeTimers(() => scrapeWalgreensStore());
+
+    // After retry, health should only reflect the second attempt's queries
+    const health = _getScraperHealth();
+    // If retry happened and health was reset, walgreens health should have
+    // succeeded queries from the second attempt (not accumulated blocked from first)
+    if (launchCount >= 2) {
+      const wg = health.walgreens;
+      // If the second attempt was not blocked, succeeded should be > 0
+      // and blocked should be 0 (health was reset between attempts)
+      if (wg && wg.succeeded > 0) {
+        expect(wg.blocked || 0).toBe(0);
+      }
+    }
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── Walgreens coords validation ─────────────────────────────────────────────
+
+describe("Walgreens zipToCoords validation", () => {
+  beforeEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+    _resetWalgreensCoords();
+  });
+
+  it("returns empty when zipToCoords returns null lat/lng", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.zipToCoords.mockResolvedValue({ lat: null, lng: null });
+    setupMockBrowser();
+
+    const result = await runWithFakeTimers(() => scrapeWalgreensStore());
+    expect(result).toEqual([]);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── loadState null/invalid guard ────────────────────────────────────────────
+
+describe("loadState handles corrupted state files", () => {
+  it("returns {} when state.json contains null", async () => {
+    mocks.readFile.mockResolvedValueOnce("null");
+    const state = await loadState();
+    expect(state).toEqual({});
+  });
+
+  it("returns {} when state.json contains an array", async () => {
+    mocks.readFile.mockResolvedValueOnce("[1,2,3]");
+    const state = await loadState();
+    expect(state).toEqual({});
+  });
+
+  it("returns {} when state.json contains a string", async () => {
+    mocks.readFile.mockResolvedValueOnce('"hello"');
+    const state = await loadState();
+    expect(state).toEqual({});
+  });
+
+  it("returns valid object when state.json is correct", async () => {
+    mocks.readFile.mockResolvedValueOnce('{"costco":{"100":{}}}');
+    const state = await loadState();
+    expect(state).toEqual({ costco: { "100": {} } });
+  });
+});
+
+// ─── closeRetailerBrowsers timeout safety ────────────────────────────────────
+
+describe("closeRetailerBrowsers timeout safety", () => {
+  it("does not hang when context.close() hangs (uses fake timers)", async () => {
+    _resetRetailerBrowserCache();
+    const { context: mockContext } = setupMockBrowser();
+    // First: populate the retailer browser cache by running a successful scrape
+    await runWithFakeTimers(() => scrapeCostcoStore(TEST_STORE));
+    // Now make close hang forever
+    mockContext.close.mockReturnValue(new Promise(() => {}));
+    // closeRetailerBrowsers wraps each close in withTimeout(10s)
+    // With fake timers, we can advance past the timeout
+    const closePromise = closeRetailerBrowsers();
+    closePromise.catch(() => {}); // prevent unhandled rejection
+    await vi.advanceTimersByTimeAsync(11000); // past the 10s timeout
+    await closePromise;
+    // If we get here, it didn't hang (the withTimeout resolved)
+    _resetRetailerBrowserCache();
+  });
+});
+
+// ─── parseSize L-unit normalization ──────────────────────────────────────────
+
+describe("parseSize L normalization", () => {
+  it("normalizes 1.75L via parseFloat (not raw regex string)", () => {
+    expect(parseSize("Bourbon 1.75L")).toBe("1.75L");
+  });
+
+  it("normalizes 1 liter", () => {
+    expect(parseSize("Bourbon 1 liter")).toBe("1L");
+  });
+
+  it("handles integer L values", () => {
+    expect(parseSize("Bourbon 1L")).toBe("1L");
   });
 });

@@ -7,7 +7,7 @@ import { chromium as rebrowserChromium } from "rebrowser-playwright-core";
 import { addExtra } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 // node-cron removed — replaced with setTimeout + jitter for variable scan intervals
-import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
+import { readFile, writeFile, rename, mkdir, unlink, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 import * as cheerio from "cheerio";
@@ -39,7 +39,10 @@ const {
 // Supports "*/N * * * *" (every N minutes) format. Falls back to 15 min.
 function parsePollIntervalMs(cronExpr) {
   const match = cronExpr?.match(/^\*\/(\d+)\s/);
-  if (match) return parseInt(match[1], 10) * 60 * 1000;
+  if (match) {
+    const mins = parseInt(match[1], 10);
+    if (mins > 0) return mins * 60 * 1000;
+  }
   return 15 * 60 * 1000;
 }
 
@@ -86,18 +89,25 @@ function refreshProxySession() {
     const key = retailers[i];
     if (BACKUP_PROXY_URL && BACKUP_PROXY_RETAILERS.has(key)) {
       // Use backup proxy for this retailer (e.g., IPRoyal for burned IPs)
-      const backupUrl = new URL(BACKUP_PROXY_URL);
-      backupUrl.port = String(backupBasePort + i);
-      retailerProxyUrls[key] = backupUrl.toString();
-      retailerProxyAgents[key] = createProxyAgent(retailerProxyUrls[key]);
+      try {
+        const backupUrl = new URL(BACKUP_PROXY_URL);
+        backupUrl.port = String(backupBasePort + i);
+        retailerProxyUrls[key] = backupUrl.toString();
+        retailerProxyAgents[key] = createProxyAgent(retailerProxyUrls[key]);
+      } catch (err) {
+        console.error(`[proxy] Invalid BACKUP_PROXY_URL for ${key}: ${err.message} — falling back to primary`);
+        const url = makeStickyProxyUrl(basePort + i);
+        retailerProxyUrls[key] = url;
+        retailerProxyAgents[key] = createProxyAgent(url);
+      }
     } else {
       const url = makeStickyProxyUrl(basePort + i);
       retailerProxyUrls[key] = url;
       retailerProxyAgents[key] = createProxyAgent(url);
     }
   }
-  // Default proxyAgent uses the first port (for any non-retailer-specific fetch calls)
-  proxySessionUrl = makeStickyProxyUrl(basePort);
+  // Default proxyAgent uses a port outside the per-retailer range (avoids sharing with retailers[0])
+  proxySessionUrl = makeStickyProxyUrl(basePort + retailers.length);
   proxyAgent = createProxyAgent(proxySessionUrl);
 }
 function getRetailerProxy(retailerKey) {
@@ -289,7 +299,8 @@ const CANARY_NAMES = new Set(TARGET_BOTTLES.filter((b) => b.canary).map((b) => b
 async function loadState() {
   try {
     const raw = await readFile(STATE_FILE, "utf-8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : {};
   } catch {
     return {};
   }
@@ -471,7 +482,8 @@ function formatStoreInfo(retailerKey, retailerName, store) {
     ? `📍 [${store.address}](https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(store.address)})`
     : "📍 Address unknown";
   // Strip duplicate retailer prefix (e.g. "Costco Costco Chandler" → "Costco Chandler")
-  const displayName = store.name.startsWith(retailerName) ? store.name : `${retailerName} ${store.name}`;
+  const storeName = store.name || "";
+  const displayName = storeName.startsWith(retailerName) ? storeName : `${retailerName} ${storeName}`;
 
   return {
     title: `${displayName} (#${store.storeId})${dist}`,
@@ -534,7 +546,7 @@ function truncateDescription(desc) {
 // Returns array of embeds for a store based on computed changes.
 function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   const info = formatStoreInfo(retailerKey, retailerName, store);
-  const allNames = TARGET_BOTTLES.map((b) => b.name);
+  const allNames = TARGET_BOTTLES.filter((b) => !CANARY_NAMES.has(b.name)).map((b) => b.name);
   const embeds = [];
 
   // New finds embed (green, urgent)
@@ -719,7 +731,7 @@ async function scraperFetchRetry(url, opts) {
   try {
     return await scraperFetch(url, opts);
   } catch (err) {
-    console.warn(`[fetchRetry] ${err.message} — retrying in 1s`);
+    console.warn(`[scraperFetchRetry] ${err.message} — retrying in 1s`);
     await sleep(1000);
     return await scraperFetch(url, opts);
   }
@@ -734,7 +746,7 @@ function parseSize(text) {
   const u = unit.toLowerCase();
   if (u === "ml") return `${num}ml`;
   if (u === "cl") return `${Math.round(parseFloat(num) * 10)}ml`;
-  return `${num}L`;
+  return `${parseFloat(num)}L`;
 }
 
 // Normalize unicode curly quotes/apostrophes to ASCII before matching.
@@ -905,6 +917,17 @@ async function launchRetailerBrowser(retailerKey) {
   const profileDir = join(PROFILES_DIR, retailerKey);
   await mkdir(profileDir, { recursive: true });
 
+  // Clean up stale SingletonLock files left by crashed Chrome processes.
+  // These prevent launchPersistentContext from acquiring the profile directory.
+  try {
+    const files = await readdir(profileDir);
+    for (const f of files) {
+      if (f === "SingletonLock" || f === "SingletonSocket" || f === "SingletonCookie") {
+        await unlink(join(profileDir, f)).catch(() => {});
+      }
+    }
+  } catch { /* profile dir may not exist yet */ }
+
   const viewports = [
     { width: 1366, height: 768 },
     { width: 1440, height: 900 },
@@ -947,7 +970,8 @@ async function launchRetailerBrowser(retailerKey) {
 async function closeRetailerBrowsers() {
   for (const key of Object.keys(retailerBrowserCache)) {
     const { context } = retailerBrowserCache[key];
-    await context.close().catch(() => {});
+    // Timeout prevents a hung Chrome process from blocking saveState and summary
+    await withTimeout(context.close().catch(() => {}), 10000, undefined);
     delete retailerBrowserCache[key];
   }
 }
@@ -1145,7 +1169,10 @@ async function scrapeCostcoViaFetch() {
     }
   });
   await runWithConcurrency(queryTasks, concurrency);
-  if (validPages === 0) return null;
+  // Require at least 25% of queries to succeed — a single valid page shouldn't
+  // suppress browser fallback when most queries were blocked
+  const minValid = Math.max(1, Math.ceil(queryTasks.length / 4));
+  if (validPages < minValid) return null;
   return dedupFound(found);
 }
 
@@ -1164,9 +1191,21 @@ async function scrapeCostcoOnce(page) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
       const tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 15000 }).then(() => true).catch(() => false);
-      if (!tilesLoaded && await isBlockedPage(page)) {
-        console.warn(`[costco] Bot detection page for query "${query}" — skipping`);
-        trackHealth("costco", "blocked");
+      if (!tilesLoaded) {
+        if (await isBlockedPage(page)) {
+          console.warn(`[costco] Bot detection page for query "${query}" — skipping`);
+          trackHealth("costco", "blocked");
+        } else {
+          // No tiles and not blocked — could be a degraded page or JS failed to hydrate.
+          // Check for any content that suggests a real (empty) search result vs broken page.
+          const hasContent = await page.$('main, [data-testid="search-results"], [data-testid="no-results"]').then(el => !!el).catch(() => false);
+          if (hasContent) {
+            trackHealth("costco", "ok"); // Genuine empty result
+          } else {
+            console.warn(`[costco] No tiles and no content for query "${query}" — marking degraded`);
+            trackHealth("costco", "blocked");
+          }
+        }
         continue;
       }
 
@@ -1220,7 +1259,14 @@ async function scrapeCostcoStore() {
 
   // Fetch blocked or no proxy — fall back to browser
   console.log("[costco] Fetch blocked, using browser (dedicated IP)");
-  const { page } = await launchRetailerBrowser("costco");
+  let page;
+  try {
+    ({ page } = await launchRetailerBrowser("costco"));
+  } catch (err) {
+    console.error(`[costco] Browser launch failed: ${err.message}`);
+    trackHealth("costco", "fail");
+    return [];
+  }
   try {
     const scraperPromise = scrapeCostcoOnce(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -1321,7 +1367,10 @@ async function scrapeTotalWineViaFetch(store) {
     }
   });
   await runWithConcurrency(queryTasks, 4);
-  if (validPages === 0) return null;
+  // Require at least 25% of queries to succeed — a single valid page shouldn't
+  // suppress browser fallback when most queries were blocked
+  const minValid = Math.max(1, Math.ceil(queryTasks.length / 4));
+  if (validPages < minValid) return null;
   return dedupFound(found);
 }
 
@@ -1374,7 +1423,10 @@ async function scrapeTotalWineViaBrowser(store, page) {
           (cards) =>
             cards.map((el) => ({
               name: (el.querySelector('[class*="title"], [class*="name"], h2, a') || {}).textContent || "",
-              inStock: !!el.querySelector('button[class*="addToCart"], button[class*="Add"], [data-testid*="add"]'),
+              inStock: (() => {
+                const btn = el.querySelector('button[class*="addToCart"], button[class*="Add"], [data-testid*="add"]');
+                return !!btn && !btn.disabled && !btn.getAttribute("aria-disabled");
+              })(),
               url: (el.querySelector('a[href*="/spirits/"], a[href*="/wine/"], a') || {}).href || "",
               price: (el.querySelector('[class*="price"], [data-testid*="price"]') || {}).textContent?.trim() || "",
             }))
@@ -1425,7 +1477,14 @@ async function scrapeTotalWineStore(store) {
 
   // Fetch blocked or no proxy — fall back to browser
   console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser (dedicated IP)`);
-  const { page } = await launchRetailerBrowser("totalwine");
+  let page;
+  try {
+    ({ page } = await launchRetailerBrowser("totalwine"));
+  } catch (err) {
+    console.error(`[totalwine:${store.storeId}] Browser launch failed: ${err.message}`);
+    trackHealth("totalwine", "fail");
+    return [];
+  }
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -1449,7 +1508,7 @@ async function scrapeTotalWineStore(store) {
 function matchWalmartNextData(nextData) {
   const found = [];
   const allStacks = nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks || [];
-  const items = allStacks.flatMap((stack) => stack.items || []);
+  const items = allStacks.filter(Boolean).flatMap((stack) => stack.items || []);
 
   for (const item of items) {
     // Skip non-product entries (ads, recommendations, editorial)
@@ -1532,7 +1591,10 @@ async function scrapeWalmartViaFetch(store) {
     }
   });
   await runWithConcurrency(queryTasks, 4);
-  if (validPages === 0) return null;
+  // Require at least 25% of queries to succeed — a single valid page shouldn't
+  // suppress browser fallback when most queries were blocked
+  const minValid = Math.max(1, Math.ceil(queryTasks.length / 4));
+  if (validPages < minValid) return null;
   return dedupFound(found);
 }
 
@@ -1569,6 +1631,7 @@ async function scrapeWalmartViaBrowser(store, page) {
 
       if (nextData) {
         found.push(...matchWalmartNextData(nextData));
+        trackHealth("walmart", "ok");
       } else {
         // DOM fallback if __NEXT_DATA__ is unavailable
         const products = await page.$$eval(
@@ -1584,15 +1647,21 @@ async function scrapeWalmartViaBrowser(store, page) {
               }))
           /* v8 ignore stop */
         );
-        for (const p of products) {
-          for (const bottle of TARGET_BOTTLES) {
-            if (matchesBottle(p.title, bottle)) {
-              found.push({ name: bottle.name, url: p.url, price: p.price, sku: "", size: parseSize(p.title), fulfillment: "" });
+        if (products.length > 0) {
+          for (const p of products) {
+            for (const bottle of TARGET_BOTTLES) {
+              if (matchesBottle(p.title, bottle)) {
+                found.push({ name: bottle.name, url: p.url, price: p.price, sku: "", size: parseSize(p.title), fulfillment: "" });
+              }
             }
           }
+          trackHealth("walmart", "ok");
+        } else {
+          // No __NEXT_DATA__ and no DOM products — degraded page (JS hydration failed)
+          console.warn(`[walmart:${store.storeId}] No __NEXT_DATA__ or DOM products for query — marking degraded`);
+          trackHealth("walmart", "blocked");
         }
       }
-      trackHealth("walmart", "ok");
     } catch (err) {
       console.error(`[walmart:${store.storeId}] Error searching "${query}": ${err.message}`);
       trackHealth("walmart", "fail");
@@ -1638,7 +1707,9 @@ async function checkWalmartKnownUrls(store) {
         found.push(...matched);
         console.log(`[walmart:${store.storeId}] Known URL check: ${name} still in stock`);
       }
-    } catch { /* best-effort */ }
+    } catch (err) {
+      console.warn(`[walmart:${store.storeId}] Known URL check failed for ${name}: ${err.message}`);
+    }
     await sleep(500 + Math.random() * 500);
   }
   return found;
@@ -1646,7 +1717,10 @@ async function checkWalmartKnownUrls(store) {
 
 async function scrapeWalmartStore(store) {
   // Check known product URLs first (less suspicious, supplements search results)
-  const knownFound = await checkWalmartKnownUrls(store).catch(() => []);
+  const knownFound = await checkWalmartKnownUrls(store).catch((err) => {
+    console.warn(`[walmart:${store.storeId}] Known URL check wrapper failed: ${err.message}`);
+    return [];
+  });
 
   // Skip fetch attempt on CI unless a proxy is configured (datacenter IPs are blocked)
   const isCI = process.env.CI === "true" || process.env.GITHUB_ACTIONS === "true";
@@ -1658,7 +1732,14 @@ async function scrapeWalmartStore(store) {
     }
   }
   console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser (dedicated IP)`);
-  const { page } = await launchRetailerBrowser("walmart");
+  let page;
+  try {
+    ({ page } = await launchRetailerBrowser("walmart"));
+  } catch (err) {
+    console.error(`[walmart:${store.storeId}] Browser launch failed: ${err.message}`);
+    trackHealth("walmart", "fail");
+    return dedupFound(knownFound);
+  }
   try {
     const scraperPromise = scrapeWalmartViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -1688,7 +1769,12 @@ async function scrapeWalgreensViaBrowser(page) {
   // Cache zip coordinates for USER_LOC cookie (same zip every poll)
   if (!walgreensCoords) {
     try {
-      walgreensCoords = await zipToCoords(ZIP_CODE);
+      const coords = await zipToCoords(ZIP_CODE);
+      if (coords?.lat == null || coords?.lng == null) {
+        console.warn(`[walgreens] zipToCoords returned invalid coords — skipping`);
+        return [];
+      }
+      walgreensCoords = coords;
     } catch (err) {
       console.warn(`[walgreens] Failed to resolve zip ${ZIP_CODE}: ${err.message} — skipping`);
       return [];
@@ -1773,22 +1859,55 @@ async function scrapeWalgreensViaBrowser(page) {
 }
 
 // Wrapper: browser-only (no fetch-first — Akamai blocks direct HTTP).
+// Since Walgreens is scrapeOnce, a single Akamai challenge wipes out all stores.
+// Retry once with a fresh browser if ≥50% of queries were blocked.
 async function scrapeWalgreensStore() {
-  console.log("[walgreens] Using browser (dedicated IP)");
-  const { page } = await launchRetailerBrowser("walgreens");
-  try {
-    const scraperPromise = scrapeWalgreensViaBrowser(page);
-    scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, null);
-    if (result === null) {
-      console.warn("[walgreens] Browser scraper timed out (180s)");
-      trackHealth("walgreens", "blocked");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      console.log("[walgreens] Retrying with fresh browser after blocks");
+      // Reset walgreens health so retry metrics aren't polluted by first attempt
+      delete scraperHealth["walgreens"];
+      // Clear cached context so we get a fresh browser instance
+      if (retailerBrowserCache["walgreens"]) {
+        await retailerBrowserCache["walgreens"].context.close().catch(() => {});
+        delete retailerBrowserCache["walgreens"];
+      }
+      await sleep(3000 + Math.random() * 2000); // Cool-down before retry
+    }
+    console.log("[walgreens] Using browser (dedicated IP)");
+    let page;
+    try {
+      ({ page } = await launchRetailerBrowser("walgreens"));
+    } catch (err) {
+      console.error(`[walgreens] Browser launch failed: ${err.message}`);
+      trackHealth("walgreens", "fail");
       return [];
     }
-    return result;
-  } finally {
-    await page.close().catch(() => {});
+    try {
+      const scraperPromise = scrapeWalgreensViaBrowser(page);
+      scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
+      const result = await withTimeout(scraperPromise, 180000, null);
+      if (result === null) {
+        console.warn("[walgreens] Browser scraper timed out (180s)");
+        trackHealth("walgreens", "blocked");
+        if (attempt === 0) {
+          console.warn("[walgreens] Timeout on first attempt — retrying with fresh browser");
+          continue; // finally{} closes page
+        }
+        return [];
+      }
+      // Check if too many queries were blocked — worth retrying with fresh browser
+      const wgHealth = scraperHealth["walgreens"];
+      if (wgHealth && wgHealth.blocked > 0 && wgHealth.blocked >= wgHealth.queries / 2 && attempt === 0) {
+        console.warn(`[walgreens] ${wgHealth.blocked}/${wgHealth.queries} queries blocked — retrying`);
+        continue; // finally{} closes page
+      }
+      return result;
+    } finally {
+      await page.close().catch(() => {});
+    }
   }
+  return []; // Should not reach here, but safety fallback
 }
 
 // ─── Sam's Club: per-product-URL fetch with browser fallback ─────────────────
@@ -1923,8 +2042,12 @@ async function scrapeSamsClubViaBrowser(page) {
       if (nextData) {
         const match = matchSamsClubProduct(nextData, bottleName);
         if (match) found.push(match);
+        trackHealth("samsclub", "ok");
+      } else {
+        // __NEXT_DATA__ missing but page wasn't flagged as blocked — degraded response
+        console.warn(`[samsclub] No __NEXT_DATA__ for product ${productId} — marking degraded`);
+        trackHealth("samsclub", "blocked");
       }
-      trackHealth("samsclub", "ok");
     } catch (err) {
       console.error(`[samsclub] Error checking ${bottleName}: ${err.message}`);
       trackHealth("samsclub", "fail");
@@ -1942,7 +2065,14 @@ async function scrapeSamsClubStore() {
     return fetchResult;
   }
   console.log("[samsclub] Fetch blocked, using browser (dedicated IP)");
-  const { page } = await launchRetailerBrowser("samsclub");
+  let page;
+  try {
+    ({ page } = await launchRetailerBrowser("samsclub"));
+  } catch (err) {
+    console.error(`[samsclub] Browser launch failed: ${err.message}`);
+    trackHealth("samsclub", "fail");
+    return [];
+  }
   try {
     const scraperPromise = scrapeSamsClubViaBrowser(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
@@ -1980,7 +2110,7 @@ async function getKrogerToken() {
       };
       const krogerAgent = getRetailerProxy("kroger");
       if (krogerAgent) tokenOpts.agent = krogerAgent;
-      const res = await fetch("https://api.kroger.com/v1/connect/oauth2/token", tokenOpts);
+      const res = await fetchRetry("https://api.kroger.com/v1/connect/oauth2/token", tokenOpts);
       if (!res.ok) throw new Error(`OAuth HTTP ${res.status}`);
       krogerToken = (await res.json()).access_token;
       return krogerToken;
@@ -2001,6 +2131,7 @@ async function scrapeKrogerStore(store) {
     token = await getKrogerToken();
   } catch (err) {
     console.error(`[kroger:${store.storeId}] OAuth failed: ${err.message}`);
+    trackHealth("kroger", "fail");
     return [];
   }
 
@@ -2059,16 +2190,21 @@ async function scrapeKrogerStore(store) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       matchKrogerProducts(data.data || []);
-      // Fetch page 2 if first page was full (may have more results)
+      trackHealth("kroger", "ok");
+      // Fetch page 2 if first page was full (may have more results).
+      // Isolated try/catch: page 2 failure shouldn't lose page 1 data or mark query as failed.
       if (data.data?.length === 50) {
-        const page2Opts = { ...krogerOpts, signal: AbortSignal.timeout(15000) };
-        const res2 = await fetchRetry(`${baseUrl}&filter.start=50`, page2Opts);
-        if (res2.ok) {
-          const data2 = await res2.json();
-          matchKrogerProducts(data2.data || []);
+        try {
+          const page2Opts = { ...krogerOpts, signal: AbortSignal.timeout(15000) };
+          const res2 = await fetchRetry(`${baseUrl}&filter.start=50`, page2Opts);
+          if (res2.ok) {
+            const data2 = await res2.json();
+            matchKrogerProducts(data2.data || []);
+          }
+        } catch (p2Err) {
+          console.warn(`[kroger:${store.storeId}] Page 2 failed for "${query}": ${p2Err.message}`);
         }
       }
-      trackHealth("kroger", "ok");
     } catch (err) {
       console.error(`[kroger:${store.storeId}] Error searching "${query}": ${err.message}`);
       trackHealth("kroger", "fail");
@@ -2129,17 +2265,22 @@ async function scrapeSafewayStore(store) {
       const data = await res.json();
       const products = data?.primaryProducts?.response?.docs || [];
       matchSafewayProducts(products);
-      // Fetch page 2 if first page was full (may have more results)
+      trackHealth("safeway", "ok");
+      // Fetch page 2 if first page was full (may have more results).
+      // Isolated try/catch: page 2 failure shouldn't lose page 1 data or mark query as failed.
       if (products.length === 50) {
-        const page2Url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
-        const page2Opts = { ...safewayOpts, signal: AbortSignal.timeout(15000) };
-        const res2 = await fetchRetry(page2Url, page2Opts);
-        if (res2.ok) {
-          const data2 = await res2.json();
-          matchSafewayProducts(data2?.primaryProducts?.response?.docs || []);
+        try {
+          const page2Url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
+          const page2Opts = { ...safewayOpts, signal: AbortSignal.timeout(15000) };
+          const res2 = await fetchRetry(page2Url, page2Opts);
+          if (res2.ok) {
+            const data2 = await res2.json();
+            matchSafewayProducts(data2?.primaryProducts?.response?.docs || []);
+          }
+        } catch (p2Err) {
+          console.warn(`[safeway:${store.storeId}] Page 2 failed for "${query}": ${p2Err.message}`);
         }
       }
-      trackHealth("safeway", "ok");
     } catch (err) {
       console.error(`[safeway:${store.storeId}] Error searching "${query}": ${err.message}`);
       trackHealth("safeway", "fail");
@@ -2362,6 +2503,7 @@ export function _setScanCounter(n) { scanCounter = n; }
 export function _getScanCounter() { return scanCounter; }
 export function _resetRetailerFailures() { for (const k of Object.keys(retailerFailures)) delete retailerFailures[k]; }
 export function _resetKnownProducts() { knownProducts = {}; }
+export function _getKnownProducts() { return knownProducts; }
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
