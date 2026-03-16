@@ -1167,11 +1167,14 @@ describe("buildSummaryEmbed", () => {
       totalGoneOOS: 0, nothingCount: 5, durationSec: 60, health,
     });
     expect(embed.fields).toBeDefined();
-    expect(embed.fields.length).toBe(2);
-    expect(embed.fields[0].name).toBe("Costco");
-    expect(embed.fields[0].value).toContain("✅");
-    expect(embed.fields[0].value).toContain("14/14");
-    expect(embed.fields[0].inline).toBe(true);
+    expect(embed.fields.length).toBe(7); // All 7 retailers always shown
+    const costco = embed.fields.find((f) => f.name === "Costco");
+    expect(costco.value).toContain("✅");
+    expect(costco.value).toContain("14/14");
+    expect(costco.inline).toBe(true);
+    // Retailers with no health data shown as skipped
+    const totalwine = embed.fields.find((f) => f.name === "Total Wine");
+    expect(totalwine.value).toContain("⏭️");
   });
 
   it("shows warning emoji for degraded scraper (25-74%)", () => {
@@ -1206,7 +1209,8 @@ describe("buildSummaryEmbed", () => {
       storesScanned: 1, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
       totalGoneOOS: 0, nothingCount: 1, durationSec: 30, health, canaryResults,
     });
-    expect(embed.fields[0].value).toContain("🐤");
+    const kroger = embed.fields.find((f) => f.name === "Kroger");
+    expect(kroger.value).toContain("🐤");
   });
 
   it("omits canary emoji when canary not found", () => {
@@ -1215,18 +1219,24 @@ describe("buildSummaryEmbed", () => {
       storesScanned: 1, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
       totalGoneOOS: 0, nothingCount: 1, durationSec: 30, health,
     });
-    expect(embed.fields[0].value).not.toContain("🐤");
+    const kroger = embed.fields.find((f) => f.name === "Kroger");
+    expect(kroger.value).not.toContain("🐤");
   });
 
-  it("omits fields when no health data", () => {
+  it("shows all 7 retailers as skipped when no health data", () => {
     const embed = buildSummaryEmbed({
       storesScanned: 5, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
       totalGoneOOS: 0, nothingCount: 5, durationSec: 60,
     });
-    expect(embed.fields).toBeUndefined();
+    expect(embed.fields).toBeDefined();
+    expect(embed.fields.length).toBe(7);
+    for (const f of embed.fields) {
+      expect(f.value).toContain("⏭️");
+      expect(f.inline).toBe(true);
+    }
   });
 
-  it("orders fields by retailer registry order", () => {
+  it("orders fields by retailer registry order (all 7 always present)", () => {
     const health = {
       samsclub: { queries: 8, succeeded: 8, failed: 0, blocked: 0 },
       walgreens: { queries: 14, succeeded: 14, failed: 0, blocked: 0 },
@@ -1237,7 +1247,13 @@ describe("buildSummaryEmbed", () => {
       storesScanned: 4, retailersScanned: 4, totalNewFinds: 0, totalStillInStock: 0,
       totalGoneOOS: 0, nothingCount: 4, durationSec: 60, health,
     });
-    expect(embed.fields.map((f) => f.name)).toEqual(["Costco", "Kroger", "Walgreens", "Sam's Club"]);
+    expect(embed.fields.map((f) => f.name)).toEqual(["Costco", "Total Wine", "Walmart", "Kroger", "Safeway", "Walgreens", "Sam's Club"]);
+    // Retailers with health data show real stats
+    expect(embed.fields.find((f) => f.name === "Costco").value).toContain("✅");
+    // Retailers without health data show skipped
+    expect(embed.fields.find((f) => f.name === "Total Wine").value).toContain("⏭️");
+    expect(embed.fields.find((f) => f.name === "Walmart").value).toContain("⏭️");
+    expect(embed.fields.find((f) => f.name === "Safeway").value).toContain("⏭️");
   });
 
   it("shows Sam's Club health with canary in summary", () => {
@@ -5028,7 +5044,7 @@ describe("computeChanges edge cases", () => {
 // ─── buildSummaryEmbed zero-query health entry ───────────────────────────────
 
 describe("buildSummaryEmbed with zero-query health", () => {
-  it("shows error emoji for retailer with zero queries tracked (no NaN)", () => {
+  it("shows skipped indicator for retailer with zero queries tracked (no NaN)", () => {
     const health = { kroger: { queries: 0, succeeded: 0, failed: 0, blocked: 0 } };
     const embed = buildSummaryEmbed({
       storesScanned: 5, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
@@ -5036,7 +5052,7 @@ describe("buildSummaryEmbed with zero-query health", () => {
     });
     const field = embed.fields?.find(f => f.name.includes("Kroger"));
     expect(field).toBeDefined();
-    expect(field.value).toContain("0/0");
+    expect(field.value).toContain("⏭️");
     expect(field.value).not.toContain("NaN");
     expect(field.value).not.toContain("Infinity");
   });
@@ -5185,7 +5201,7 @@ describe("Walgreens zipToCoords validation", () => {
     _resetWalgreensCoords();
   });
 
-  it("returns empty when zipToCoords returns null lat/lng", async () => {
+  it("returns empty and tracks health when zipToCoords returns null lat/lng", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -5194,6 +5210,25 @@ describe("Walgreens zipToCoords validation", () => {
 
     const result = await runWithFakeTimers(() => scrapeWalgreensStore());
     expect(result).toEqual([]);
+    // Walgreens should still appear in health data so it shows in the summary embed
+    const health = _getScraperHealth();
+    expect(health.walgreens).toBeDefined();
+    expect(health.walgreens.failed).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+  });
+
+  it("returns empty and tracks health when zipToCoords throws", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.zipToCoords.mockRejectedValue(new Error("DNS failure"));
+    setupMockBrowser();
+
+    const result = await runWithFakeTimers(() => scrapeWalgreensStore());
+    expect(result).toEqual([]);
+    const health = _getScraperHealth();
+    expect(health.walgreens).toBeDefined();
+    expect(health.walgreens.failed).toBeGreaterThanOrEqual(1);
     vi.restoreAllMocks();
   });
 });

@@ -645,13 +645,17 @@ function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, tot
   }
 
   // Build health fields: one inline field per retailer (3 per row in Discord)
+  // Always show all 7 retailers — skipped or crashed retailers get a "⏭️ —" indicator
   const fields = [];
   for (const key of RETAILER_ORDER) {
     const h = health[key];
-    if (!h) continue;
-    const pct = h.queries > 0 ? h.succeeded / h.queries : 0;
-    const emoji = pct >= 0.75 ? "✅" : pct >= 0.25 ? "⚠️" : "❌";
     const canary = canaryResults[key] ? " 🐤" : "";
+    if (!h || h.queries === 0) {
+      fields.push({ name: RETAILER_LABELS[key] || key, value: `⏭️ —${canary}`, inline: true });
+      continue;
+    }
+    const pct = h.succeeded / h.queries;
+    const emoji = pct >= 0.75 ? "✅" : pct >= 0.25 ? "⚠️" : "❌";
     fields.push({ name: RETAILER_LABELS[key] || key, value: `${emoji} ${h.succeeded}/${h.queries}${canary}`, inline: true });
   }
 
@@ -1772,11 +1776,13 @@ async function scrapeWalgreensViaBrowser(page) {
       const coords = await zipToCoords(ZIP_CODE);
       if (coords?.lat == null || coords?.lng == null) {
         console.warn(`[walgreens] zipToCoords returned invalid coords — skipping`);
+        trackHealth("walgreens", "fail");
         return [];
       }
       walgreensCoords = coords;
     } catch (err) {
       console.warn(`[walgreens] Failed to resolve zip ${ZIP_CODE}: ${err.message} — skipping`);
+      trackHealth("walgreens", "fail");
       return [];
     }
   }
