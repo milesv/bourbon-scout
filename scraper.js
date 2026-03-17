@@ -1363,11 +1363,13 @@ async function scrapeCostcoStore() {
     return fetchResult;
   }
 
-  // Fetch blocked or no proxy — fall back to browser
-  console.log("[costco] Fetch blocked, using browser (dedicated IP)");
+  // Fetch blocked or no proxy — fall back to clean browser (no stealth/rebrowser).
+  // Akamai detects stealth plugin CDP modifications the same way PerimeterX does.
+  const useHeaded = IS_MAC;
+  console.log(`[costco] Fetch blocked, using clean browser (direct IP${useHeaded ? ", headed" : ""})`);
   let page;
   try {
-    ({ page } = await launchRetailerBrowser("costco"));
+    ({ page } = await launchRetailerBrowser("costco", { clean: true, headless: !useHeaded }));
   } catch (err) {
     console.error(`[costco] Browser launch failed: ${err.message}`);
     trackHealth("costco", "fail");
@@ -1539,19 +1541,22 @@ async function searchViaSearchBox(page, query, storeId) {
   return false; // no search box found
 }
 
-async function scrapeTotalWineViaBrowser(store, page) {
-  // Pre-warm: visit homepage to let PerimeterX sensor collect behavioral telemetry.
+async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = {}) {
   const t0 = Date.now();
   const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
-  await page.goto("https://www.totalwine.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
-  console.log(`[totalwine:${store.storeId}] Homepage loaded (${elapsed()})`);
-  await sleep(3000 + Math.random() * 2000);
-  // Solve PerimeterX "Press & Hold" if it appears on homepage
-  await solveHumanChallenge(page);
-  await humanizePage(page);
-  console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), navigating to category...`);
-  await navigateCategory(page, "totalwine");
-  console.log(`[totalwine:${store.storeId}] Category done (${elapsed()}), starting queries...`);
+  if (!skipPreWarm) {
+    // Pre-warm: visit homepage to let PerimeterX sensor collect behavioral telemetry.
+    await page.goto("https://www.totalwine.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+    console.log(`[totalwine:${store.storeId}] Homepage loaded (${elapsed()})`);
+    await sleep(3000 + Math.random() * 2000);
+    await solveHumanChallenge(page);
+    await humanizePage(page);
+    console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), navigating to category...`);
+    await navigateCategory(page, "totalwine");
+    console.log(`[totalwine:${store.storeId}] Category done (${elapsed()}), starting queries...`);
+  } else {
+    console.log(`[totalwine:${store.storeId}] Skipping pre-warm (context already warm)`);
+  }
 
   const found = [];
   const queries = shuffle(getQueriesForScan(SEARCH_QUERIES));
@@ -1663,12 +1668,9 @@ async function scrapeTotalWineViaBrowser(store, page) {
 // Proxy browser tier removed — PerimeterX always blocks proxy IPs, wasting 180s per store.
 // Direct residential IP browser (headed on Mac) is the only browser fallback.
 async function scrapeTotalWineStore(store) {
-  // Try fetch-first with got-scraping (Chrome TLS fingerprint)
-  const fetchResult = await scrapeTotalWineViaFetch(store);
-  if (fetchResult !== null) {
-    console.log(`[totalwine:${store.storeId}] ✓ fast fetch succeeded`);
-    return fetchResult;
-  }
+  // Fetch-first disabled — PerimeterX blocks got-scraping even with proxy (requires JS sensor
+  // execution). The clean browser path works reliably so skip the fetch to save ~10s per store.
+  // The fetch function is retained for future use if PerimeterX relaxes fetch blocking.
 
   // Fail-fast: if browser already blocked this poll, skip remaining stores
   if (retailerBrowserBlocked["totalwine"]) {
@@ -1680,7 +1682,10 @@ async function scrapeTotalWineStore(store) {
   // Direct residential IP browser (no proxy). On Mac, use headless: false to defeat
   // PerimeterX headless detection at the cost of a visible Chrome window.
   const useHeaded = IS_MAC;
-  console.log(`[totalwine:${store.storeId}] Fetch blocked, queuing browser (direct IP${useHeaded ? ", headed" : ""})`);
+  // Skip pre-warm if the persistent context was already warmed by a previous store this poll.
+  // Mutex ensures stores run sequentially, so the context cookies persist across stores.
+  const skipPreWarm = !!retailerBrowserCache["totalwine"];
+  console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP${useHeaded ? ", headed" : ""}${skipPreWarm ? ", warm" : ""})`);
   const releaseLock = await acquireRetailerLock("totalwine");
   let page;
   try {
@@ -1693,7 +1698,7 @@ async function scrapeTotalWineStore(store) {
     return [];
   }
   try {
-    const scraperPromise = scrapeTotalWineViaBrowser(store, page);
+    const scraperPromise = scrapeTotalWineViaBrowser(store, page, { skipPreWarm });
     scraperPromise.catch(() => {});
     const result = await withTimeout(scraperPromise, 180000, null);
     if (result === null) {
@@ -2318,10 +2323,11 @@ async function scrapeSamsClubStore() {
     console.log("[samsclub] Used fast fetch mode (proxied)");
     return fetchResult;
   }
-  console.log("[samsclub] Fetch blocked, using browser (dedicated IP)");
+  const useHeaded = IS_MAC;
+  console.log(`[samsclub] Fetch blocked, using clean browser (direct IP${useHeaded ? ", headed" : ""})`);
   let page;
   try {
-    ({ page } = await launchRetailerBrowser("samsclub"));
+    ({ page } = await launchRetailerBrowser("samsclub", { clean: true, headless: !useHeaded }));
   } catch (err) {
     console.error(`[samsclub] Browser launch failed: ${err.message}`);
     trackHealth("samsclub", "fail");
@@ -2680,14 +2686,12 @@ async function poll() {
         });
       }
     } /* v8 ignore stop */ else {
-      // API/fetch-based scrapers (with possible browser fallback): stagger each store
-      // to avoid concurrent pages on the same browser context if fetch fails.
+      // API/fetch-based scrapers (with possible browser fallback). Browser concurrency
+      // is handled by acquireRetailerLock, so only light staggering needed for fetch.
       for (const [si, store] of stores.entries()) {
         tasks.push(async () => {
-          // First store gets the retailer stagger; subsequent stores wait 30-60s each
-          // to avoid piling into the browser context simultaneously after fetch failures
           if (si === 0 && staggerMs) await sleep(staggerMs);
-          else if (si > 0) await sleep(si * (30000 + Math.floor(Math.random() * 30000)));
+          else if (si > 0) await sleep(si * (2000 + Math.floor(Math.random() * 3000)));
           try {
             console.log(`[poll] Checking ${retailer.name} — ${store.name}...`);
             const inStock = await retailer.scraper(store);

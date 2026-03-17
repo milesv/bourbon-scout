@@ -316,13 +316,12 @@ describe("proxy support", () => {
     expect(found).toBeNull();
   });
 
-  it("scrapeTotalWineStore wrapper tries fetch-first then falls back to browser", async () => {
-    // With PROXY_URL set, fetch-first runs but default mock returns empty HTML (no INITIAL_STATE)
-    // → all queries fail to find INITIAL_STATE → returns null → falls back to browser
+  it("scrapeTotalWineStore wrapper goes straight to browser (fetch disabled)", async () => {
+    // Fetch-first disabled — PerimeterX always blocks got-scraping. Goes straight to browser.
     setupMockBrowser();
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("queuing browser"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Queuing browser"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });
