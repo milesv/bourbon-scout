@@ -31,7 +31,7 @@ vi.mock("dotenv/config", () => ({}));
 vi.mock("node-fetch", () => ({ default: mocks.fetch }));
 vi.mock("got-scraping", () => ({ gotScraping: mocks.gotScraping }));
 vi.mock("rebrowser-playwright-core", () => ({
-  chromium: {},
+  chromium: { launchPersistentContext: mocks.chromiumLaunchPersistentContext },
 }));
 vi.mock("playwright-extra", () => ({
   addExtra: () => ({ use: mocks.chromiumUse, launch: mocks.chromiumLaunch, launchPersistentContext: mocks.chromiumLaunchPersistentContext }),
@@ -78,6 +78,7 @@ import {
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
   _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
   _resetRetailerFailures, _resetKnownProducts, _getKnownProducts,
+  acquireRetailerLock, _resetRetailerBrowserLocks, _resetRetailerBrowserBlocked,
 } from "../scraper.js";
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────
@@ -135,6 +136,8 @@ beforeEach(() => {
   mocks.gotScraping.mockResolvedValue(mockGotResponse(200, "<html></html>"));
   _resetKrogerToken();
   _resetRetailerBrowserCache();
+  _resetRetailerBrowserLocks();
+  _resetRetailerBrowserBlocked();
   _resetRetailerFailures();
   _resetKnownProducts();
 });
@@ -1965,7 +1968,7 @@ describe("scrapeCostcoStore wrapper", () => {
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeCostcoStore());
     // No PROXY_URL in scraper.test.js → fetch returns null → falls back to browser
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("browser"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });
@@ -1977,7 +1980,7 @@ describe("scrapeTotalWineStore wrapper", () => {
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
     // No PROXY_URL in scraper.test.js → fetch returns null → falls back to browser
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("browser"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });
@@ -2838,7 +2841,7 @@ describe("scrapeSamsClubStore wrapper", () => {
     mocks.readFile.mockRejectedValue(new Error("no file"));
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeSamsClubStore());
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("browser"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
     await closeBrowser();
@@ -5295,5 +5298,36 @@ describe("parseSize L normalization", () => {
 
   it("handles integer L values", () => {
     expect(parseSize("Bourbon 1L")).toBe("1L");
+  });
+});
+
+// ─── Per-retailer browser mutex (acquireRetailerLock) ───────────────────────
+
+describe("acquireRetailerLock", () => {
+  it("serializes concurrent callers for the same retailer", async () => {
+    vi.useRealTimers(); // mutex uses real promises, not fake timers
+    const order = [];
+    const release1 = await acquireRetailerLock("totalwine");
+    // Caller 2 should be blocked until caller 1 releases
+    const caller2 = acquireRetailerLock("totalwine").then((release) => {
+      order.push("caller2-acquired");
+      release();
+    });
+    order.push("caller1-acquired");
+    // Small delay to confirm caller 2 hasn't run yet
+    await new Promise((r) => setTimeout(r, 10));
+    expect(order).toEqual(["caller1-acquired"]);
+    release1();
+    await caller2;
+    expect(order).toEqual(["caller1-acquired", "caller2-acquired"]);
+  });
+
+  it("allows concurrent callers for different retailers", async () => {
+    vi.useRealTimers();
+    const release1 = await acquireRetailerLock("totalwine");
+    const release2 = await acquireRetailerLock("walmart");
+    // Both acquired immediately — different retailers don't block each other
+    release1();
+    release2();
   });
 });

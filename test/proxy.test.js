@@ -44,7 +44,7 @@ vi.mock("dotenv/config", () => ({}));
 vi.mock("node-fetch", () => ({ default: mocks.fetch }));
 vi.mock("got-scraping", () => ({ gotScraping: mocks.gotScraping }));
 vi.mock("rebrowser-playwright-core", () => ({
-  chromium: {},
+  chromium: { launchPersistentContext: mocks.chromiumLaunchPersistentContext },
 }));
 vi.mock("playwright-extra", () => ({
   addExtra: () => ({ use: mocks.chromiumUse, launch: mocks.chromiumLaunch, launchPersistentContext: mocks.chromiumLaunchPersistentContext }),
@@ -322,7 +322,7 @@ describe("proxy support", () => {
     setupMockBrowser();
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Fetch blocked, using browser"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("queuing browser"));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });

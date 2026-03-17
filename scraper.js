@@ -871,7 +871,6 @@ async function launchBrowser() {
       "--disable-blink-features=AutomationControlled",
       "--disable-dev-shm-usage",
       "--no-first-run",
-      "--disable-extensions",
       "--disable-component-update",
     ],
     ignoreDefaultArgs: ["--enable-automation"],
@@ -902,10 +901,30 @@ async function closeBrowser() {
 // Between polls, profile data persists even after context.close().
 const retailerBrowserCache = {};
 
+// Per-retailer browser-blocked flag: set when a browser scrape fails (blocked/timeout).
+// Remaining stores skip browser fallback for this poll — if one store is blocked,
+// the rest will be too (same IP, same profile, same PerimeterX fingerprint).
+const retailerBrowserBlocked = {};
+
+// Per-retailer mutex: serializes browser scraping so only one store at a time
+// uses a retailer's shared browser context. Without this, multiple stores open
+// concurrent pages on the same context — PerimeterX/Akamai flag multiple
+// simultaneous search sessions from one browser fingerprint as bot behavior.
+const retailerBrowserLocks = {};
+function acquireRetailerLock(retailerKey) {
+  const prev = retailerBrowserLocks[retailerKey] || Promise.resolve();
+  let release;
+  const lock = new Promise((resolve) => { release = resolve; });
+  retailerBrowserLocks[retailerKey] = prev.then(() => lock);
+  return prev.then(() => release);
+}
+
 // Launch (or reuse) a persistent browser context with a retailer-specific proxy IP.
 // Uses launchPersistentContext to maintain a full Chrome profile on disk per retailer.
 // Returns { page } — caller should close the PAGE when done (not the context).
-async function launchRetailerBrowser(retailerKey) {
+// opts.headless: override headless mode (default true). Use false for PerimeterX-heavy
+// sites on Mac — fully defeats headless detection at the cost of a visible window.
+async function launchRetailerBrowser(retailerKey, opts = {}) {
   // Reuse existing persistent context if available
   if (retailerBrowserCache[retailerKey]) {
     try {
@@ -941,12 +960,11 @@ async function launchRetailerBrowser(retailerKey) {
   const viewport = viewports[Math.floor(Math.random() * viewports.length)];
 
   const contextOpts = {
-    headless: true,
+    headless: opts.headless !== undefined ? opts.headless : true,
     args: [
       "--disable-blink-features=AutomationControlled",
       "--disable-dev-shm-usage",
       "--no-first-run",
-      "--disable-extensions",
       "--disable-component-update",
     ],
     ignoreDefaultArgs: ["--enable-automation"],
@@ -963,7 +981,11 @@ async function launchRetailerBrowser(retailerKey) {
   const proxyConfig = getRetailerBrowserProxy(retailerKey);
   if (proxyConfig) contextOpts.proxy = proxyConfig;
 
-  const context = await chromium.launchPersistentContext(profileDir, contextOpts);
+  // Clean mode: skip stealth plugin + rebrowser patches.
+  // PerimeterX detects CDP modifications from addExtra/stealth and flags as automation.
+  // Plain chromium with --disable-blink-features=AutomationControlled passes undetected.
+  const launcher = opts.clean ? rebrowserChromium : chromium;
+  const context = await launcher.launchPersistentContext(profileDir, contextOpts);
   retailerBrowserCache[retailerKey] = { context };
   const page = await context.newPage();
   return { page };
@@ -985,6 +1007,16 @@ async function closeRetailerBrowsers() {
 // Run after homepage pre-warm navigation completes.
 async function humanizePage(page) {
   try {
+    // Random mouse movements before scrolling (PerimeterX tracks mouse telemetry)
+    const viewport = page.viewportSize() || { width: 1366, height: 768 };
+    for (let i = 0; i < 2 + Math.floor(Math.random() * 3); i++) {
+      await page.mouse.move(
+        100 + Math.random() * (viewport.width - 200),
+        100 + Math.random() * (viewport.height - 200),
+        { steps: 5 + Math.floor(Math.random() * 10) }, // multi-step = realistic curve
+      );
+      await sleep(200 + Math.random() * 300);
+    }
     // Scroll down slowly (2-3 viewport heights)
     const scrollSteps = 2 + Math.floor(Math.random() * 2);
     for (let i = 0; i < scrollSteps; i++) {
@@ -1067,11 +1099,72 @@ async function isBlockedPage(page) {
     return true;
   }
   // Check body text for challenges that use normal-looking titles
-  const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 5000) || "").catch(() => "");
+  const bodyText = String(await page.evaluate(() => document.body?.innerText?.slice(0, 5000) || "").catch(() => ""));
   const bodyLower = bodyText.toLowerCase();
   return bodyLower.includes("please verify") || bodyLower.includes("are you a robot") ||
     bodyLower.includes("security check") || bodyLower.includes("one more step") ||
-    bodyLower.includes("checking your browser");
+    bodyLower.includes("checking your browser") || bodyLower.includes("press & hold");
+}
+
+// Detect and solve PerimeterX "Press & Hold" challenge.
+// PerimeterX renders the button via captcha.js inside #px-captcha — the "Press & Hold"
+// text is drawn by the script (canvas/shadow DOM), not as a regular DOM element.
+// Returns true if a challenge was found and solved, false otherwise.
+async function solveHumanChallenge(page) {
+  try {
+    const bodyText = String(await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || "").catch(() => ""));
+    if (!bodyText.includes("Press & Hold")) return false;
+
+    console.log("[bot] Detected Press & Hold challenge — solving...");
+
+    // PerimeterX always uses #px-captcha as the container
+    const target = await page.$("#px-captcha").catch(() => null);
+    if (!target) {
+      console.warn("[bot] #px-captcha not found — cannot solve");
+      return false;
+    }
+
+    const box = await target.boundingBox();
+    if (!box) {
+      console.warn("[bot] #px-captcha has no bounding box");
+      return false;
+    }
+
+    // The "Press & Hold" button is rendered inside #px-captcha. Click its center.
+    // Move mouse naturally, then press and hold for 3-5 seconds.
+    const cx = box.x + box.width / 2 + (Math.random() * 10 - 5);
+    const cy = box.y + box.height / 2 + (Math.random() * 6 - 3);
+    await page.mouse.move(cx, cy, { steps: 15 + Math.floor(Math.random() * 10) });
+    await sleep(300 + Math.random() * 400);
+
+    await page.mouse.down();
+    const holdMs = 3000 + Math.random() * 2000;
+    console.log(`[bot] Holding for ${(holdMs / 1000).toFixed(1)}s...`);
+    await sleep(holdMs);
+    await page.mouse.up();
+
+    // Wait for challenge to verify and page to navigate/reload
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }),
+      sleep(15000),
+    ]).catch(() => {});
+    await sleep(1500 + Math.random() * 1000);
+
+    // Check if challenge resolved
+    const stillBlocked = await page.evaluate(() =>
+      (document.body?.innerText || "").includes("Press & Hold"),
+    ).catch(() => true);
+
+    if (!stillBlocked) {
+      console.log("[bot] Challenge solved successfully");
+      return true;
+    }
+    console.warn("[bot] Challenge still present after attempt");
+    return false;
+  } catch (err) {
+    console.warn(`[bot] Challenge solve error: ${err.message}`);
+    return false;
+  }
 }
 
 // ─── Costco: fetch-first with browser fallback ──────────────────────────────
@@ -1134,14 +1227,15 @@ async function scrapeCostcoViaFetch() {
   } catch { /* continue without cookies */ }
 
   // SOCKS5 proxies (e.g. NordVPN) cap concurrent connections — go sequential.
-  const concurrency = PROXY_URL?.startsWith("socks") ? 1 : 4;
+  // HTTP proxies use 2 concurrent (down from 4) to reduce Akamai burst detection.
+  const concurrency = PROXY_URL?.startsWith("socks") ? 1 : 2;
 
   // Batch queries with adaptive concurrency
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) { trackHealth("costco", "blocked"); return; }
-    // Inter-query delay with jitter to reduce burst detection
-    if (i > 0) await sleep(1000 + Math.random() * 1000);
+    // Inter-query delay with jitter to reduce Akamai burst detection
+    if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     const headers = { ...FETCH_HEADERS };
     if (cookies) headers["Cookie"] = cookies;
@@ -1186,6 +1280,7 @@ async function scrapeCostcoOnce(page) {
   // Use networkidle + longer dwell so sensor scripts fully execute and phone home.
   await page.goto("https://www.costco.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
+  await solveHumanChallenge(page);
   await humanizePage(page);
   await navigateCategory(page, "costco");
 
@@ -1194,21 +1289,28 @@ async function scrapeCostcoOnce(page) {
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      const tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 15000 }).then(() => true).catch(() => false);
-      if (!tilesLoaded) {
-        if (await isBlockedPage(page)) {
+      let tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 15000 }).then(() => true).catch(() => false);
+      // If blocked, try solving the PerimeterX challenge and retry the query
+      if (!tilesLoaded && await isBlockedPage(page)) {
+        const solved = await solveHumanChallenge(page);
+        if (solved) {
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+          tilesLoaded = await page.waitForSelector('[data-testid^="ProductTile_"]', { timeout: 15000 }).then(() => true).catch(() => false);
+        }
+        if (!tilesLoaded) {
           console.warn(`[costco] Bot detection page for query "${query}" — skipping`);
           trackHealth("costco", "blocked");
+          continue;
+        }
+      }
+      if (!tilesLoaded) {
+        // No tiles and not blocked — could be a degraded page or JS failed to hydrate.
+        const hasContent = await page.$('main, [data-testid="search-results"], [data-testid="no-results"]').then(el => !!el).catch(() => false);
+        if (hasContent) {
+          trackHealth("costco", "ok"); // Genuine empty result
         } else {
-          // No tiles and not blocked — could be a degraded page or JS failed to hydrate.
-          // Check for any content that suggests a real (empty) search result vs broken page.
-          const hasContent = await page.$('main, [data-testid="search-results"], [data-testid="no-results"]').then(el => !!el).catch(() => false);
-          if (hasContent) {
-            trackHealth("costco", "ok"); // Genuine empty result
-          } else {
-            console.warn(`[costco] No tiles and no content for query "${query}" — marking degraded`);
-            trackHealth("costco", "blocked");
-          }
+          console.warn(`[costco] No tiles and no content for query "${query}" — marking degraded`);
+          trackHealth("costco", "blocked");
         }
         continue;
       }
@@ -1328,14 +1430,33 @@ async function scrapeTotalWineViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  // Batch queries (4 concurrent) — balances speed vs PerimeterX detection risk
+
+  // Pre-warm: fetch homepage to get PerimeterX session cookies (_px3, _px2, _pxvid).
+  // Without these cookies, search URLs immediately return a PerimeterX challenge page.
+  // Same pattern as Costco's successful fetch pre-warm.
+  let cookies = "";
+  try {
+    const homeRes = await scraperFetchRetry("https://www.totalwine.com/", {
+      headers: FETCH_HEADERS,
+      timeout: 10000,
+      proxyUrl: twProxy,
+    });
+    const rawSetCookie = homeRes.headers["set-cookie"];
+    const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
+    cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
+  } catch { /* continue without cookies */ }
+
+  // Batch queries (2 concurrent) — lower concurrency reduces PerimeterX burst detection.
+  // With 4 stores potentially running fetch simultaneously, even 2 concurrent queries
+  // per store means up to 8 total requests hitting totalwine.com at once.
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) { trackHealth("totalwine", "blocked"); return; }
-    // Inter-query delay with jitter to reduce burst detection (matches Costco/Sam's Club fetch)
-    if (i > 0) await sleep(1000 + Math.random() * 1000);
+    // Inter-query delay with jitter to reduce burst detection
+    if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
     const headers = { ...FETCH_HEADERS };
+    if (cookies) headers["Cookie"] = cookies;
     if (i > 0) {
       headers["Sec-Fetch-Site"] = "same-origin";
       headers["Referer"] = "https://www.totalwine.com/";
@@ -1370,7 +1491,7 @@ async function scrapeTotalWineViaFetch(store) {
       trackHealth("totalwine", "fail");
     }
   });
-  await runWithConcurrency(queryTasks, 4);
+  await runWithConcurrency(queryTasks, 2);
   // Require at least 25% of queries to succeed — a single valid page shouldn't
   // suppress browser fallback when most queries were blocked
   const minValid = Math.max(1, Math.ceil(queryTasks.length / 4));
@@ -1380,27 +1501,95 @@ async function scrapeTotalWineViaFetch(store) {
 
 // Browser-based Total Wine scraper (fallback). Accepts a shared Playwright page.
 // Product data is in window.INITIAL_STATE.search.results.products (structured JSON).
+// Search via the search box (generates keyboard/click events for PerimeterX telemetry).
+// Falls back to direct URL navigation if the search box can't be found.
+async function searchViaSearchBox(page, query, storeId) {
+  // Try multiple common search input selectors
+  const searchSelectors = [
+    'input[data-testid="search-input"]',
+    'input[name="searchTerm"]',
+    'input[type="search"]',
+    'input[placeholder*="Search"]',
+    'input[aria-label*="Search"]',
+    '#header-search-input',
+  ];
+  for (const selector of searchSelectors) {
+    try {
+      const input = await page.$(selector);
+      if (!input) continue;
+      await input.click();
+      await sleep(300 + Math.random() * 300);
+      // Triple-click to select all existing text, then type over it
+      await input.click({ clickCount: 3 });
+      await sleep(200 + Math.random() * 200);
+      // Type with realistic per-key delay (50-120ms between keystrokes)
+      await page.keyboard.type(query, { delay: 50 + Math.random() * 70 });
+      await sleep(500 + Math.random() * 500);
+      await page.keyboard.press("Enter");
+      // Wait for search results page to load
+      await page.waitForURL(/search/, { timeout: 15000 }).catch(() => {});
+      // Ensure storeId is in URL (Total Wine filters by store)
+      if (storeId && !page.url().includes(`storeId=${storeId}`)) {
+        const sep = page.url().includes("?") ? "&" : "?";
+        await page.goto(`${page.url()}${sep}storeId=${storeId}`, { waitUntil: "domcontentloaded", timeout: 15000 });
+      }
+      return true; // search box approach succeeded
+    } catch { continue; }
+  }
+  return false; // no search box found
+}
+
 async function scrapeTotalWineViaBrowser(store, page) {
-  // Pre-warm: visit homepage to let PerimeterX sensor set cookies before searching.
+  // Pre-warm: visit homepage to let PerimeterX sensor collect behavioral telemetry.
+  const t0 = Date.now();
+  const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
   await page.goto("https://www.totalwine.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  console.log(`[totalwine:${store.storeId}] Homepage loaded (${elapsed()})`);
   await sleep(3000 + Math.random() * 2000);
+  // Solve PerimeterX "Press & Hold" if it appears on homepage
+  await solveHumanChallenge(page);
   await humanizePage(page);
+  console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), navigating to category...`);
   await navigateCategory(page, "totalwine");
+  console.log(`[totalwine:${store.storeId}] Category done (${elapsed()}), starting queries...`);
 
   const found = [];
-  for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
+  const queries = shuffle(getQueriesForScan(SEARCH_QUERIES));
+  for (let qi = 0; qi < queries.length; qi++) {
+    const query = queries[qi];
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      // First query: use search box to generate keyboard events for PerimeterX telemetry.
+      // Subsequent queries: direct URL navigation (like a user refining search).
+      if (qi === 0) {
+        const usedSearchBox = await searchViaSearchBox(page, query, store.storeId);
+        if (!usedSearchBox) {
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        }
+      } else {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      }
       await page.waitForFunction(
         () => !!window.INITIAL_STATE?.search?.results,
         { timeout: 10000 }
       ).catch(() => {});
 
       if (await isBlockedPage(page)) {
-        console.warn(`[totalwine:${store.storeId}] Bot detection page for query "${query}" — skipping`);
-        trackHealth("totalwine", "blocked");
-        continue;
+        // Try to solve PerimeterX "Press & Hold" challenge before giving up
+        const solved = await solveHumanChallenge(page);
+        if (solved) {
+          // Challenge solved — reload the search page to get real results
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+          await page.waitForFunction(
+            () => !!window.INITIAL_STATE?.search?.results,
+            { timeout: 10000 },
+          ).catch(() => {});
+        }
+        if (!solved || (await isBlockedPage(page))) {
+          console.warn(`[totalwine:${store.storeId}] Bot detection page for query "${query}" — skipping`);
+          trackHealth("totalwine", "blocked");
+          continue;
+        }
       }
 
       // Extract INITIAL_STATE from browser context
@@ -1471,6 +1660,8 @@ async function scrapeTotalWineViaBrowser(store, page) {
 // Wrapper: try got-scraping fetch-first (Chrome TLS fingerprint), fall back to browser.
 // PerimeterX injects sensor JS (_px* cookies) that requires a real browser, but got-scraping
 // may pass the initial requests before sensors detect it — worth trying for speed.
+// Proxy browser tier removed — PerimeterX always blocks proxy IPs, wasting 180s per store.
+// Direct residential IP browser (headed on Mac) is the only browser fallback.
 async function scrapeTotalWineStore(store) {
   // Try fetch-first with got-scraping (Chrome TLS fingerprint)
   const fetchResult = await scrapeTotalWineViaFetch(store);
@@ -1479,28 +1670,46 @@ async function scrapeTotalWineStore(store) {
     return fetchResult;
   }
 
-  // Fetch blocked or no proxy — fall back to browser
-  console.log(`[totalwine:${store.storeId}] Fetch blocked, using browser (dedicated IP)`);
+  // Fail-fast: if browser already blocked this poll, skip remaining stores
+  if (retailerBrowserBlocked["totalwine"]) {
+    console.log(`[totalwine:${store.storeId}] Skipping browser — blocked earlier this poll`);
+    trackHealth("totalwine", "blocked");
+    return [];
+  }
+
+  // Direct residential IP browser (no proxy). On Mac, use headless: false to defeat
+  // PerimeterX headless detection at the cost of a visible Chrome window.
+  const useHeaded = IS_MAC;
+  console.log(`[totalwine:${store.storeId}] Fetch blocked, queuing browser (direct IP${useHeaded ? ", headed" : ""})`);
+  const releaseLock = await acquireRetailerLock("totalwine");
   let page;
   try {
-    ({ page } = await launchRetailerBrowser("totalwine"));
+    ({ page } = await launchRetailerBrowser("totalwine", { headless: !useHeaded, clean: true }));
   } catch (err) {
     console.error(`[totalwine:${store.storeId}] Browser launch failed: ${err.message}`);
     trackHealth("totalwine", "fail");
+    retailerBrowserBlocked["totalwine"] = true;
+    releaseLock();
     return [];
   }
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page);
-    scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
+    scraperPromise.catch(() => {});
     const result = await withTimeout(scraperPromise, 180000, null);
     if (result === null) {
-      console.warn(`[totalwine:${store.storeId}] Browser scraper timed out (180s)`);
+      console.warn(`[totalwine:${store.storeId}] Browser timed out (180s)`);
       trackHealth("totalwine", "blocked");
+      retailerBrowserBlocked["totalwine"] = true;
       return [];
+    }
+    const twHealth = scraperHealth["totalwine"];
+    if (twHealth && twHealth.queries > 0 && twHealth.blocked >= twHealth.queries * 0.75) {
+      retailerBrowserBlocked["totalwine"] = true;
     }
     return result;
   } finally {
     await page.close().catch(() => {});
+    releaseLock();
   }
 }
 
@@ -1551,12 +1760,14 @@ async function scrapeWalmartViaFetch(store) {
   let failures = 0;
   let validPages = 0;
   const wmProxy = getRetailerProxyUrl("walmart");
-  // Batch queries (4 concurrent) — balances speed vs Akamai/PerimeterX detection risk
+  // Batch queries (2 concurrent) — lower concurrency reduces Akamai/PerimeterX burst detection.
+  // With 5 stores potentially running fetch simultaneously, even 2 concurrent queries
+  // per store means up to 10 total requests hitting walmart.com at once.
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) { trackHealth("walmart", "blocked"); return; }
-    // Inter-query delay with jitter to reduce burst detection (matches Costco/Sam's Club fetch)
-    if (i > 0) await sleep(1000 + Math.random() * 1000);
+    // Inter-query delay with jitter to reduce burst detection
+    if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
     const headers = { ...FETCH_HEADERS };
     if (i > 0) {
@@ -1594,7 +1805,7 @@ async function scrapeWalmartViaFetch(store) {
       trackHealth("walmart", "fail");
     }
   });
-  await runWithConcurrency(queryTasks, 4);
+  await runWithConcurrency(queryTasks, 2);
   // Require at least 25% of queries to succeed — a single valid page shouldn't
   // suppress browser fallback when most queries were blocked
   const minValid = Math.max(1, Math.ceil(queryTasks.length / 4));
@@ -1735,13 +1946,25 @@ async function scrapeWalmartStore(store) {
       return dedupFound([...knownFound, ...fetchResult]);
     }
   }
-  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}using browser (dedicated IP)`);
+  // Fail-fast: if a previous store's browser was blocked this poll, skip remaining
+  if (retailerBrowserBlocked["walmart"]) {
+    console.log(`[walmart:${store.storeId}] Skipping browser — blocked earlier this poll`);
+    trackHealth("walmart", "blocked");
+    return dedupFound(knownFound);
+  }
+
+  // Acquire per-retailer lock so only one store uses the browser at a time.
+  // Multiple concurrent pages on one context triggers Akamai/PerimeterX bot detection.
+  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing browser (dedicated IP)`);
+  const releaseLock = await acquireRetailerLock("walmart");
   let page;
   try {
     ({ page } = await launchRetailerBrowser("walmart"));
   } catch (err) {
     console.error(`[walmart:${store.storeId}] Browser launch failed: ${err.message}`);
     trackHealth("walmart", "fail");
+    retailerBrowserBlocked["walmart"] = true;
+    releaseLock();
     return dedupFound(knownFound);
   }
   try {
@@ -1751,11 +1974,13 @@ async function scrapeWalmartStore(store) {
     if (result === null) {
       console.warn(`[walmart:${store.storeId}] Browser scraper timed out (180s)`);
       trackHealth("walmart", "blocked");
+      retailerBrowserBlocked["walmart"] = true;
       return dedupFound(knownFound);
     }
     return dedupFound([...knownFound, ...result]);
   } finally {
     await page.close().catch(() => {});
+    releaseLock();
   }
 }
 
@@ -1803,6 +2028,7 @@ async function scrapeWalgreensViaBrowser(page) {
   // Pre-warm: visit homepage to let Akamai sensor set _abck cookie before searching.
   await page.goto("https://www.walgreens.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
+  await solveHumanChallenge(page);
   await humanizePage(page);
   await navigateCategory(page, "walgreens");
 
@@ -1813,9 +2039,16 @@ async function scrapeWalgreensViaBrowser(page) {
       await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 10000 }).catch(() => {});
 
       if (await isBlockedPage(page)) {
-        console.warn(`[walgreens] Bot detection page for query "${query}" — skipping`);
-        trackHealth("walgreens", "blocked");
-        continue;
+        const solved = await solveHumanChallenge(page);
+        if (solved) {
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+          await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 10000 }).catch(() => {});
+        }
+        if (!solved || (await isBlockedPage(page))) {
+          console.warn(`[walgreens] Bot detection page for query "${query}" — skipping`);
+          trackHealth("walgreens", "blocked");
+          continue;
+        }
       }
 
       const products = await page.$$eval(
@@ -1962,11 +2195,25 @@ async function scrapeSamsClubViaFetch() {
   let validPages = 0;
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
 
+  // Pre-warm: fetch homepage to get PerimeterX session cookies before product pages.
+  let cookies = "";
+  try {
+    const homeRes = await scraperFetchRetry("https://www.samsclub.com/", {
+      headers: FETCH_HEADERS,
+      timeout: 10000,
+      proxyUrl: scProxy,
+    });
+    const rawSetCookie = homeRes.headers["set-cookie"];
+    const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
+    cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
+  } catch { /* continue without cookies */ }
+
   const productTasks = entries.map(([bottleName, productId], i) => async () => {
     if (failures > Math.floor(entries.length / 2)) { trackHealth("samsclub", "blocked"); return; }
-    if (i > 0) await sleep(1000 + Math.random() * 1000);
+    if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.samsclub.com/ip/${productId}`;
     const headers = { ...FETCH_HEADERS };
+    if (cookies) headers["Cookie"] = cookies;
     if (i > 0) {
       headers["Sec-Fetch-Site"] = "same-origin";
       headers["Referer"] = "https://www.samsclub.com/";
@@ -2003,8 +2250,8 @@ async function scrapeSamsClubViaFetch() {
       trackHealth("samsclub", "fail");
     }
   });
-  await runWithConcurrency(productTasks, 4);
-  // Require at least half the products to succeed — a 1/8 success rate shouldn't suppress browser fallback
+  await runWithConcurrency(productTasks, 2);
+  // Require at least 25% of products to succeed — low success rate triggers browser fallback
   const minValid = Math.max(1, Math.ceil(entries.length / 4));
   if (validPages < minValid) return null;
   return dedupFound(found);
@@ -2012,9 +2259,10 @@ async function scrapeSamsClubViaFetch() {
 
 // Browser-based Sam's Club scraper (fallback).
 async function scrapeSamsClubViaBrowser(page) {
-  // Pre-warm: visit homepage to let PerimeterX sensor set cookies
+  // Pre-warm: visit homepage to let PerimeterX sensor collect behavioral telemetry.
+  // Same parent company as Walmart — uses the same PerimeterX integration.
   await page.goto("https://www.samsclub.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
-  await sleep(3000 + Math.random() * 2000);
+  await sleep(5000 + Math.random() * 3000);
   await humanizePage(page);
   await navigateCategory(page, "samsclub");
 
@@ -2342,6 +2590,7 @@ async function poll() {
   krogerToken = null;
   browserStateCache = null;
   scraperHealth = {};
+  for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k];
   const canaryResults = {};
   scanCounter++;
   loadKnownProducts(state);
@@ -2431,10 +2680,14 @@ async function poll() {
         });
       }
     } /* v8 ignore stop */ else {
-      // API/fetch-based scrapers: no browser page needed
+      // API/fetch-based scrapers (with possible browser fallback): stagger each store
+      // to avoid concurrent pages on the same browser context if fetch fails.
       for (const [si, store] of stores.entries()) {
         tasks.push(async () => {
+          // First store gets the retailer stagger; subsequent stores wait 30-60s each
+          // to avoid piling into the browser context simultaneously after fetch failures
           if (si === 0 && staggerMs) await sleep(staggerMs);
+          else if (si > 0) await sleep(si * (30000 + Math.floor(Math.random() * 30000)));
           try {
             console.log(`[poll] Checking ${retailer.name} — ${store.name}...`);
             const inStock = await retailer.scraper(store);
@@ -2482,7 +2735,7 @@ export {
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry, scraperFetch, scraperFetchRetry,
+  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
@@ -2510,6 +2763,9 @@ export function _getScanCounter() { return scanCounter; }
 export function _resetRetailerFailures() { for (const k of Object.keys(retailerFailures)) delete retailerFailures[k]; }
 export function _resetKnownProducts() { knownProducts = {}; }
 export function _getKnownProducts() { return knownProducts; }
+export function _resetRetailerBrowserLocks() { for (const k of Object.keys(retailerBrowserLocks)) delete retailerBrowserLocks[k]; }
+export function _resetRetailerBrowserBlocked() { for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k]; }
+export { acquireRetailerLock };
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
