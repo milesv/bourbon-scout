@@ -1138,7 +1138,7 @@ async function solveHumanChallenge(page) {
     await sleep(300 + Math.random() * 400);
 
     await page.mouse.down();
-    const holdMs = 3000 + Math.random() * 2000;
+    const holdMs = 8000 + Math.random() * 4000;
     console.log(`[bot] Holding for ${(holdMs / 1000).toFixed(1)}s...`);
     await sleep(holdMs);
     await page.mouse.up();
@@ -1960,11 +1960,12 @@ async function scrapeWalmartStore(store) {
 
   // Acquire per-retailer lock so only one store uses the browser at a time.
   // Multiple concurrent pages on one context triggers Akamai/PerimeterX bot detection.
-  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing browser (dedicated IP)`);
+  const wmHeaded = IS_MAC;
+  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser (direct IP${wmHeaded ? ", headed" : ""})`);
   const releaseLock = await acquireRetailerLock("walmart");
   let page;
   try {
-    ({ page } = await launchRetailerBrowser("walmart"));
+    ({ page } = await launchRetailerBrowser("walmart", { clean: true, headless: !wmHeaded }));
   } catch (err) {
     console.error(`[walmart:${store.storeId}] Browser launch failed: ${err.message}`);
     trackHealth("walmart", "fail");
@@ -2118,10 +2119,11 @@ async function scrapeWalgreensStore() {
       }
       await sleep(3000 + Math.random() * 2000); // Cool-down before retry
     }
-    console.log("[walgreens] Using browser (dedicated IP)");
+    const wgHeaded = IS_MAC;
+    console.log(`[walgreens] Using clean browser (direct IP${wgHeaded ? ", headed" : ""})`);
     let page;
     try {
-      ({ page } = await launchRetailerBrowser("walgreens"));
+      ({ page } = await launchRetailerBrowser("walgreens", { clean: true, headless: !wgHeaded }));
     } catch (err) {
       console.error(`[walgreens] Browser launch failed: ${err.message}`);
       trackHealth("walgreens", "fail");
