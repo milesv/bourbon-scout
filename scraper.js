@@ -1268,7 +1268,7 @@ async function scrapeCostcoViaFetch() {
   // Batch queries with adaptive concurrency
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
-    if (failures > 3) { trackHealth("costco", "blocked"); return; }
+    if (failures > 3) return; // Early-abort without health tracking — browser will track its own
     // Inter-query delay with jitter to reduce Akamai burst detection
     if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
@@ -1285,9 +1285,9 @@ async function scrapeCostcoViaFetch() {
       if (!res.ok || isCostcoBlocked(html)) {
         await sleep(2000 + Math.random() * 1000);
         const retryRes = await scraperFetch(url, { headers, timeout: 15000, proxyUrl: costcoProxy }).catch(() => null);
-        if (!retryRes?.ok) { failures++; trackHealth("costco", !res.ok ? "fail" : "blocked"); return; }
+        if (!retryRes?.ok) { failures++; return; }
         const retryHtml = await retryRes.text();
-        if (isCostcoBlocked(retryHtml)) { failures++; trackHealth("costco", "blocked"); return; }
+        if (isCostcoBlocked(retryHtml)) { failures++; return; }
         html = retryHtml;
       }
       const $ = cheerio.load(html);
@@ -1298,7 +1298,6 @@ async function scrapeCostcoViaFetch() {
       found.push(...matchCostcoTiles($));
     } catch {
       failures++;
-      trackHealth("costco", "fail");
     }
   });
   await runWithConcurrency(queryTasks, concurrency);
@@ -1487,7 +1486,7 @@ async function scrapeTotalWineViaFetch(store) {
   // per store means up to 8 total requests hitting totalwine.com at once.
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
-    if (failures > 3) { trackHealth("totalwine", "blocked"); return; }
+    if (failures > 3) return; // Early-abort — browser will track its own
     // Inter-query delay with jitter to reduce burst detection
     if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
@@ -1499,12 +1498,12 @@ async function scrapeTotalWineViaFetch(store) {
     }
     try {
       const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: twProxy });
-      if (!res.ok) { failures++; trackHealth("totalwine", "fail"); return; }
+      if (!res.ok) { failures++; return; }
       const html = await res.text();
       const idx = html.indexOf("window.INITIAL_STATE");
-      if (idx === -1) { failures++; trackHealth("totalwine", "blocked"); return; }
+      if (idx === -1) { failures++; return; }
       const braceStart = html.indexOf("{", idx);
-      if (braceStart === -1) { failures++; trackHealth("totalwine", "blocked"); return; }
+      if (braceStart === -1) { failures++; return; }
       // Use brace counting to find the matching closing brace (handles </script> inside JSON strings)
       let depth = 0, inStr = false, escape = false, end = -1;
       for (let j = braceStart; j < html.length; j++) {
@@ -1516,15 +1515,14 @@ async function scrapeTotalWineViaFetch(store) {
         if (ch === "{") depth++;
         else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
       }
-      if (end === -1) { failures++; trackHealth("totalwine", "blocked"); return; }
+      if (end === -1) { failures++; return; }
       const state = JSON.parse(html.slice(braceStart, end));
-      if (!state?.search?.results) { failures++; trackHealth("totalwine", "blocked"); return; }
+      if (!state?.search?.results) { failures++; return; }
       validPages++;
       trackHealth("totalwine", "ok");
       found.push(...matchTotalWineInitialState(state));
     } catch {
       failures++;
-      trackHealth("totalwine", "fail");
     }
   });
   await runWithConcurrency(queryTasks, 2);
@@ -1801,7 +1799,7 @@ async function scrapeWalmartViaFetch(store) {
   // per store means up to 10 total requests hitting walmart.com at once.
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
-    if (failures > 3) { trackHealth("walmart", "blocked"); return; }
+    if (failures > 3) return; // Early-abort without health tracking — browser will track its own
     // Inter-query delay with jitter to reduce burst detection
     if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
@@ -1812,13 +1810,13 @@ async function scrapeWalmartViaFetch(store) {
     }
     try {
       const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: wmProxy });
-      if (!res.ok) { failures++; trackHealth("walmart", "fail"); return; }
+      if (!res.ok) { failures++; return; }
       const html = await res.text();
       // Use brace-counting to extract JSON (handles </script> inside JSON strings)
       const idx = html.indexOf('id="__NEXT_DATA__"');
-      if (idx === -1) { failures++; trackHealth("walmart", "blocked"); return; }
+      if (idx === -1) { failures++; return; }
       const braceStart = html.indexOf("{", idx);
-      if (braceStart === -1) { failures++; trackHealth("walmart", "blocked"); return; }
+      if (braceStart === -1) { failures++; return; }
       let depth = 0, inStr = false, escape = false, end = -1;
       for (let j = braceStart; j < html.length; j++) {
         const ch = html[j];
@@ -1829,16 +1827,15 @@ async function scrapeWalmartViaFetch(store) {
         if (ch === "{") depth++;
         else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
       }
-      if (end === -1) { failures++; trackHealth("walmart", "blocked"); return; }
+      if (end === -1) { failures++; return; }
       const nextData = JSON.parse(html.slice(braceStart, end));
       const hasSearchResult = nextData?.props?.pageProps?.initialData?.searchResult != null;
-      if (!hasSearchResult) { failures++; trackHealth("walmart", "blocked"); return; }
+      if (!hasSearchResult) { failures++; return; }
       validPages++;
       trackHealth("walmart", "ok");
       found.push(...matchWalmartNextData(nextData));
     } catch {
       failures++;
-      trackHealth("walmart", "fail");
     }
   });
   await runWithConcurrency(queryTasks, 2);
@@ -2245,7 +2242,7 @@ async function scrapeSamsClubViaFetch() {
   } catch { /* continue without cookies */ }
 
   const productTasks = entries.map(([bottleName, productId], i) => async () => {
-    if (failures > Math.floor(entries.length / 2)) { trackHealth("samsclub", "blocked"); return; }
+    if (failures > Math.floor(entries.length / 2)) return; // Early-abort — browser will track its own
     if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.samsclub.com/ip/${productId}`;
     const headers = { ...FETCH_HEADERS };
@@ -2256,13 +2253,13 @@ async function scrapeSamsClubViaFetch() {
     }
     try {
       const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: scProxy });
-      if (!res.ok) { failures++; trackHealth("samsclub", "fail"); return; }
+      if (!res.ok) { failures++; return; }
       const html = await res.text();
       // Brace-counting JSON extraction (same as Walmart path)
       const idx = html.indexOf('id="__NEXT_DATA__"');
-      if (idx === -1) { failures++; trackHealth("samsclub", "blocked"); return; }
+      if (idx === -1) { failures++; return; }
       const braceStart = html.indexOf("{", idx);
-      if (braceStart === -1) { failures++; trackHealth("samsclub", "blocked"); return; }
+      if (braceStart === -1) { failures++; return; }
       let depth = 0, inStr = false, escape = false, end = -1;
       for (let j = braceStart; j < html.length; j++) {
         const ch = html[j];
@@ -2273,17 +2270,16 @@ async function scrapeSamsClubViaFetch() {
         if (ch === "{") depth++;
         else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
       }
-      if (end === -1) { failures++; trackHealth("samsclub", "blocked"); return; }
+      if (end === -1) { failures++; return; }
       const nextData = JSON.parse(html.slice(braceStart, end));
       const product = nextData?.props?.pageProps?.initialData?.data?.product;
-      if (!product?.name) { failures++; trackHealth("samsclub", "blocked"); return; }
+      if (!product?.name) { failures++; return; }
       validPages++;
       trackHealth("samsclub", "ok");
       const match = matchSamsClubProduct(nextData, bottleName);
       if (match) found.push(match);
     } catch {
       failures++;
-      trackHealth("samsclub", "fail");
     }
   });
   await runWithConcurrency(productTasks, 2);
