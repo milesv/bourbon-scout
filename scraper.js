@@ -922,8 +922,8 @@ function acquireRetailerLock(retailerKey) {
 // Launch (or reuse) a persistent browser context with a retailer-specific proxy IP.
 // Uses launchPersistentContext to maintain a full Chrome profile on disk per retailer.
 // Returns { page } — caller should close the PAGE when done (not the context).
-// opts.headless: override headless mode (default true). Use false for PerimeterX-heavy
-// sites on Mac — fully defeats headless detection at the cost of a visible window.
+// opts.clean: use raw chromium (no stealth/rebrowser plugins). Required for PerimeterX/Akamai
+// sites — the stealth plugin's CDP modifications are fingerprinted as automation signals.
 async function launchRetailerBrowser(retailerKey, opts = {}) {
   // Reuse existing persistent context if available
   if (retailerBrowserCache[retailerKey]) {
@@ -959,13 +959,17 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
   ];
   const viewport = viewports[Math.floor(Math.random() * viewports.length)];
 
+  // Headed mode on Mac defeats PerimeterX/Akamai headless detection.
+  // macOS ignores --window-position for off-screen placement, so we minimize after launch.
+  const headless = opts.headless !== undefined ? opts.headless : !IS_MAC;
   const contextOpts = {
-    headless: opts.headless !== undefined ? opts.headless : true,
+    headless,
     args: [
       "--disable-blink-features=AutomationControlled",
       "--disable-dev-shm-usage",
       "--no-first-run",
       "--disable-component-update",
+      ...(!headless ? ["--window-size=800,600"] : []),
     ],
     ignoreDefaultArgs: ["--enable-automation"],
     viewport,
@@ -987,6 +991,19 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
   const launcher = opts.clean ? rebrowserChromium : chromium;
   const context = await launcher.launchPersistentContext(profileDir, contextOpts);
   retailerBrowserCache[retailerKey] = { context };
+  // Minimize the browser window on Mac so it doesn't steal focus during scans.
+  // Uses CDP Browser.getWindowForTarget + Browser.setWindowBounds to minimize without
+  // affecting page rendering or anti-bot sensor execution.
+  if (!headless) {
+    try {
+      const pages = context.pages();
+      const anyPage = pages[0] || await context.newPage();
+      const cdp = await context.newCDPSession(anyPage);
+      const { windowId } = await cdp.send("Browser.getWindowForTarget");
+      await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
+      await cdp.detach();
+    } catch { /* non-critical — window visible but functional */ }
+  }
   const page = await context.newPage();
   return { page };
 }
@@ -1365,11 +1382,10 @@ async function scrapeCostcoStore() {
 
   // Fetch blocked or no proxy — fall back to clean browser (no stealth/rebrowser).
   // Akamai detects stealth plugin CDP modifications the same way PerimeterX does.
-  const useHeaded = IS_MAC;
-  console.log(`[costco] Fetch blocked, using clean browser (direct IP${useHeaded ? ", headed" : ""})`);
+  console.log("[costco] Fetch blocked, using clean browser");
   let page;
   try {
-    ({ page } = await launchRetailerBrowser("costco", { clean: true, headless: !useHeaded }));
+    ({ page } = await launchRetailerBrowser("costco", { clean: true }));
   } catch (err) {
     console.error(`[costco] Browser launch failed: ${err.message}`);
     trackHealth("costco", "fail");
@@ -1679,17 +1695,14 @@ async function scrapeTotalWineStore(store) {
     return [];
   }
 
-  // Direct residential IP browser (no proxy). On Mac, use headless: false to defeat
-  // PerimeterX headless detection at the cost of a visible Chrome window.
-  const useHeaded = IS_MAC;
+  // Direct residential IP browser (no proxy, clean mode — no stealth/rebrowser plugins).
   // Skip pre-warm if the persistent context was already warmed by a previous store this poll.
-  // Mutex ensures stores run sequentially, so the context cookies persist across stores.
   const skipPreWarm = !!retailerBrowserCache["totalwine"];
-  console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP${useHeaded ? ", headed" : ""}${skipPreWarm ? ", warm" : ""})`);
+  console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP${skipPreWarm ? ", warm" : ""})`);
   const releaseLock = await acquireRetailerLock("totalwine");
   let page;
   try {
-    ({ page } = await launchRetailerBrowser("totalwine", { headless: !useHeaded, clean: true }));
+    ({ page } = await launchRetailerBrowser("totalwine", { clean: true }));
   } catch (err) {
     console.error(`[totalwine:${store.storeId}] Browser launch failed: ${err.message}`);
     trackHealth("totalwine", "fail");
@@ -1960,12 +1973,11 @@ async function scrapeWalmartStore(store) {
 
   // Acquire per-retailer lock so only one store uses the browser at a time.
   // Multiple concurrent pages on one context triggers Akamai/PerimeterX bot detection.
-  const wmHeaded = IS_MAC;
-  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser (direct IP${wmHeaded ? ", headed" : ""})`);
+  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser`);
   const releaseLock = await acquireRetailerLock("walmart");
   let page;
   try {
-    ({ page } = await launchRetailerBrowser("walmart", { clean: true, headless: !wmHeaded }));
+    ({ page } = await launchRetailerBrowser("walmart", { clean: true }));
   } catch (err) {
     console.error(`[walmart:${store.storeId}] Browser launch failed: ${err.message}`);
     trackHealth("walmart", "fail");
@@ -2119,11 +2131,10 @@ async function scrapeWalgreensStore() {
       }
       await sleep(3000 + Math.random() * 2000); // Cool-down before retry
     }
-    const wgHeaded = IS_MAC;
-    console.log(`[walgreens] Using clean browser (direct IP${wgHeaded ? ", headed" : ""})`);
+    console.log("[walgreens] Using clean browser");
     let page;
     try {
-      ({ page } = await launchRetailerBrowser("walgreens", { clean: true, headless: !wgHeaded }));
+      ({ page } = await launchRetailerBrowser("walgreens", { clean: true }));
     } catch (err) {
       console.error(`[walgreens] Browser launch failed: ${err.message}`);
       trackHealth("walgreens", "fail");
@@ -2325,11 +2336,10 @@ async function scrapeSamsClubStore() {
     console.log("[samsclub] Used fast fetch mode (proxied)");
     return fetchResult;
   }
-  const useHeaded = IS_MAC;
-  console.log(`[samsclub] Fetch blocked, using clean browser (direct IP${useHeaded ? ", headed" : ""})`);
+  console.log("[samsclub] Fetch blocked, using clean browser");
   let page;
   try {
-    ({ page } = await launchRetailerBrowser("samsclub", { clean: true, headless: !useHeaded }));
+    ({ page } = await launchRetailerBrowser("samsclub", { clean: true }));
   } catch (err) {
     console.error(`[samsclub] Browser launch failed: ${err.message}`);
     trackHealth("samsclub", "fail");
