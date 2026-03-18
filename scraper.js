@@ -237,7 +237,6 @@ const SEARCH_QUERIES = [
   "stagg bourbon",             // Stagg Jr + George T. Stagg
   "george t stagg",            // George T. Stagg (BTAC) — keyword search needs exact name
   "eagle rare 17",             // Eagle Rare 17 Year (BTAC)
-  "sazerac rye 18",            // Sazerac Rye 18 Year (BTAC)
   "thomas handy sazerac",      // Thomas H. Handy (BTAC)
   "elmer t lee",               // Elmer T. Lee
   "rock hill farms",           // Rock Hill Farms
@@ -271,7 +270,6 @@ const TARGET_BOTTLES = [
   { name: "Eagle Rare 17 Year",         searchTerms: ["eagle rare 17"] },
   { name: "William Larue Weller",       searchTerms: ["william larue weller", "wm larue weller", "william l weller", "w.l. weller btac", "larue weller"] },
   { name: "Thomas H. Handy",            searchTerms: ["thomas h. handy", "thomas handy sazerac", "thomas h handy", "thomas handy"] },
-  { name: "Sazerac Rye 18 Year",        searchTerms: ["sazerac rye 18", "sazerac 18 year"] },
   { name: "Pappy Van Winkle 10 Year",   searchTerms: ["pappy van winkle 10", "old rip van winkle 10"] },
   { name: "Pappy Van Winkle 12 Year",   searchTerms: ["pappy van winkle 12", "van winkle special reserve 12"] },
   { name: "Pappy Van Winkle 15 Year",   searchTerms: ["pappy van winkle 15"] },

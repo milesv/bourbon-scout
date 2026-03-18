@@ -158,8 +158,8 @@ async function runWithFakeTimers(fn) {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 describe("constants", () => {
-  it("SEARCH_QUERIES has 14 broad queries (13 allocated + 1 canary)", () => {
-    expect(SEARCH_QUERIES).toHaveLength(14);
+  it("SEARCH_QUERIES has 13 broad queries (12 allocated + 1 canary)", () => {
+    expect(SEARCH_QUERIES).toHaveLength(13);
     expect(SEARCH_QUERIES).toContain("weller bourbon");
     expect(SEARCH_QUERIES).toContain("van winkle");
     expect(SEARCH_QUERIES).toContain("eh taylor");
@@ -168,8 +168,8 @@ describe("constants", () => {
     expect(SEARCH_QUERIES).toContain("buffalo trace");
   });
 
-  it("TARGET_BOTTLES has 39 bottles (38 allocated + 1 canary)", () => {
-    expect(TARGET_BOTTLES).toHaveLength(39);
+  it("TARGET_BOTTLES has 38 bottles (37 allocated + 1 canary)", () => {
+    expect(TARGET_BOTTLES).toHaveLength(38);
     expect(TARGET_BOTTLES[0]).toHaveProperty("name");
     expect(TARGET_BOTTLES[0]).toHaveProperty("searchTerms");
   });
@@ -196,12 +196,6 @@ describe("constants", () => {
 
   it("SEARCH_QUERIES includes 'george t stagg' for BTAC coverage (B3)", () => {
     expect(SEARCH_QUERIES).toContain("george t stagg");
-  });
-
-  it("Sazerac 18 uses 'sazerac 18 year' search term (B2)", () => {
-    const saz = TARGET_BOTTLES.find((b) => b.name.includes("Sazerac") && b.name.includes("18"));
-    expect(saz.searchTerms).toContain("sazerac 18 year");
-    expect(saz.searchTerms).not.toContain("sazerac 18");
   });
 
   it("Blanton's Red/Green/Black are removed (Japan-only, B6)", () => {
@@ -266,7 +260,7 @@ describe("canary bottle", () => {
 
   it("non-canary bottles do not have canary flag", () => {
     const nonCanary = TARGET_BOTTLES.filter((b) => !b.canary);
-    expect(nonCanary.length).toBe(38);
+    expect(nonCanary.length).toBe(37);
   });
 
   it("matchesBottle works for Buffalo Trace", () => {
