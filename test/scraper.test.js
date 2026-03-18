@@ -1501,11 +1501,11 @@ describe("postDiscordWebhook", () => {
 });
 
 describe("sendUrgentAlert", () => {
-  it("sends with @everyone and allowed_mentions", async () => {
+  it("sends with @here and allowed_mentions", async () => {
     mocks.fetch.mockResolvedValueOnce({ ok: true });
     await sendUrgentAlert([{ title: "FOUND!" }]);
     const body = JSON.parse(mocks.fetch.mock.calls[0][1].body);
-    expect(body.content).toContain("@everyone");
+    expect(body.content).toContain("@here");
     expect(body.allowed_mentions.parse).toContain("everyone");
   });
 
@@ -3329,13 +3329,13 @@ describe("poll error isolation", () => {
     await runWithFakeTimers(() => poll());
     // Should log the green new-find message
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("New:"));
-    // Discord should have been called with @everyone for urgent alert
+    // Discord should have been called with @here for urgent alert
     const discordCalls = mocks.fetch.mock.calls.filter(
       (c) => typeof c[0] === "string" && c[0].includes("test-webhook")
     );
     const urgentCall = discordCalls.find(([, opts]) => {
       const body = JSON.parse(opts.body);
-      return body.content && body.content.includes("@everyone");
+      return body.content && body.content.includes("@here");
     });
     expect(urgentCall).toBeTruthy();
     consoleSpy.mockRestore();

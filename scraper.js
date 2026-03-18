@@ -416,7 +416,7 @@ async function sendDiscordAlert(embeds) {
   }
 }
 
-// Loud alert with @everyone for in-stock finds
+// Loud alert with @here for in-stock finds (pings online channel members only)
 async function sendUrgentAlert(embeds) {
   /* v8 ignore next -- env guard */
   if (!DISCORD_WEBHOOK_URL) return;
@@ -424,7 +424,7 @@ async function sendUrgentAlert(embeds) {
     const batch = embeds.slice(i, i + 4);
     await postDiscordWebhook({
       username: "Bourbon Scout 🥃",
-      content: "@everyone 🚨 **ALLOCATED BOURBON SPOTTED!**",
+      content: "@here 🚨 **ALLOCATED BOURBON SPOTTED!**",
       allowed_mentions: { parse: ["everyone"] },
       embeds: batch,
     });
