@@ -928,6 +928,14 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
     try {
       const cached = retailerBrowserCache[retailerKey];
       const page = await cached.context.newPage();
+      // Re-minimize on Mac when reusing cached context (macOS may have un-minimized)
+      if (cached.minimizeWindowId) {
+        try {
+          const cdp = await cached.context.newCDPSession(page);
+          await cdp.send("Browser.setWindowBounds", { windowId: cached.minimizeWindowId, bounds: { windowState: "minimized" } });
+          await cdp.detach();
+        } catch { /* non-critical */ }
+      }
       return { page };
     } catch {
       // Context died — clear cache and re-create below
@@ -992,17 +1000,29 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
   // Minimize the browser window on Mac so it doesn't steal focus during scans.
   // Uses CDP Browser.getWindowForTarget + Browser.setWindowBounds to minimize without
   // affecting page rendering or anti-bot sensor execution.
+  // Store the windowId so we can re-minimize after navigation events.
+  let minimizeWindowId = null;
   if (!headless) {
     try {
       const pages = context.pages();
       const anyPage = pages[0] || await context.newPage();
       const cdp = await context.newCDPSession(anyPage);
       const { windowId } = await cdp.send("Browser.getWindowForTarget");
+      minimizeWindowId = windowId;
       await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
       await cdp.detach();
     } catch { /* non-critical — window visible but functional */ }
   }
+  retailerBrowserCache[retailerKey] = { context, minimizeWindowId };
   const page = await context.newPage();
+  // Re-minimize after new page creation (macOS may un-minimize)
+  if (minimizeWindowId) {
+    try {
+      const cdp = await context.newCDPSession(page);
+      await cdp.send("Browser.setWindowBounds", { windowId: minimizeWindowId, bounds: { windowState: "minimized" } });
+      await cdp.detach();
+    } catch { /* non-critical */ }
+  }
   return { page };
 }
 
@@ -2279,6 +2299,7 @@ async function scrapeSamsClubViaBrowser(page) {
   // Same parent company as Walmart — uses the same PerimeterX integration.
   await page.goto("https://www.samsclub.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(5000 + Math.random() * 3000);
+  await solveHumanChallenge(page);
   await humanizePage(page);
   await navigateCategory(page, "samsclub");
 
@@ -2294,9 +2315,20 @@ async function scrapeSamsClubViaBrowser(page) {
       ).catch(() => {});
 
       if (await isBlockedPage(page)) {
-        console.warn(`[samsclub] Bot detection on product ${productId} — skipping`);
-        trackHealth("samsclub", "blocked");
-        continue;
+        // Try solving PerimeterX "Press & Hold" challenge before giving up
+        const solved = await solveHumanChallenge(page);
+        if (solved) {
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+          await page.waitForFunction(
+            () => document.querySelector('script#__NEXT_DATA__')?.textContent?.length > 100,
+            { timeout: 10000 },
+          ).catch(() => {});
+        }
+        if (!solved || (await isBlockedPage(page))) {
+          console.warn(`[samsclub] Bot detection on product ${productId} — skipping`);
+          trackHealth("samsclub", "blocked");
+          continue;
+        }
       }
 
       const nextData = await page.evaluate(
@@ -2327,35 +2359,66 @@ async function scrapeSamsClubViaBrowser(page) {
   return dedupFound(found);
 }
 
-// Wrapper: try fetch-first, fall back to browser.
+// Wrapper: try fetch-first, fall back to clean headed browser with retry.
+// Sam's Club PerimeterX blocks product pages aggressively — fetch sometimes works
+// when proxy IP is clean, browser works with clean headed Chrome.
 async function scrapeSamsClubStore() {
+  // Try fetch-first (sometimes works with clean proxy IP)
   const fetchResult = await scrapeSamsClubViaFetch();
   if (fetchResult !== null) {
     console.log("[samsclub] Used fast fetch mode (proxied)");
     return fetchResult;
   }
-  console.log("[samsclub] Fetch blocked, using clean browser");
-  let page;
-  try {
-    ({ page } = await launchRetailerBrowser("samsclub", { clean: true }));
-  } catch (err) {
-    console.error(`[samsclub] Browser launch failed: ${err.message}`);
-    trackHealth("samsclub", "fail");
-    return [];
-  }
-  try {
-    const scraperPromise = scrapeSamsClubViaBrowser(page);
-    scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, null);
-    if (result === null) {
-      console.warn("[samsclub] Browser scraper timed out (180s)");
-      trackHealth("samsclub", "blocked");
+
+  // Reset health from failed fetch before browser attempt
+  delete scraperHealth["samsclub"];
+
+  // Browser fallback with retry (clean + headed on Mac to defeat PerimeterX)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      console.log("[samsclub] Retrying with fresh browser after blocks");
+      delete scraperHealth["samsclub"];
+      if (retailerBrowserCache["samsclub"]) {
+        await retailerBrowserCache["samsclub"].context.close().catch(() => {});
+        delete retailerBrowserCache["samsclub"];
+      }
+      await sleep(3000 + Math.random() * 2000);
+    }
+
+    console.log("[samsclub] Using clean browser");
+    let page;
+    try {
+      ({ page } = await launchRetailerBrowser("samsclub", { clean: true, headless: !IS_MAC }));
+    } catch (err) {
+      console.error(`[samsclub] Browser launch failed: ${err.message}`);
+      trackHealth("samsclub", "fail");
       return [];
     }
-    return result;
-  } finally {
-    await page.close().catch(() => {});
+    try {
+      const scraperPromise = scrapeSamsClubViaBrowser(page);
+      scraperPromise.catch(() => {});
+      const result = await withTimeout(scraperPromise, 180000, null);
+      if (result === null) {
+        console.warn("[samsclub] Browser scraper timed out (180s)");
+        trackHealth("samsclub", "blocked");
+        if (attempt === 0) {
+          console.warn("[samsclub] Timeout on first attempt — retrying with fresh browser");
+          continue;
+        }
+        return [];
+      }
+      // Check if too many products were blocked — retry with fresh browser
+      const scHealth = scraperHealth["samsclub"];
+      if (scHealth && scHealth.queries > 0 && scHealth.blocked >= scHealth.queries / 2 && attempt === 0) {
+        console.warn(`[samsclub] ${scHealth.blocked}/${scHealth.queries} products blocked — retrying`);
+        continue;
+      }
+      return result;
+    } finally {
+      await page.close().catch(() => {});
+    }
   }
+  return [];
 }
 
 // ─── API-based scrapers ─────────────────────────────────────────────────────

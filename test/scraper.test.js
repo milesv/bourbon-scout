@@ -2774,15 +2774,13 @@ describe("scrapeSamsClubViaBrowser", () => {
         usItemId: "prod20595259",
       } } } } },
     };
-    // isBlockedPage calls page.evaluate for body text (returns string),
-    // then __NEXT_DATA__ extraction calls page.evaluate (returns object).
-    // Each product in the loop calls evaluate twice. Mock alternating: string, object.
-    let evalCount = 0;
-    page.evaluate.mockImplementation(() => {
-      evalCount++;
-      // Odd calls = isBlockedPage body text, even calls = __NEXT_DATA__
-      if (evalCount % 2 === 1) return Promise.resolve("");
-      return Promise.resolve(productData);
+    // evaluate is called by: solveHumanChallenge (body text), humanizePage (links),
+    // isBlockedPage (body text), and __NEXT_DATA__ extraction (object).
+    // Return productData when the callback accesses __NEXT_DATA__, empty string otherwise.
+    page.evaluate.mockImplementation((fn) => {
+      const src = typeof fn === "function" ? fn.toString() : "";
+      if (src.includes("__NEXT_DATA__")) return Promise.resolve(productData);
+      return Promise.resolve("");
     });
     const promise = scrapeSamsClubViaBrowser(page);
     promise.catch(() => {});
@@ -5075,12 +5073,10 @@ describe("Sam's Club browser OOS product health tracking", () => {
         priceInfo: { currentPrice: { priceString: "$24.98" } },
       } } } } },
     };
-    let evalCount = 0;
-    mockPage.evaluate.mockImplementation(async () => {
-      evalCount++;
-      // Odd calls = isBlockedPage body (empty string)
-      // Even calls = __NEXT_DATA__ extraction
-      return evalCount % 2 === 1 ? "" : oosData;
+    mockPage.evaluate.mockImplementation((fn) => {
+      const src = typeof fn === "function" ? fn.toString() : "";
+      if (src.includes("__NEXT_DATA__")) return Promise.resolve(oosData);
+      return Promise.resolve("");
     });
     mockPage.title.mockResolvedValue("Weller at Sam's Club");
 
