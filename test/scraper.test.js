@@ -63,8 +63,8 @@ import {
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, fetchRetry, scraperFetch, scraperFetchRetry,
-  refreshProxySession, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs,
+  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
+  refreshProxySession, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
@@ -1614,6 +1614,82 @@ describe("isBlockedPage", () => {
     page.title.mockResolvedValue("Walmart.com");
     page.evaluate.mockResolvedValue("A security check is required before accessing this page");
     expect(await isBlockedPage(page)).toBe(true);
+  });
+
+  it("detects 'press & hold' PerimeterX challenge in body", async () => {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Access to this page has been denied");
+    page.evaluate.mockResolvedValue("Before we continue... Press & Hold to confirm you are a human");
+    expect(await isBlockedPage(page)).toBe(true);
+  });
+});
+
+// ─── solveHumanChallenge ─────────────────────────────────────────────────────
+
+describe("solveHumanChallenge", () => {
+  it("returns false when no Press & Hold text in body", async () => {
+    const page = createMockPage();
+    page.evaluate.mockResolvedValue("Normal page content");
+    expect(await solveHumanChallenge(page)).toBe(false);
+  });
+
+  it("returns false when body check throws", async () => {
+    const page = createMockPage();
+    page.evaluate.mockRejectedValue(new Error("page closed"));
+    expect(await solveHumanChallenge(page)).toBe(false);
+  });
+
+  it("returns false when #px-captcha not found", async () => {
+    const page = createMockPage();
+    // First evaluate: body text check
+    page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
+    // page.$: no #px-captcha element
+    page.$.mockResolvedValue(null);
+    expect(await solveHumanChallenge(page)).toBe(false);
+  });
+
+  it("returns false when #px-captcha has no bounding box", async () => {
+    const page = createMockPage();
+    page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
+    page.$.mockResolvedValue({ boundingBox: vi.fn().mockResolvedValue(null) });
+    expect(await solveHumanChallenge(page)).toBe(false);
+  });
+
+  it("attempts press-and-hold when #px-captcha found with bounding box", async () => {
+    const page = createMockPage();
+    const mouse = { move: vi.fn(), down: vi.fn(), up: vi.fn() };
+    page.mouse = mouse;
+    // First evaluate: body text with challenge
+    page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
+    // page.$: found #px-captcha with bounding box
+    page.$.mockResolvedValue({
+      boundingBox: vi.fn().mockResolvedValue({ x: 400, y: 400, width: 530, height: 95 }),
+    });
+    // waitForNavigation
+    page.waitForNavigation = vi.fn().mockResolvedValue(undefined);
+    // Second evaluate: check if still blocked (returns false = solved)
+    page.evaluate.mockResolvedValueOnce(false);
+
+    const result = await runWithFakeTimers(() => solveHumanChallenge(page));
+    expect(result).toBe(true);
+    expect(mouse.move).toHaveBeenCalled();
+    expect(mouse.down).toHaveBeenCalled();
+    expect(mouse.up).toHaveBeenCalled();
+  });
+
+  it("returns false when challenge still present after hold", async () => {
+    const page = createMockPage();
+    page.mouse = { move: vi.fn(), down: vi.fn(), up: vi.fn() };
+    page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
+    page.$.mockResolvedValue({
+      boundingBox: vi.fn().mockResolvedValue({ x: 400, y: 400, width: 530, height: 95 }),
+    });
+    page.waitForNavigation = vi.fn().mockResolvedValue(undefined);
+    // Still blocked after attempt
+    page.evaluate.mockResolvedValueOnce(true);
+
+    const result = await runWithFakeTimers(() => solveHumanChallenge(page));
+    expect(result).toBe(false);
   });
 });
 
@@ -4023,6 +4099,84 @@ describe("parsePollIntervalMs", () => {
 
   it("rejects */0 (invalid) and returns default 15min", () => {
     expect(parsePollIntervalMs("*/0 * * * *")).toBe(15 * 60 * 1000);
+  });
+});
+
+// ─── Schedule-aware scanning ─────────────────────────────────────────────────
+
+describe("getMTTime", () => {
+  it("returns hour and day in Arizona time", () => {
+    const { hour, day } = getMTTime();
+    expect(typeof hour).toBe("number");
+    expect(hour).toBeGreaterThanOrEqual(0);
+    expect(hour).toBeLessThanOrEqual(23);
+    expect(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]).toContain(day);
+  });
+});
+
+describe("isActiveHour", () => {
+  it("returns true for evening hours (5 PM – midnight)", () => {
+    expect(isActiveHour(17)).toBe(true);  // 5 PM
+    expect(isActiveHour(20)).toBe(true);  // 8 PM
+    expect(isActiveHour(23)).toBe(true);  // 11 PM
+  });
+
+  it("returns true for morning hours (midnight – 10 AM)", () => {
+    expect(isActiveHour(0)).toBe(true);   // midnight
+    expect(isActiveHour(5)).toBe(true);   // 5 AM
+    expect(isActiveHour(9)).toBe(true);   // 9 AM
+  });
+
+  it("returns false during work hours (10 AM – 5 PM)", () => {
+    expect(isActiveHour(10)).toBe(false);  // 10 AM
+    expect(isActiveHour(12)).toBe(false);  // noon
+    expect(isActiveHour(14)).toBe(false);  // 2 PM
+    expect(isActiveHour(16)).toBe(false);  // 4 PM
+  });
+
+  it("boundary: 10 AM is inactive, 5 PM is active", () => {
+    expect(isActiveHour(10)).toBe(false);
+    expect(isActiveHour(17)).toBe(true);
+  });
+});
+
+describe("isBoostPeriod", () => {
+  it("returns true for Tuesday evening (≥ 5 PM)", () => {
+    expect(isBoostPeriod(17, "Tue")).toBe(true);
+    expect(isBoostPeriod(23, "Tue")).toBe(true);
+  });
+
+  it("returns true for Wednesday morning (< 10 AM)", () => {
+    expect(isBoostPeriod(0, "Wed")).toBe(true);
+    expect(isBoostPeriod(9, "Wed")).toBe(true);
+  });
+
+  it("returns true for Thursday evening (≥ 5 PM)", () => {
+    expect(isBoostPeriod(17, "Thu")).toBe(true);
+    expect(isBoostPeriod(22, "Thu")).toBe(true);
+  });
+
+  it("returns true for Friday morning (< 10 AM)", () => {
+    expect(isBoostPeriod(0, "Fri")).toBe(true);
+    expect(isBoostPeriod(9, "Fri")).toBe(true);
+  });
+
+  it("returns false for non-boost days", () => {
+    expect(isBoostPeriod(20, "Mon")).toBe(false);
+    expect(isBoostPeriod(20, "Wed")).toBe(false);
+    expect(isBoostPeriod(20, "Fri")).toBe(false);
+    expect(isBoostPeriod(20, "Sat")).toBe(false);
+    expect(isBoostPeriod(20, "Sun")).toBe(false);
+  });
+
+  it("returns false for Tuesday morning (before boost starts)", () => {
+    expect(isBoostPeriod(9, "Tue")).toBe(false);
+    expect(isBoostPeriod(14, "Tue")).toBe(false);
+  });
+
+  it("returns false for Wednesday afternoon (after boost ends)", () => {
+    expect(isBoostPeriod(10, "Wed")).toBe(false);
+    expect(isBoostPeriod(15, "Wed")).toBe(false);
   });
 });
 

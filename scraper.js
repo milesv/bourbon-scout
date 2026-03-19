@@ -46,6 +46,35 @@ function parsePollIntervalMs(cronExpr) {
   return 15 * 60 * 1000;
 }
 
+// ─── Schedule-aware scanning ─────────────────────────────────────────────────
+// Active hours: 5 PM – 10 AM MT. Boost (20 min) on Tue/Thu nights, else 30 min.
+// Arizona = MST year-round (UTC-7, no DST).
+const ACTIVE_START = 17; // 5 PM MT
+const ACTIVE_END = 10;   // 10 AM MT
+
+function getMTTime() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Phoenix",
+    hour: "numeric", hour12: false,
+    weekday: "short",
+  }).formatToParts(now);
+  const hour = parseInt(parts.find((p) => p.type === "hour").value, 10);
+  const day = parts.find((p) => p.type === "weekday").value;
+  return { hour, day };
+}
+
+function isActiveHour(hour) {
+  return hour >= ACTIVE_START || hour < ACTIVE_END;
+}
+
+function isBoostPeriod(hour, day) {
+  return (day === "Tue" && hour >= ACTIVE_START) ||
+         (day === "Wed" && hour < ACTIVE_END) ||
+         (day === "Thu" && hour >= ACTIVE_START) ||
+         (day === "Fri" && hour < ACTIVE_END);
+}
+
 // Residential proxy agent for fetch-based scrapers (Walmart fetch path, Kroger, Safeway).
 // Only created when PROXY_URL is set. Discord webhook calls intentionally skip the proxy.
 // Auto-detects SOCKS5/SOCKS4 vs HTTP/HTTPS proxy protocol.
@@ -2809,7 +2838,7 @@ export {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
-  createProxyAgent, refreshProxySession, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs,
+  createProxyAgent, refreshProxySession, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
@@ -2872,40 +2901,10 @@ async function main() {
 
     // Schedule-aware poll loop: scans only during active hours (5 PM – 10 AM MT),
     // with 30-min default intervals and 20-min "boost" intervals on Tue/Thu nights.
-    // Arizona = MST year-round (UTC-7, no DST).
     const JITTER_MS = 3 * 60 * 1000; // ±3 min
-    const ACTIVE_START = 17; // 5 PM MT
-    const ACTIVE_END = 10;   // 10 AM MT
     const BOOST_INTERVAL_MS = 20 * 60 * 1000; // 20 min
     const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 min
 
-    // Get current hour and day-of-week in Arizona time
-    function getMTTime() {
-      const now = new Date();
-      const parts = new Intl.DateTimeFormat("en-US", {
-        timeZone: "America/Phoenix",
-        hour: "numeric", hour12: false,
-        weekday: "short",
-      }).formatToParts(now);
-      const hour = parseInt(parts.find((p) => p.type === "hour").value, 10);
-      const day = parts.find((p) => p.type === "weekday").value; // "Mon", "Tue", etc.
-      return { hour, day };
-    }
-
-    // Active hours: 5 PM – 10 AM MT (overnight window)
-    function isActiveHour(hour) {
-      return hour >= ACTIVE_START || hour < ACTIVE_END;
-    }
-
-    // Boost period: Tue 5 PM → Wed 10 AM, Thu 5 PM → Fri 10 AM (MT)
-    function isBoostPeriod(hour, day) {
-      return (day === "Tue" && hour >= ACTIVE_START) ||
-             (day === "Wed" && hour < ACTIVE_END) ||
-             (day === "Thu" && hour >= ACTIVE_START) ||
-             (day === "Fri" && hour < ACTIVE_END);
-    }
-
-    // Calculate delay until next poll, respecting active hours and boost periods.
     function getNextPollDelayMs() {
       const { hour, day } = getMTTime();
       if (!isActiveHour(hour)) {
