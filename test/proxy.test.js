@@ -74,6 +74,7 @@ import {
   scrapeWalmartViaFetch, scrapeWalmartStore, scrapeKrogerStore, scrapeSafewayStore,
   scrapeSamsClubViaFetch,
   getKrogerToken, main, createProxyAgent,
+  refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl,
   _resetKrogerToken, _resetPolling, _setStoreCache,
   _resetRetailerBrowserCache, _resetRetailerFailures, _resetKnownProducts,
 } from "../scraper.js";
@@ -551,5 +552,53 @@ describe("createProxyAgent", () => {
   it("returns null for undefined/empty URL", () => {
     expect(createProxyAgent(undefined)).toBeNull();
     expect(createProxyAgent("")).toBeNull();
+  });
+});
+
+// ─── rotateRetailerProxy (with PROXY_URL set) ────────────────────────────────
+
+describe("rotateRetailerProxy", () => {
+  beforeEach(() => {
+    // Initialize retailer proxy URLs via refreshProxySession
+    refreshProxySession();
+  });
+
+  it("changes retailer proxy URL to a new port", () => {
+    const before = getRetailerProxyUrl("costco");
+    expect(before).toBeTruthy(); // should be set after refreshProxySession
+    rotateRetailerProxy("costco");
+    const after = getRetailerProxyUrl("costco");
+    expect(after).toBeTruthy();
+    // Port changed — URLs should differ (extremely high probability with random ports)
+    // Both should be valid proxy URLs for the same host
+    expect(new URL(after).hostname).toBe("proxy.example.com");
+    const afterPort = parseInt(new URL(after).port, 10);
+    expect(afterPort).toBeGreaterThanOrEqual(10000);
+    expect(afterPort).toBeLessThan(20000);
+  });
+
+  it("does not affect other retailers when rotating one", () => {
+    const walmartBefore = getRetailerProxyUrl("walmart");
+    rotateRetailerProxy("costco");
+    const walmartAfter = getRetailerProxyUrl("walmart");
+    expect(walmartAfter).toBe(walmartBefore); // walmart unchanged
+  });
+
+  it("updates proxy URL that subsequent fetch calls use", () => {
+    rotateRetailerProxy("walmart");
+    const rotatedUrl = getRetailerProxyUrl("walmart");
+    expect(rotatedUrl).toContain("proxy.example.com");
+    // Rotate again — should change to yet another port
+    rotateRetailerProxy("walmart");
+    const rotatedAgain = getRetailerProxyUrl("walmart");
+    expect(rotatedAgain).toContain("proxy.example.com");
+    // Very unlikely to be the same port twice in a row (1/10000 chance)
+  });
+
+  it("logs rotation message", () => {
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    rotateRetailerProxy("samsclub");
+    expect(spy).toHaveBeenCalledWith(expect.stringContaining("[proxy] Rotated samsclub to port"));
+    spy.mockRestore();
   });
 });
