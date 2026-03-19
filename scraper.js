@@ -2119,27 +2119,32 @@ async function scrapeWalgreensViaBrowser(page) {
   }]);
 
   // Pre-warm: visit homepage to let Akamai sensor set _abck cookie before searching.
-  await page.goto("https://www.walgreens.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  // Use domcontentloaded (not networkidle) — Walgreens keeps making beacon requests that
+  // prevent networkidle from ever firing, burning the full 20s timeout.
+  await page.goto("https://www.walgreens.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
   await solveHumanChallenge(page);
   await humanizePage(page);
   await navigateCategory(page, "walgreens");
 
+  let wgFailures = 0;
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
+    if (wgFailures >= 3) { trackHealth("walgreens", "blocked"); continue; }
     const url = `https://www.walgreens.com/search/results.jsp?Ntt=${encodeURIComponent(query)}`;
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 10000 }).catch(() => {});
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+      await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 8000 }).catch(() => {});
 
       if (await isBlockedPage(page)) {
         const solved = await solveHumanChallenge(page);
         if (solved) {
-          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
-          await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 10000 }).catch(() => {});
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+          await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 8000 }).catch(() => {});
         }
         if (!solved || (await isBlockedPage(page))) {
           console.warn(`[walgreens] Bot detection page for query "${query}" — skipping`);
           trackHealth("walgreens", "blocked");
+          wgFailures++;
           continue;
         }
       }
@@ -2184,6 +2189,7 @@ async function scrapeWalgreensViaBrowser(page) {
     } catch (err) {
       console.error(`[walgreens] Error searching "${query}": ${err.message}`);
       trackHealth("walgreens", "fail");
+      wgFailures++;
     }
     await sleep(2000 + Math.random() * 2000);
   }
