@@ -139,6 +139,24 @@ function refreshProxySession() {
   proxySessionUrl = makeStickyProxyUrl(basePort + retailers.length);
   proxyAgent = createProxyAgent(proxySessionUrl);
 }
+// Rotate a retailer's proxy to a fresh sticky port (= new residential IP).
+// Called when a retailer's fetch path detects blocking — next request uses a different IP.
+function rotateRetailerProxy(retailerKey) {
+  if (!PROXY_URL) return;
+  const proxyBase = (BACKUP_PROXY_URL && BACKUP_PROXY_RETAILERS.has(retailerKey)) ? BACKUP_PROXY_URL : PROXY_URL;
+  const newPort = 10000 + Math.floor(Math.random() * 10000);
+  try {
+    const url = new URL(proxyBase);
+    url.port = String(newPort);
+    const newUrl = url.toString();
+    retailerProxyUrls[retailerKey] = newUrl;
+    retailerProxyAgents[retailerKey] = createProxyAgent(newUrl);
+    console.log(`[proxy] Rotated ${retailerKey} to port ${newPort} (new IP)`);
+  } catch (err) {
+    console.warn(`[proxy] Failed to rotate ${retailerKey}: ${err.message}`);
+  }
+}
+
 function getRetailerProxy(retailerKey) {
   return retailerProxyAgents[retailerKey] || proxyAgent;
 }
@@ -1270,10 +1288,10 @@ function isCostcoBlocked(html) {
 // Returns found[] on success, null if blocked by Akamai Bot Manager.
 async function scrapeCostcoViaFetch() {
   if (!proxyAgent) return null; // fetch will always be blocked without proxy
-  const costcoProxy = getRetailerProxyUrl("costco");
   const found = [];
   let failures = 0;
   let validPages = 0;
+  let rotated = false;
 
   // Pre-warm: fetch homepage to get session cookies (mirrors browser pre-warm).
   // Akamai gives lighter treatment to requests with valid session cookies.
@@ -1282,7 +1300,7 @@ async function scrapeCostcoViaFetch() {
     const homeRes = await scraperFetchRetry("https://www.costco.com/", {
       headers: FETCH_HEADERS,
       timeout: 10000,
-      proxyUrl: costcoProxy,
+      proxyUrl: getRetailerProxyUrl("costco"),
     });
     // got-scraping returns headers as plain object; set-cookie may be string or array
     const rawSetCookie = homeRes.headers["set-cookie"];
@@ -1298,6 +1316,13 @@ async function scrapeCostcoViaFetch() {
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) return; // Early-abort without health tracking — browser will track its own
+    // Rotate proxy IP after 2 consecutive failures (likely burned IP)
+    if (failures >= 2 && !rotated) {
+      rotated = true;
+      rotateRetailerProxy("costco");
+      cookies = ""; // Clear cookies from old IP's session
+      await sleep(1000 + Math.random() * 1000);
+    }
     // Inter-query delay with jitter to reduce Akamai burst detection
     if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
@@ -1308,12 +1333,12 @@ async function scrapeCostcoViaFetch() {
       headers["Referer"] = "https://www.costco.com/";
     }
     try {
-      let res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: costcoProxy });
+      let res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("costco") });
       let html = res.ok ? await res.text() : "";
       // Retry once with backoff if blocked (Akamai may unblock after a pause)
       if (!res.ok || isCostcoBlocked(html)) {
         await sleep(2000 + Math.random() * 1000);
-        const retryRes = await scraperFetch(url, { headers, timeout: 15000, proxyUrl: costcoProxy }).catch(() => null);
+        const retryRes = await scraperFetch(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("costco") }).catch(() => null);
         if (!retryRes?.ok) { failures++; return; }
         const retryHtml = await retryRes.text();
         if (isCostcoBlocked(retryHtml)) { failures++; return; }
@@ -1822,13 +1847,19 @@ async function scrapeWalmartViaFetch(store) {
   const found = [];
   let failures = 0;
   let validPages = 0;
-  const wmProxy = getRetailerProxyUrl("walmart");
+  let rotated = false;
   // Batch queries (2 concurrent) — lower concurrency reduces Akamai/PerimeterX burst detection.
   // With 5 stores potentially running fetch simultaneously, even 2 concurrent queries
   // per store means up to 10 total requests hitting walmart.com at once.
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) return; // Early-abort without health tracking — browser will track its own
+    // Rotate proxy IP after 2 consecutive failures (likely burned IP)
+    if (failures >= 2 && !rotated) {
+      rotated = true;
+      rotateRetailerProxy("walmart");
+      await sleep(1000 + Math.random() * 1000);
+    }
     // Inter-query delay with jitter to reduce burst detection
     if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
@@ -1838,7 +1869,7 @@ async function scrapeWalmartViaFetch(store) {
       headers["Referer"] = "https://www.walmart.com/";
     }
     try {
-      const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: wmProxy });
+      const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("walmart") });
       if (!res.ok) { failures++; return; }
       const html = await res.text();
       // Use brace-counting to extract JSON (handles </script> inside JSON strings)
@@ -2251,10 +2282,10 @@ function matchSamsClubProduct(nextData, bottleName) {
 // Returns found[] on success, null if blocked (triggers browser fallback).
 async function scrapeSamsClubViaFetch() {
   if (!proxyAgent) return null;
-  const scProxy = getRetailerProxyUrl("samsclub");
   const found = [];
   let failures = 0;
   let validPages = 0;
+  let rotated = false;
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
 
   // Pre-warm: fetch homepage to get PerimeterX session cookies before product pages.
@@ -2263,7 +2294,7 @@ async function scrapeSamsClubViaFetch() {
     const homeRes = await scraperFetchRetry("https://www.samsclub.com/", {
       headers: FETCH_HEADERS,
       timeout: 10000,
-      proxyUrl: scProxy,
+      proxyUrl: getRetailerProxyUrl("samsclub"),
     });
     const rawSetCookie = homeRes.headers["set-cookie"];
     const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
@@ -2272,6 +2303,13 @@ async function scrapeSamsClubViaFetch() {
 
   const productTasks = entries.map(([bottleName, productId], i) => async () => {
     if (failures > Math.floor(entries.length / 2)) return; // Early-abort — browser will track its own
+    // Rotate proxy IP after 2 consecutive failures (likely burned IP)
+    if (failures >= 2 && !rotated) {
+      rotated = true;
+      rotateRetailerProxy("samsclub");
+      cookies = "";
+      await sleep(1000 + Math.random() * 1000);
+    }
     if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.samsclub.com/ip/${productId}`;
     const headers = { ...FETCH_HEADERS };
@@ -2281,7 +2319,7 @@ async function scrapeSamsClubViaFetch() {
       headers["Referer"] = "https://www.samsclub.com/";
     }
     try {
-      const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: scProxy });
+      const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("samsclub") });
       if (!res.ok) { failures++; return; }
       const html = await res.text();
       // Brace-counting JSON extraction (same as Walmart path)
@@ -2838,7 +2876,7 @@ export {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
-  createProxyAgent, refreshProxySession, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
+  createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
