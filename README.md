@@ -2,9 +2,9 @@
 
 Automated inventory tracker for allocated and rare bourbon. Monitors 7 major retailers near your zip code and sends real-time Discord alerts with SKU/item numbers, store details, and stock status changes when bottles are spotted or go out of stock.
 
-## Tracked Bottles (39)
+## Tracked Bottles (38)
 
-Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy, Sazerac Rye 18), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch), Buffalo Trace (canary health check).
+Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Antique 107, 12 Year, Full Proof, Single Barrel, C.Y.P.B.), E.H. Taylor (Small Batch, Single Barrel, Barrel Proof, Straight Rye, Seasoned Wood, Four Grain, Amaranth, Cured Oak, 18 Year Marriage), Stagg Jr, BTAC (George T. Stagg, Eagle Rare 17, William Larue Weller, Thomas H. Handy), Pappy Van Winkle (10/12/15/20/23), Van Winkle Family Reserve Rye 13, Elmer T. Lee, Rock Hill Farms, King of Kentucky, Old Forester (Birthday Bourbon, President's Choice, 150th Anniversary, King Ranch), Buffalo Trace (canary health check).
 
 ## Supported Retailers
 
@@ -21,9 +21,9 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 ## How It Works
 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
-2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 14 broad search queries that cover all 39 bottles. Each retailer gets a dedicated residential IP via per-retailer sticky proxy sessions. Retailers are staggered 10-30s apart. All 5 browser scrapers use "clean" Chrome — plain `chromium.launch()` without stealth plugin or rebrowser-patches (these CDP modifications are actually fingerprinted by anti-bot systems). On Mac, browsers run headed (`headless: false`) for complete PerimeterX/Akamai evasion. 4 of 5 scrapers try `got-scraping` fetch-first (Chrome TLS fingerprint impersonation via JA3/JA4 spoofing) before falling back to browser; Total Wine goes straight to browser (PerimeterX requires JS sensor execution). Persistent browser profiles per retailer (HTTP cache, service workers, IndexedDB persist on disk). Browser scrapers follow a human-like flow: homepage → category page → search queries. Includes a PerimeterX "Press & Hold" challenge solver. Known bottle URLs from previous finds are checked directly before searching. Includes a canary bottle (Buffalo Trace) as a scraper health check. Retailers that fail 3 consecutive scans are automatically backed off for 30 minutes.
+2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 13 broad search queries that cover all 38 bottles. Each retailer gets a dedicated residential IP via per-retailer sticky proxy sessions. If a proxy IP gets blocked mid-scan, it automatically rotates to a fresh IP after 2 consecutive failures. Retailers are staggered 10-30s apart. All 5 browser scrapers use "clean" Chrome — plain `chromium.launch()` without stealth plugin or rebrowser-patches (these CDP modifications are actually fingerprinted by anti-bot systems). On Mac, browsers run headed and minimized via CDP `Browser.setWindowBounds`. 4 of 5 scrapers try `got-scraping` fetch-first (Chrome TLS fingerprint impersonation via JA3/JA4 spoofing) before falling back to browser; Total Wine goes straight to browser (PerimeterX requires JS sensor execution). Persistent browser profiles per retailer (HTTP cache, service workers, IndexedDB persist on disk). Browser scrapers follow a human-like flow: homepage → category page → search queries. Includes a PerimeterX "Press & Hold" challenge solver. Known bottle URLs from previous finds are checked directly before searching. Includes a canary bottle (Buffalo Trace) as a scraper health check. Retailers that fail 3 consecutive scans are automatically backed off for 30 minutes.
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
-4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@everyone` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
+4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@here` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 
 ## Setup
 
@@ -141,7 +141,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-534 tests across 5 files using [Vitest](https://vitest.dev/):
+562 tests across 5 files using [Vitest](https://vitest.dev/):
 
 ```sh
 npm test                # Run all tests
@@ -150,8 +150,8 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 418 | Bottle matching, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management, browser mutex |
-| `test/proxy.test.js` | 32 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry |
+| `test/scraper.test.js` | 442 | Bottle matching, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling |
+| `test/proxy.test.js` | 36 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |
 | `test/fallback-stores.test.js` | 6 | Static fallback store data validation |
