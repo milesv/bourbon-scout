@@ -2119,13 +2119,16 @@ async function scrapeWalgreensViaBrowser(page) {
   }]);
 
   // Pre-warm: visit homepage to let Akamai sensor set _abck cookie before searching.
-  // Use domcontentloaded (not networkidle) — Walgreens keeps making beacon requests that
-  // prevent networkidle from ever firing, burning the full 20s timeout.
+  const wgT0 = Date.now();
+  const wgElapsed = () => `${((Date.now() - wgT0) / 1000).toFixed(1)}s`;
   await page.goto("https://www.walgreens.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+  console.log(`[walgreens] Homepage loaded (${wgElapsed()})`);
   await sleep(3000 + Math.random() * 2000);
   await solveHumanChallenge(page);
-  await humanizePage(page);
-  await navigateCategory(page, "walgreens");
+  // Skip heavy humanization — Walgreens pages have thousands of links that make
+  // humanizePage take 70s+ on page.$$('a[href]'). Quick mouse move is enough.
+  await page.mouse.move(400 + Math.random() * 500, 300 + Math.random() * 200, { steps: 10 }).catch(() => {});
+  console.log(`[walgreens] Pre-warm done (${wgElapsed()}), starting queries...`);
 
   let wgFailures = 0;
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {

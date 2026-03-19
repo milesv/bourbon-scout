@@ -96,7 +96,7 @@ function createMockPage() {
     $: vi.fn().mockResolvedValue(null),
     $eval: vi.fn().mockResolvedValue(null),
     close: vi.fn().mockResolvedValue(undefined),
-    mouse: { wheel: vi.fn().mockResolvedValue(undefined) },
+    mouse: { wheel: vi.fn().mockResolvedValue(undefined), move: vi.fn().mockResolvedValue(undefined), down: vi.fn().mockResolvedValue(undefined), up: vi.fn().mockResolvedValue(undefined) },
     context: vi.fn(() => ({
       close: vi.fn().mockResolvedValue(undefined),
       storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }),
@@ -3065,9 +3065,10 @@ describe("main", () => {
     const promise = main();
     promise.catch(() => {});
     // Advance enough for initial poll to complete + schedule log
-    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(10000);
     expect(mocks.discoverStores).toHaveBeenCalled();
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("next poll in"));
+    // Schedule-aware: logs "next poll in" during active hours, "sleeping" outside
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringMatching(/next poll in|sleeping/));
     consoleSpy.mockRestore();
   });
 
