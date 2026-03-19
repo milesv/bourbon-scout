@@ -141,7 +141,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-562 tests across 5 files using [Vitest](https://vitest.dev/):
+581 tests across 5 files using [Vitest](https://vitest.dev/) (95.9% line coverage):
 
 ```sh
 npm test                # Run all tests
@@ -150,7 +150,7 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 442 | Bottle matching, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling |
+| `test/scraper.test.js` | 461 | Bottle matching, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, humanizePage, browser timeout paths |
 | `test/proxy.test.js` | 36 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |

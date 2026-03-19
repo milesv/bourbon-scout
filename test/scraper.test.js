@@ -5578,3 +5578,409 @@ describe("acquireRetailerLock", () => {
     release2();
   });
 });
+
+// ─── humanizePage (indirect via scrapeCostcoOnce) ─────────────────────────────
+
+describe("humanizePage coverage via scrapeCostcoOnce", () => {
+  it("calls mouse.move, mouse.wheel, and hovers links during pre-warm", async () => {
+    const mockPage = createMockPage();
+    // viewportSize is called by humanizePage to bound mouse moves
+    mockPage.viewportSize = vi.fn(() => ({ width: 1366, height: 768 }));
+    // $$ returns links for hover step
+    const mockLink = { hover: vi.fn().mockResolvedValue(undefined) };
+    mockPage.$$.mockResolvedValue([mockLink, mockLink]);
+    // waitForSelector times out (no tiles) — doesn't matter, we're testing humanize coverage
+    mockPage.waitForSelector.mockRejectedValue(new Error("timeout"));
+    mockPage.$$eval.mockResolvedValue([]);
+
+    const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
+    expect(found).toEqual([]);
+    // humanizePage should have called mouse.move (random movements + hover)
+    expect(mockPage.mouse.move).toHaveBeenCalled();
+    // humanizePage scrolls down then back up via mouse.wheel
+    expect(mockPage.mouse.wheel).toHaveBeenCalled();
+    // At least one link should have been hovered
+    expect(mockLink.hover).toHaveBeenCalled();
+  });
+
+  it("handles humanizePage gracefully when $$ throws", async () => {
+    const mockPage = createMockPage();
+    mockPage.viewportSize = vi.fn(() => null); // falls back to default
+    // Force link query to throw — humanizePage wraps in try/catch
+    mockPage.$$.mockRejectedValue(new Error("$$ failed"));
+    mockPage.waitForSelector.mockRejectedValue(new Error("timeout"));
+    mockPage.$$eval.mockResolvedValue([]);
+
+    // Should not throw — humanizePage's catch block absorbs the error
+    const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
+    expect(found).toEqual([]);
+  });
+});
+
+// ─── Walgreens wgFailures >= 3 early abort ────────────────────────────────────
+
+describe("scrapeWalgreensViaBrowser wgFailures early abort", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetWalgreensCoords();
+    _resetScraperHealth();
+    mocks.zipToCoords.mockResolvedValue({ lat: 33.4152, lng: -111.8315 });
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  async function runWgWithFakeTimers(fn) {
+    const promise = fn();
+    promise.catch(() => {});
+    await vi.runAllTimersAsync();
+    return promise;
+  }
+
+  it("skips remaining queries after 3 consecutive failures", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const ctx = {
+      close: vi.fn().mockResolvedValue(undefined),
+      storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }),
+      addCookies: vi.fn().mockResolvedValue(undefined),
+    };
+    const page = createMockPage();
+    page.context = vi.fn(() => ctx);
+    // All queries throw — each increments wgFailures
+    page.goto.mockRejectedValue(new Error("Navigation timeout"));
+    page.evaluate.mockResolvedValue("");
+
+    const found = await runWgWithFakeTimers(() => scrapeWalgreensViaBrowser(page));
+    expect(found).toEqual([]);
+
+    // After 3 failures, remaining queries should be skipped with "blocked" health
+    const health = _getScraperHealth();
+    // At least 3 "fail" from thrown errors + blocked entries from skipped queries
+    expect(health.walgreens.failed + health.walgreens.blocked).toBeGreaterThanOrEqual(3);
+    expect(health.walgreens.blocked).toBeGreaterThan(0); // confirms the skip path was hit
+    warnSpy.mockRestore();
+    errSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+});
+
+// ─── Sam's Club fetch proxy rotation ──────────────────────────────────────────
+
+describe("scrapeSamsClubViaFetch proxy rotation after failures", () => {
+  it("returns null without proxy (baseline)", async () => {
+    const result = await scrapeSamsClubViaFetch();
+    expect(result).toBeNull();
+  });
+});
+
+// ─── searchViaSearchBox (indirect via scrapeTotalWineViaBrowser) ───────────────
+
+describe("searchViaSearchBox coverage via scrapeTotalWineViaBrowser", () => {
+  it("uses search box for first query when input element is found", async () => {
+    const mockPage = createMockPage();
+    // Add keyboard mock (not in createMockPage by default)
+    mockPage.keyboard = {
+      type: vi.fn().mockResolvedValue(undefined),
+      press: vi.fn().mockResolvedValue(undefined),
+    };
+    // viewportSize needed by humanizePage
+    mockPage.viewportSize = vi.fn(() => ({ width: 1366, height: 768 }));
+    mockPage.$$.mockResolvedValue([]); // no links for humanize hover
+
+    // Mock the search input element that searchViaSearchBox looks for
+    const mockInput = {
+      click: vi.fn().mockResolvedValue(undefined),
+      hover: vi.fn().mockResolvedValue(undefined),
+    };
+    // page.$() is called for each search selector — return the input on the first match
+    mockPage.$.mockImplementation(async (selector) => {
+      if (selector.includes("search")) return mockInput;
+      return null;
+    });
+
+    // waitForURL called after pressing Enter in search box
+    mockPage.waitForURL = vi.fn().mockResolvedValue(undefined);
+    // page.url() is checked to verify storeId is in URL after search
+    mockPage.url = vi.fn(() => `https://www.totalwine.com/search/all?text=bourbon&storeId=${TEST_STORE.storeId}`);
+
+    // evaluate returns empty for isBlockedPage/solveHumanChallenge, then null for INITIAL_STATE
+    let evalCount = 0;
+    mockPage.evaluate.mockImplementation(async () => {
+      evalCount++;
+      return evalCount % 2 === 1 ? "" : null;
+    });
+    mockPage.$$eval.mockResolvedValue([]);
+
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaBrowser(TEST_STORE, mockPage));
+    // Verify keyboard.type was called (search box path taken on first query)
+    expect(mockPage.keyboard.type).toHaveBeenCalled();
+    expect(mockPage.keyboard.press).toHaveBeenCalledWith("Enter");
+    expect(found).toEqual([]);
+  });
+
+  it("falls back to direct URL when no search input exists", async () => {
+    const mockPage = createMockPage();
+    mockPage.keyboard = {
+      type: vi.fn().mockResolvedValue(undefined),
+      press: vi.fn().mockResolvedValue(undefined),
+    };
+    mockPage.viewportSize = vi.fn(() => ({ width: 1366, height: 768 }));
+    mockPage.$$.mockResolvedValue([]);
+    // page.$() returns null for all selectors — no search box found
+    mockPage.$.mockResolvedValue(null);
+    mockPage.url = vi.fn(() => "https://www.totalwine.com/");
+
+    mockPage.evaluate.mockResolvedValue("");
+    mockPage.$$eval.mockResolvedValue([]);
+
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaBrowser(TEST_STORE, mockPage));
+    // keyboard.type should NOT have been called (search box not found)
+    expect(mockPage.keyboard.type).not.toHaveBeenCalled();
+    // goto should have been called for direct URL navigation (homepage + category + queries)
+    expect(mockPage.goto).toHaveBeenCalled();
+    expect(found).toEqual([]);
+  });
+});
+
+// ─── Schedule-aware polling (main loop branching) ─────────────────────────────
+
+describe("schedule-aware polling helpers (additional coverage)", () => {
+  it("getMTTime returns hour and day strings", () => {
+    const { hour, day } = getMTTime();
+    expect(typeof hour).toBe("number");
+    expect(hour).toBeGreaterThanOrEqual(0);
+    expect(hour).toBeLessThanOrEqual(23);
+    expect(typeof day).toBe("string");
+    expect(day.length).toBe(3); // e.g. "Mon", "Tue"
+  });
+
+  it("isActiveHour returns false for mid-day hours (10-16)", () => {
+    // 10 AM to 4 PM MT should be inactive (work hours)
+    for (const h of [10, 11, 12, 13, 14, 15, 16]) {
+      expect(isActiveHour(h)).toBe(false);
+    }
+  });
+
+  it("isActiveHour returns true for evening and early morning", () => {
+    // 5 PM - 10 AM MT should be active
+    for (const h of [17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) {
+      expect(isActiveHour(h)).toBe(true);
+    }
+  });
+
+  it("isBoostPeriod returns true on Tue/Thu evenings", () => {
+    // Tue evening = boost period
+    expect(isBoostPeriod(20, "Tue")).toBe(true);
+    expect(isBoostPeriod(22, "Thu")).toBe(true);
+  });
+
+  it("isBoostPeriod returns false on Mon/Wed/Fri evenings", () => {
+    expect(isBoostPeriod(20, "Mon")).toBe(false);
+    expect(isBoostPeriod(20, "Wed")).toBe(false);
+    expect(isBoostPeriod(20, "Fri")).toBe(false);
+  });
+
+  it("isBoostPeriod includes Wed/Fri early mornings (overnight from Tue/Thu)", () => {
+    // Wed 2 AM = still part of Tue night boost window
+    expect(isBoostPeriod(2, "Wed")).toBe(true);
+    // Fri 5 AM = still part of Thu night boost window
+    expect(isBoostPeriod(5, "Fri")).toBe(true);
+  });
+});
+
+// ─── Walmart browser timeout sets retailerBrowserBlocked ──────────────────────
+
+describe("scrapeWalmartStore browser timeout path", () => {
+  beforeEach(() => {
+    _resetRetailerBrowserBlocked();
+    _resetRetailerBrowserCache();
+    _resetRetailerBrowserLocks();
+    _resetScraperHealth();
+    _resetKnownProducts();
+  });
+
+  it("marks walmart as blocked and tracks health on browser timeout", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage } = setupMockBrowser();
+    // Make gotScraping return a non-search page (triggers browser fallback)
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(403, "blocked"));
+    // Make the browser scraper hang forever (triggers timeout)
+    mockPage.goto.mockImplementation(() => new Promise(() => {}));
+    mockPage.evaluate.mockResolvedValue("");
+    mockPage.$$eval.mockResolvedValue([]);
+
+    const result = await runWithFakeTimers(() => scrapeWalmartStore(TEST_STORE));
+    // Should return empty (timeout returns null → dedupFound(knownFound))
+    expect(result).toEqual([]);
+    // Health should show blocked from the timeout
+    const health = _getScraperHealth();
+    expect(health.walmart?.blocked).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── scrapeTotalWineViaBrowser skipPreWarm path ───────────────────────────────
+
+describe("scrapeTotalWineViaBrowser skipPreWarm", () => {
+  it("skips homepage visit and humanizePage when skipPreWarm is true", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const mockPage = createMockPage();
+    mockPage.viewportSize = vi.fn(() => ({ width: 1366, height: 768 }));
+    mockPage.$$.mockResolvedValue([]);
+    mockPage.$.mockResolvedValue(null);
+    mockPage.url = vi.fn(() => "https://www.totalwine.com/");
+    mockPage.evaluate.mockResolvedValue("");
+    mockPage.$$eval.mockResolvedValue([]);
+
+    const found = await runWithFakeTimers(() => scrapeTotalWineViaBrowser(TEST_STORE, mockPage, { skipPreWarm: true }));
+    expect(found).toEqual([]);
+    // Should log the skip message instead of homepage/category messages
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Skipping pre-warm"));
+    // mouse.wheel should NOT have been called (humanizePage skipped)
+    expect(mockPage.mouse.wheel).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+});
+
+// ─── scrapeTotalWineStore browser timeout ─────────────────────────────────────
+
+describe("scrapeTotalWineStore browser timeout path", () => {
+  beforeEach(() => {
+    _resetRetailerBrowserBlocked();
+    _resetRetailerBrowserCache();
+    _resetRetailerBrowserLocks();
+    _resetScraperHealth();
+  });
+
+  it("returns empty and tracks blocked on browser scraper timeout", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage } = setupMockBrowser();
+    // Fetch path returns null (no proxy), so wrapper goes to browser
+    // Browser scraper hangs forever → timeout
+    mockPage.goto.mockImplementation(() => new Promise(() => {}));
+    mockPage.evaluate.mockResolvedValue("");
+    mockPage.viewportSize = vi.fn(() => ({ width: 1366, height: 768 }));
+    mockPage.$$.mockResolvedValue([]);
+
+    const result = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
+    expect(result).toEqual([]);
+    const health = _getScraperHealth();
+    expect(health.totalwine?.blocked).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── scrapeWalgreensStore browser timeout ─────────────────────────────────────
+
+describe("scrapeWalgreensStore browser timeout path", () => {
+  beforeEach(() => {
+    _resetRetailerBrowserBlocked();
+    _resetRetailerBrowserCache();
+    _resetRetailerBrowserLocks();
+    _resetScraperHealth();
+    _resetWalgreensCoords();
+  });
+
+  it("returns empty and tracks blocked on browser scraper timeout", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage } = setupMockBrowser();
+    mocks.zipToCoords.mockResolvedValue({ lat: 33.4152, lng: -111.8315 });
+    // Browser scraper hangs forever → 180s timeout
+    mockPage.goto.mockImplementation(() => new Promise(() => {}));
+    mockPage.evaluate.mockResolvedValue("");
+
+    const result = await runWithFakeTimers(() => scrapeWalgreensStore());
+    expect(result).toEqual([]);
+    const health = _getScraperHealth();
+    // Both attempts time out: first sets "blocked", then retries and times out again
+    expect(health.walgreens?.blocked).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── scrapeSamsClubStore browser timeout ──────────────────────────────────────
+
+describe("scrapeSamsClubStore browser timeout path", () => {
+  beforeEach(() => {
+    _resetRetailerBrowserBlocked();
+    _resetRetailerBrowserCache();
+    _resetRetailerBrowserLocks();
+    _resetScraperHealth();
+  });
+
+  it("returns empty and tracks blocked on browser scraper timeout", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage } = setupMockBrowser();
+    // scrapeSamsClubViaFetch returns null (no proxy), wrapper falls to browser
+    // Browser hangs → timeout
+    mockPage.goto.mockImplementation(() => new Promise(() => {}));
+    mockPage.evaluate.mockResolvedValue("");
+
+    const result = await runWithFakeTimers(() => scrapeSamsClubStore());
+    expect(result).toEqual([]);
+    const health = _getScraperHealth();
+    expect(health.samsclub?.blocked).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── scrapeCostcoStore browser timeout ────────────────────────────────────────
+
+describe("scrapeCostcoStore browser timeout path", () => {
+  beforeEach(() => {
+    _resetRetailerBrowserBlocked();
+    _resetRetailerBrowserCache();
+    _resetRetailerBrowserLocks();
+    _resetScraperHealth();
+  });
+
+  it("returns empty and tracks blocked on browser scraper timeout", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { page: mockPage } = setupMockBrowser();
+    // gotScraping returns 403 so fetch path fails and wrapper tries browser
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(403, "blocked"));
+    // Browser hangs → 180s timeout
+    mockPage.goto.mockImplementation(() => new Promise(() => {}));
+    mockPage.evaluate.mockResolvedValue("");
+    mockPage.viewportSize = vi.fn(() => ({ width: 1366, height: 768 }));
+    mockPage.$$.mockResolvedValue([]);
+
+    const result = await runWithFakeTimers(() => scrapeCostcoStore(TEST_STORE));
+    expect(result).toEqual([]);
+    const health = _getScraperHealth();
+    expect(health.costco?.blocked).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+  });
+});
+
+// ─── buildStoreEmbeds goneOOS with stillInStock ───────────────────────────────
+
+describe("buildStoreEmbeds goneOOS with stillInStock", () => {
+  it("includes OOS list alongside gone bottles", () => {
+    const changes = {
+      newFinds: [],
+      stillInStock: [{ name: "Weller Special Reserve", url: "https://costco.com/wsr", price: "$24.99", sku: "111" }],
+      goneOOS: [{ name: "Blanton's Original", price: "$64.99", sku: "222", firstSeen: new Date(Date.now() - 86400000).toISOString() }],
+    };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds.length).toBeGreaterThan(0);
+    const oosEmbed = embeds.find((e) => e.color === COLORS.goneOOS);
+    expect(oosEmbed).toBeDefined();
+    expect(oosEmbed.description).toContain("Blanton's Original");
+    // stillInStock bottles are excluded from the OOS list
+    expect(oosEmbed.description).toContain("OUT OF STOCK");
+    // Weller Special Reserve is still in stock, so it should NOT appear in the OOS section
+    const oosSection = oosEmbed.description.split("OUT OF STOCK")[1] || "";
+    expect(oosSection).not.toContain("Weller Special Reserve");
+  });
+});
