@@ -2991,7 +2991,7 @@ describe("main", () => {
     // Advance enough for initial poll to complete + schedule log
     await vi.advanceTimersByTimeAsync(5000);
     expect(mocks.discoverStores).toHaveBeenCalled();
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Next poll in"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("next poll in"));
     consoleSpy.mockRestore();
   });
 

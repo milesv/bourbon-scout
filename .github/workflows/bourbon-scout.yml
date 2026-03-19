@@ -2,8 +2,11 @@ name: Bourbon Scout
 
 on:
   schedule:
-    # Every 15 minutes. Offset from :00 to avoid the busiest time (top of hour).
-    - cron: "3,18,33,48 * * * *"
+    # 30-min default: Sun/Mon/Tue/Thu/Sat, 5 PM–10 AM MST (UTC hours 0-16)
+    # Arizona = UTC-7 (no DST): 5 PM MST = 00:00 UTC, 10 AM MST = 17:00 UTC
+    - cron: "3,33 0-16 * * 0,1,2,4,6"
+    # 20-min boost: Tue night→Wed + Thu night→Fri (Wed/Fri in UTC), 5 PM–10 AM MST
+    - cron: "3,23,43 0-16 * * 3,5"
   workflow_dispatch: {} # Manual trigger from GitHub UI
 
 jobs:

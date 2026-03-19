@@ -2870,16 +2870,66 @@ async function main() {
       return; // Prevent fall-through when process.exit is mocked in tests
     }
 
-    // Variable scan intervals: base interval ± 3 min jitter.
-    // Avoids perfectly periodic access patterns that anti-bot ML models detect.
-    // Uses setTimeout chain instead of fixed cron so intervals vary each cycle.
-    const BASE_INTERVAL_MS = parsePollIntervalMs(POLL_INTERVAL);
+    // Schedule-aware poll loop: scans only during active hours (5 PM – 10 AM MT),
+    // with 30-min default intervals and 20-min "boost" intervals on Tue/Thu nights.
+    // Arizona = MST year-round (UTC-7, no DST).
     const JITTER_MS = 3 * 60 * 1000; // ±3 min
+    const ACTIVE_START = 17; // 5 PM MT
+    const ACTIVE_END = 10;   // 10 AM MT
+    const BOOST_INTERVAL_MS = 20 * 60 * 1000; // 20 min
+    const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 min
+
+    // Get current hour and day-of-week in Arizona time
+    function getMTTime() {
+      const now = new Date();
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Phoenix",
+        hour: "numeric", hour12: false,
+        weekday: "short",
+      }).formatToParts(now);
+      const hour = parseInt(parts.find((p) => p.type === "hour").value, 10);
+      const day = parts.find((p) => p.type === "weekday").value; // "Mon", "Tue", etc.
+      return { hour, day };
+    }
+
+    // Active hours: 5 PM – 10 AM MT (overnight window)
+    function isActiveHour(hour) {
+      return hour >= ACTIVE_START || hour < ACTIVE_END;
+    }
+
+    // Boost period: Tue 5 PM → Wed 10 AM, Thu 5 PM → Fri 10 AM (MT)
+    function isBoostPeriod(hour, day) {
+      return (day === "Tue" && hour >= ACTIVE_START) ||
+             (day === "Wed" && hour < ACTIVE_END) ||
+             (day === "Thu" && hour >= ACTIVE_START) ||
+             (day === "Fri" && hour < ACTIVE_END);
+    }
+
+    // Calculate delay until next poll, respecting active hours and boost periods.
+    function getNextPollDelayMs() {
+      const { hour, day } = getMTTime();
+      if (!isActiveHour(hour)) {
+        // Sleep until 5 PM MT today
+        const now = new Date();
+        const mtHourStr = new Intl.DateTimeFormat("en-US", {
+          timeZone: "America/Phoenix", hour: "numeric", minute: "numeric", hour12: false,
+        }).format(now);
+        const [h, m] = mtHourStr.split(":").map(Number);
+        const minsUntil5PM = (ACTIVE_START - h) * 60 - m;
+        const sleepMs = Math.max(60000, minsUntil5PM * 60 * 1000);
+        console.log(`[scheduler] Outside active hours (${h}:${String(m).padStart(2, "0")} MT ${day}) — sleeping ${Math.round(sleepMs / 60000)}min until 5 PM`);
+        return sleepMs;
+      }
+      const base = isBoostPeriod(hour, day) ? BOOST_INTERVAL_MS : DEFAULT_INTERVAL_MS;
+      const jitter = (Math.random() - 0.5) * 2 * JITTER_MS;
+      const label = base === BOOST_INTERVAL_MS ? "boost" : "default";
+      const delayMs = Math.max(60000, base + jitter);
+      console.log(`[scheduler] ${label} interval (${day} ${hour}:xx MT) — next poll in ${Math.round(delayMs / 1000)}s`);
+      return delayMs;
+    }
 
     function scheduleNextPoll() {
-      const jitter = (Math.random() - 0.5) * 2 * JITTER_MS;
-      const nextMs = Math.max(60000, BASE_INTERVAL_MS + jitter); // min 1 min
-      console.log(`[scheduler] Next poll in ${Math.round(nextMs / 1000)}s`);
+      const nextMs = getNextPollDelayMs();
       /* v8 ignore next -- setTimeout scheduling */
       setTimeout(() => {
         poll()
@@ -2888,7 +2938,7 @@ async function main() {
       }, nextMs);
     }
 
-    console.log(`Poll interval: ~${Math.round(BASE_INTERVAL_MS / 60000)}min (±3min jitter)\n`);
+    console.log(`Schedule: 30min default, 20min boost (Tue/Thu nights), active 5 PM – 10 AM MT\n`);
     /* v8 ignore next -- fire-and-forget initial poll */
     poll()
       .catch((err) => console.error("[startup] Initial poll failed:", err))
