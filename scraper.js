@@ -7,7 +7,7 @@ import { chromium as rebrowserChromium } from "rebrowser-playwright-core";
 import { addExtra } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 // node-cron removed — replaced with setTimeout + jitter for variable scan intervals
-import { readFile, writeFile, rename, mkdir, unlink, readdir } from "node:fs/promises";
+import { readFile, writeFile, rename, mkdir, unlink, readdir, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 import * as cheerio from "cheerio";
@@ -151,7 +151,12 @@ function rotateRetailerProxy(retailerKey) {
     const newUrl = url.toString();
     retailerProxyUrls[retailerKey] = newUrl;
     retailerProxyAgents[retailerKey] = createProxyAgent(newUrl);
-    console.log(`[proxy] Rotated ${retailerKey} to port ${newPort} (new IP)`);
+    // Clear stale cookies from old IP — anti-bot ties cookies to IPs
+    browserStateCache = null;
+    if (retailerBrowserCache[retailerKey]) {
+      retailerBrowserCache[retailerKey].context.clearCookies().catch(() => {});
+    }
+    console.log(`[proxy] Rotated ${retailerKey} to port ${newPort} (new IP, cookies cleared)`);
   } catch (err) {
     console.warn(`[proxy] Failed to rotate ${retailerKey}: ${err.message}`);
   }
@@ -178,6 +183,11 @@ function getRetailerBrowserProxy(retailerKey) {
 // Per-poll health metrics per retailer. Reset each poll().
 // Structure: { retailerKey: { queries: 0, succeeded: 0, failed: 0, blocked: 0 } }
 let scraperHealth = {};
+
+// Set when proxy returns 407 TRAFFIC_EXHAUSTED. Fetch paths check this and skip immediately
+// (return null) instead of wasting time hitting a dead proxy. Browser fallback takes over.
+// Reset at the start of each poll().
+let proxyExhausted = false;
 
 function initHealth(key) {
   if (!scraperHealth[key]) scraperHealth[key] = { queries: 0, succeeded: 0, failed: 0, blocked: 0 };
@@ -764,6 +774,11 @@ async function scraperFetch(url, { headers, timeout = 15000, proxyUrl, redirect 
   if (proxyUrl) gotOpts.proxyUrl = proxyUrl;
   const response = await gotScraping(gotOpts);
   const statusCode = response.statusCode;
+  // Detect proxy quota exhaustion — stop wasting time on a dead proxy
+  if (statusCode === 407 && !proxyExhausted) {
+    proxyExhausted = true;
+    console.warn("[proxy] Traffic exhausted (407) — disabling fetch paths for this poll, browser fallback will use direct IP");
+  }
   return {
     ok: statusCode >= 200 && statusCode < 300,
     status: statusCode,
@@ -1035,14 +1050,31 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
     },
   };
   if (CHROME_PATH) contextOpts.executablePath = CHROME_PATH;
-  const proxyConfig = getRetailerBrowserProxy(retailerKey);
-  if (proxyConfig) contextOpts.proxy = proxyConfig;
+  // On Mac, browser uses direct residential IP — strongest anti-detection setup.
+  // Proxy only needed for fetch paths (Chrome TLS fingerprint) and CI (datacenter IPs).
+  // Proxying the browser adds latency, failure points, and proxy IPs are more likely
+  // to be flagged by PerimeterX/Akamai than residential ones.
+  if (!IS_MAC) {
+    const proxyConfig = getRetailerBrowserProxy(retailerKey);
+    if (proxyConfig) contextOpts.proxy = proxyConfig;
+  }
 
   // Clean mode: skip stealth plugin + rebrowser patches.
   // PerimeterX detects CDP modifications from addExtra/stealth and flags as automation.
   // Plain chromium with --disable-blink-features=AutomationControlled passes undetected.
   const launcher = opts.clean ? rebrowserChromium : chromium;
-  const context = await launcher.launchPersistentContext(profileDir, contextOpts);
+  let context;
+  try {
+    context = await launcher.launchPersistentContext(profileDir, contextOpts);
+  } catch (err) {
+    // Profile corruption ("Cannot find context", CDP protocol errors) — nuke and retry once
+    if (!opts._retried) {
+      console.warn(`[${retailerKey}] Browser launch failed, clearing profile: ${err.message}`);
+      await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+      return launchRetailerBrowser(retailerKey, { ...opts, _retried: true });
+    }
+    throw err;
+  }
   retailerBrowserCache[retailerKey] = { context };
   // Minimize the browser window on Mac so it doesn't steal focus during scans.
   // Uses CDP Browser.getWindowForTarget + Browser.setWindowBounds to minimize without
@@ -1105,11 +1137,12 @@ async function humanizePage(page) {
       await page.mouse.wheel(0, 300 + Math.random() * 200);
       await sleep(500 + Math.random() * 500);
     }
-    // Hover over a random visible link (if any)
-    const links = await page.$$("a[href]");
-    if (links.length > 0) {
-      const target = links[Math.floor(Math.random() * Math.min(links.length, 20))];
-      await target.hover().catch(() => {});
+    // Hover over a random visible link (if any). Use $$eval to count without
+    // materializing all elements — page.$$("a[href]") hangs for 10-70s on link-heavy pages.
+    const linkCount = await page.$$eval("a[href]", (els) => els.length);
+    if (linkCount > 0) {
+      const idx = Math.floor(Math.random() * Math.min(linkCount, 20));
+      await page.locator("a[href]").nth(idx).hover().catch(() => {});
       await sleep(300 + Math.random() * 400);
     }
     // Scroll back to top using wheel events (not scrollTo — that's a JS teleport
@@ -1287,7 +1320,7 @@ function isCostcoBlocked(html) {
 // Try fetching Costco search HTML directly and parsing with cheerio (no browser needed).
 // Returns found[] on success, null if blocked by Akamai Bot Manager.
 async function scrapeCostcoViaFetch() {
-  if (!proxyAgent) return null; // fetch will always be blocked without proxy
+  if (!proxyAgent || proxyExhausted) return null; // skip if no proxy or quota exhausted
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -1514,7 +1547,7 @@ function matchTotalWineInitialState(state) {
 // Try fetching Total Wine search HTML directly and parsing INITIAL_STATE (no browser needed).
 // Returns { name, url, price, sku, size, fulfillment }[] on success, null if blocked.
 async function scrapeTotalWineViaFetch(store) {
-  if (!proxyAgent) return null; // fetch will always be blocked without proxy
+  if (!proxyAgent || proxyExhausted) return null; // skip if no proxy or quota exhausted
   const twProxy = getRetailerProxyUrl("totalwine");
   const found = [];
   let failures = 0;
@@ -1844,6 +1877,7 @@ function matchWalmartNextData(nextData) {
 // Continues on per-query failures; only falls back to browser if majority of queries fail.
 // Returns { name, url, price }[] on success, null if blocked/unavailable.
 async function scrapeWalmartViaFetch(store) {
+  if (proxyExhausted) return null; // skip if proxy quota exhausted
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -2130,9 +2164,9 @@ async function scrapeWalgreensViaBrowser(page) {
   await page.mouse.move(400 + Math.random() * 500, 300 + Math.random() * 200, { steps: 10 }).catch(() => {});
   console.log(`[walgreens] Pre-warm done (${wgElapsed()}), starting queries...`);
 
-  let wgFailures = 0;
+  let wgConsecutiveBlocks = 0;
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
-    if (wgFailures >= 3) { trackHealth("walgreens", "blocked"); continue; }
+    if (wgConsecutiveBlocks >= 4) { trackHealth("walgreens", "blocked"); continue; }
     const url = `https://www.walgreens.com/search/results.jsp?Ntt=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
@@ -2147,7 +2181,7 @@ async function scrapeWalgreensViaBrowser(page) {
         if (!solved || (await isBlockedPage(page))) {
           console.warn(`[walgreens] Bot detection page for query "${query}" — skipping`);
           trackHealth("walgreens", "blocked");
-          wgFailures++;
+          wgConsecutiveBlocks++;
           continue;
         }
       }
@@ -2189,10 +2223,11 @@ async function scrapeWalgreensViaBrowser(page) {
         }
       }
       trackHealth("walgreens", "ok");
+      wgConsecutiveBlocks = 0; // Reset on success — only consecutive blocks trigger early exit
     } catch (err) {
       console.error(`[walgreens] Error searching "${query}": ${err.message}`);
       trackHealth("walgreens", "fail");
-      wgFailures++;
+      wgConsecutiveBlocks++;
     }
     await sleep(2000 + Math.random() * 2000);
   }
@@ -2290,7 +2325,7 @@ function matchSamsClubProduct(nextData, bottleName) {
 // Fetch-first: check each product page directly via HTTP, extract __NEXT_DATA__.
 // Returns found[] on success, null if blocked (triggers browser fallback).
 async function scrapeSamsClubViaFetch() {
-  if (!proxyAgent) return null;
+  if (!proxyAgent || proxyExhausted) return null; // skip if no proxy or quota exhausted
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -2741,6 +2776,7 @@ async function poll() {
   krogerToken = null;
   browserStateCache = null;
   scraperHealth = {};
+  proxyExhausted = false;
   for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k];
   const canaryResults = {};
   scanCounter++;
@@ -2914,6 +2950,8 @@ export function _resetKnownProducts() { knownProducts = {}; }
 export function _getKnownProducts() { return knownProducts; }
 export function _resetRetailerBrowserLocks() { for (const k of Object.keys(retailerBrowserLocks)) delete retailerBrowserLocks[k]; }
 export function _resetRetailerBrowserBlocked() { for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k]; }
+export function _setProxyExhausted(v) { proxyExhausted = v; }
+export function _getProxyExhausted() { return proxyExhausted; }
 export { acquireRetailerLock };
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
