@@ -484,6 +484,27 @@ describe("matchesBottle", () => {
     expect(matchesBottle("Old Forester President\u2019s Choice", pc)).toBe(true);
   });
 
+  it("EXCLUDE_TERMS rejects sampler and gift set product titles", () => {
+    const pappy15 = TARGET_BOTTLES.find((b) => b.name === "Pappy Van Winkle 15 Year");
+    expect(matchesBottle("Pappy Van Winkle 15 Year Bourbon Sampler", pappy15)).toBe(false);
+    const blantons = TARGET_BOTTLES.find((b) => b.name === "Blanton's Original");
+    expect(matchesBottle("Blanton's Single Barrel Gift Set", blantons)).toBe(false);
+    expect(matchesBottle("Blanton's Original Variety Pack", blantons)).toBe(false);
+    expect(matchesBottle("Blanton's Single Barrel Combo Pack", blantons)).toBe(false);
+    expect(matchesBottle("Weller Bundle Special", TARGET_BOTTLES.find((b) => b.name === "Weller Special Reserve"))).toBe(false);
+    expect(matchesBottle("EH Taylor Small Batch Miniature 50ml", TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Small Batch"))).toBe(false);
+    expect(matchesBottle("Buffalo Trace Mini Bottle Set", TARGET_BOTTLES.find((b) => b.name === "Buffalo Trace"))).toBe(false);
+  });
+
+  it("EXCLUDE_TERMS does not reject legitimate product titles", () => {
+    const pappy15 = TARGET_BOTTLES.find((b) => b.name === "Pappy Van Winkle 15 Year");
+    expect(matchesBottle("Pappy Van Winkle 15 Year Family Reserve Bourbon 750ml", pappy15)).toBe(true);
+    const blantons = TARGET_BOTTLES.find((b) => b.name === "Blanton's Original");
+    expect(matchesBottle("Blanton's Original Single Barrel Bourbon 750ml", blantons)).toBe(true);
+    const bt = TARGET_BOTTLES.find((b) => b.name === "Buffalo Trace");
+    expect(matchesBottle("Buffalo Trace Bourbon 750ml", bt)).toBe(true);
+  });
+
   it("every TARGET_BOTTLE is reachable by at least one SEARCH_QUERY", () => {
     // Retailer search engines do keyword matching, not substring matching.
     // A query like "blantons bourbon" returns all products containing "blantons".
@@ -3938,6 +3959,26 @@ describe("Kroger null inventory false-positive prevention", () => {
       });
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     expect(found).toEqual([]);
+  });
+
+  it("filters products with OUT_OF_STOCK variant strings (case-insensitive)", async () => {
+    _resetKrogerToken();
+    const variants = ["OUT_OF_STOCK", "out_of_stock", "Temporarily Out_Of_Stock"];
+    for (const stockLevel of variants) {
+      mocks.fetch
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
+        .mockResolvedValue({
+          ok: true,
+          json: async () => ({ data: [{
+            description: "Weller Special Reserve Bourbon 750ml",
+            productId: "0001234",
+            items: [{ fulfillment: { inStore: true }, inventory: { stockLevel }, price: { regular: 29.99 } }],
+          }] }),
+        });
+      const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
+      expect(found).toEqual([]);
+      mocks.fetch.mockReset();
+    }
   });
 });
 

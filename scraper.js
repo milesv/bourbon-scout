@@ -888,8 +888,13 @@ function normalizeText(text) {
   return text.toLowerCase().replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'").replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"');
 }
 
+// Product titles containing these terms are not individual bottles — skip them to prevent
+// sampler packs, gift sets, etc. from triggering multiple bottle matches at once.
+const EXCLUDE_TERMS = ["sampler", "gift set", "variety pack", "combo pack", "bundle", "miniature", "mini bottle"];
+
 function matchesBottle(text, bottle) {
   const lower = normalizeText(text);
+  if (EXCLUDE_TERMS.some((t) => lower.includes(t))) return false;
   return bottle.searchTerms.some((term) => lower.includes(term));
 }
 
@@ -2751,21 +2756,19 @@ async function scrapeKrogerStore(store) {
   function matchKrogerProducts(products) {
     for (const product of products) {
       const title = product.description || "";
-      // Require a positive inventory signal — null/missing inventory is not "in stock"
-      const inStock = product.items?.some(
-        (i) =>
-          i.fulfillment?.inStore === true &&
-          i.inventory?.stockLevel != null &&
-          i.inventory.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
-      );
+      // Require a positive inventory signal — null/missing inventory is not "in stock".
+      // Case-insensitive OOS check catches "TEMPORARILY_OUT_OF_STOCK", "OUT_OF_STOCK", etc.
+      const isKrogerItemInStock = (i) =>
+        i.fulfillment?.inStore === true &&
+        i.inventory?.stockLevel != null &&
+        !String(i.inventory.stockLevel).toLowerCase().includes("out_of_stock");
+      const inStock = product.items?.some(isKrogerItemInStock);
       if (!inStock) continue;
       for (const bottle of TARGET_BOTTLES) {
         if (matchesBottle(title, bottle)) {
           // Prefer the item variant that is actually in-store, not blindly items[0]
           // (which may be a different size at a different price)
-          const inStoreItem = product.items?.find(
-            (i) => i.fulfillment?.inStore === true && i.inventory?.stockLevel != null && i.inventory.stockLevel !== "TEMPORARILY_OUT_OF_STOCK"
-          ) || product.items?.[0];
+          const inStoreItem = product.items?.find(isKrogerItemInStock) || product.items?.[0];
           const price = inStoreItem?.price?.promo ?? inStoreItem?.price?.regular;
           const fulfillmentParts = [];
           if (inStoreItem?.fulfillment?.inStore) fulfillmentParts.push("In-store");
@@ -3085,7 +3088,7 @@ async function poll() {
 
 export {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
