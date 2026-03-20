@@ -2200,11 +2200,15 @@ async function scrapeWalgreensViaBrowser(page) {
               title: (el.querySelector(".product__title, [class*='product__title'], [class*='productTitle']") || {}).textContent?.trim() || "",
               price: (el.querySelector(".product__price-contain, [class*='product__price'], [class*='productPrice']") || {}).textContent?.trim() || "",
               url: (el.querySelector('a[href*="ID="], a[href*="/store/product/"]') || {}).href || "",
-              // Match multiple OOS text variants to survive copy changes
+              // Match multiple OOS/unconfirmed text variants to survive copy changes.
+              // "price available in store" = catalog listing with no confirmed stock
+              // (calling stores revealed they don't even carry liquor).
               outOfStock: text.includes("not sold at your store") ||
                           text.includes("not available at this store") ||
                           text.includes("out of stock") ||
-                          text.includes("unavailable"),
+                          text.includes("unavailable") ||
+                          text.includes("price available in store") ||
+                          text.includes("check your local store"),
             };
           })
         /* v8 ignore stop */
@@ -2212,6 +2216,10 @@ async function scrapeWalgreensViaBrowser(page) {
 
       for (const p of products) {
         if (p.outOfStock) continue;
+        // Skip catalog-only listings with no real price — "Price available in store"
+        // means Walgreens can't confirm stock online. Reduces false positives.
+        const priceText = (p.price || "").toLowerCase();
+        if (!priceText || priceText.includes("available in store") || priceText.includes("check your")) continue;
         for (const bottle of TARGET_BOTTLES) {
           if (matchesBottle(p.title, bottle)) {
             const idMatch = p.url.match(/ID=(\w+)/);

@@ -2643,6 +2643,32 @@ describe("scrapeWalgreensViaBrowser", () => {
     expect(result).toEqual([]);
   });
 
+  it("skips catalog-only items with 'Price available in store' (false positive prevention)", async () => {
+    const page = createWalgreensPage([
+      {
+        title: "W.L. Weller Antique 107 Kentucky Straight Bourbon Whiskey",
+        price: "Price available in store",
+        url: "https://www.walgreens.com/store/c/w-l-weller-antique-107/ID=300463000-product",
+        outOfStock: false,
+      },
+    ]);
+    const result = await runWithFakeTimers(() => scrapeWalgreensViaBrowser(page));
+    expect(result).toEqual([]);
+  });
+
+  it("skips items with empty price (no confirmed stock)", async () => {
+    const page = createWalgreensPage([
+      {
+        title: "Blanton's Single Barrel Bourbon - 750 mL",
+        price: "",
+        url: "https://www.walgreens.com/store/c/blantons/ID=300425265-product",
+        outOfStock: false,
+      },
+    ]);
+    const result = await runWithFakeTimers(() => scrapeWalgreensViaBrowser(page));
+    expect(result).toEqual([]);
+  });
+
   it("sets USER_LOC cookie on page context", async () => {
     const page = createWalgreensPage([]);
     await runWithFakeTimers(() => scrapeWalgreensViaBrowser(page));
