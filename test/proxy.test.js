@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => {
   class MockSocksProxyAgent {
     constructor(url) { MockSocksProxyAgent._lastUrl = url; Object.assign(this, SocksProxyAgentInstance); }
   }
+  const sharedLaunchPersistentContext = vi.fn();
   return {
     fetch: vi.fn(),
     gotScraping: vi.fn(),
@@ -30,7 +31,8 @@ const mocks = vi.hoisted(() => {
     rename: vi.fn(),
     mkdir: vi.fn().mockResolvedValue(undefined),
     chromiumLaunch: vi.fn(),
-    chromiumLaunchPersistentContext: vi.fn(),
+    chromiumLaunchPersistentContext: sharedLaunchPersistentContext,
+    vanillaLaunchPersistentContext: sharedLaunchPersistentContext,
     chromiumUse: vi.fn(),
     discoverStores: vi.fn(),
     HttpsProxyAgent: MockHttpsProxyAgent,
@@ -46,6 +48,9 @@ vi.mock("got-scraping", () => ({ gotScraping: mocks.gotScraping }));
 vi.mock("rebrowser-playwright-core", () => ({
   chromium: { launchPersistentContext: mocks.chromiumLaunchPersistentContext },
 }));
+vi.mock("playwright-core", () => ({
+  chromium: { launchPersistentContext: mocks.vanillaLaunchPersistentContext },
+}));
 vi.mock("playwright-extra", () => ({
   addExtra: () => ({ use: mocks.chromiumUse, launch: mocks.chromiumLaunch, launchPersistentContext: mocks.chromiumLaunchPersistentContext }),
 }));
@@ -58,6 +63,9 @@ vi.mock("node:fs/promises", () => ({
   writeFile: mocks.writeFile,
   rename: mocks.rename,
   mkdir: mocks.mkdir,
+  readdir: vi.fn().mockResolvedValue([]),
+  unlink: vi.fn().mockResolvedValue(undefined),
+  rm: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("../lib/discover-stores.js", () => ({
   discoverStores: mocks.discoverStores,

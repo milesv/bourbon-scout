@@ -12,6 +12,10 @@ const mocks = vi.hoisted(() => {
   process.env.SAFEWAY_API_KEY = "test-safeway-key";
   process.env.POLL_INTERVAL = "*/15 * * * *";
 
+  // Shared launch mock: clean mode (vanillaChromium) and stealth mode (rebrowserChromium)
+  // both use the same mock, so test overrides of chromiumLaunchPersistentContext
+  // automatically apply to vanilla clean-mode paths too.
+  const sharedLaunchPersistentContext = vi.fn();
   return {
     fetch: vi.fn(),
     gotScraping: vi.fn(),
@@ -20,7 +24,8 @@ const mocks = vi.hoisted(() => {
     rename: vi.fn(),
     mkdir: vi.fn().mockResolvedValue(undefined),
     chromiumLaunch: vi.fn(),
-    chromiumLaunchPersistentContext: vi.fn(),
+    chromiumLaunchPersistentContext: sharedLaunchPersistentContext,
+    vanillaLaunchPersistentContext: sharedLaunchPersistentContext,
     chromiumUse: vi.fn(),
     discoverStores: vi.fn(),
     zipToCoords: vi.fn().mockResolvedValue({ lat: 33.4152, lng: -111.8315 }),
@@ -32,6 +37,9 @@ vi.mock("node-fetch", () => ({ default: mocks.fetch }));
 vi.mock("got-scraping", () => ({ gotScraping: mocks.gotScraping }));
 vi.mock("rebrowser-playwright-core", () => ({
   chromium: { launchPersistentContext: mocks.chromiumLaunchPersistentContext },
+}));
+vi.mock("playwright-core", () => ({
+  chromium: { launchPersistentContext: mocks.vanillaLaunchPersistentContext },
 }));
 vi.mock("playwright-extra", () => ({
   addExtra: () => ({ use: mocks.chromiumUse, launch: mocks.chromiumLaunch, launchPersistentContext: mocks.chromiumLaunchPersistentContext }),
@@ -112,10 +120,11 @@ function createMockPage() {
 
 function setupMockBrowser() {
   const mockPage = createMockPage();
-  const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }), addCookies: vi.fn().mockResolvedValue(undefined) };
+  const mockContext = { newPage: vi.fn().mockResolvedValue(mockPage), close: vi.fn().mockResolvedValue(undefined), storageState: vi.fn().mockResolvedValue({ cookies: [], origins: [] }), addCookies: vi.fn().mockResolvedValue(undefined), clearCookies: vi.fn().mockResolvedValue(undefined), pages: vi.fn(() => []) };
   const mockBrowser = { newContext: vi.fn().mockResolvedValue(mockContext), close: vi.fn().mockResolvedValue(undefined) };
   // Mock both launch (shared browser) and launchPersistentContext (retailer browsers)
   mocks.chromiumLaunch.mockResolvedValue(mockBrowser);
+  // Both rebrowser (stealth) and vanilla (clean) use the same shared mock
   mocks.chromiumLaunchPersistentContext.mockResolvedValue(mockContext);
   return { browser: mockBrowser, context: mockContext, page: mockPage };
 }

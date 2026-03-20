@@ -4,6 +4,7 @@ import { gotScraping } from "got-scraping";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { chromium as rebrowserChromium } from "rebrowser-playwright-core";
+import { chromium as vanillaChromium } from "playwright-core";
 import { addExtra } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 // node-cron removed — replaced with setTimeout + jitter for variable scan intervals
@@ -15,7 +16,8 @@ import { discoverStores } from "./lib/discover-stores.js";
 import { zipToCoords } from "./lib/geo.js";
 
 // rebrowser-patches: patched CDP commands to evade Akamai/PerimeterX automation detection
-// Stealth plugin: higher-level browser fingerprint spoofing (navigator.webdriver, etc.)
+// Only used for discover-stores.js (store locators) via addExtra + StealthPlugin.
+// All 5 retailer scrapers use vanillaChromium for truly clean CDP.
 const chromium = addExtra(rebrowserChromium);
 chromium.use(StealthPlugin());
 
@@ -1059,10 +1061,12 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
     if (proxyConfig) contextOpts.proxy = proxyConfig;
   }
 
-  // Clean mode: skip stealth plugin + rebrowser patches.
-  // PerimeterX detects CDP modifications from addExtra/stealth and flags as automation.
-  // Plain chromium with --disable-blink-features=AutomationControlled passes undetected.
-  const launcher = opts.clean ? rebrowserChromium : chromium;
+  // Clean mode: use vanilla playwright-core (truly unpatched CDP).
+  // rebrowser-playwright-core has CDP patches (crConnection.js: __re__getMainWorld,
+  // __re__emitExecutionContext) that cause intermittent "Cannot find context" and
+  // "session closed" protocol errors. vanillaChromium avoids these entirely.
+  // Both use the same system Chrome binary (via executablePath) — only the CDP layer differs.
+  const launcher = opts.clean ? vanillaChromium : chromium;
   let context;
   try {
     context = await launcher.launchPersistentContext(profileDir, contextOpts);
