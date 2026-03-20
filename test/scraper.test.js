@@ -74,7 +74,7 @@ import {
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
-  shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
+  shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
@@ -86,7 +86,7 @@ import {
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
   _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
-  _resetRetailerFailures, _resetKnownProducts, _getKnownProducts,
+  _resetRetailerFailures, _resetKnownProducts, _getKnownProducts, _setKnownProducts,
   acquireRetailerLock, _resetRetailerBrowserLocks, _resetRetailerBrowserBlocked,
   _setProxyExhausted, _getProxyExhausted,
 } from "../scraper.js";
@@ -4284,7 +4284,7 @@ describe("loadKnownProducts", () => {
     _resetKnownProducts();
   });
 
-  it("extracts product URLs from state", () => {
+  it("extracts product URLs from state and merges with seeds", () => {
     const state = {
       walmart: {
         store1: {
@@ -4297,12 +4297,14 @@ describe("loadKnownProducts", () => {
     };
     loadKnownProducts(state);
     const known = _getKnownProducts();
-    expect(known.walmart).toHaveLength(2);
+    // Should have seed URLs + 2 state URLs (deduped against seeds)
     expect(known.walmart.find(p => p.name === "Blanton's").url).toBe("https://walmart.com/ip/blantons/123");
     expect(known.walmart.find(p => p.name === "Weller SR").url).toBe("https://walmart.com/ip/weller/456");
+    // Seed URLs should also be present
+    expect(known.walmart.length).toBeGreaterThan(2);
   });
 
-  it("deduplicates URLs across stores", () => {
+  it("deduplicates URLs across stores and seeds", () => {
     const state = {
       walmart: {
         store1: { bottles: { "Blanton's": { url: "https://walmart.com/ip/blantons/123" } } },
@@ -4311,11 +4313,12 @@ describe("loadKnownProducts", () => {
     };
     loadKnownProducts(state);
     const known = _getKnownProducts();
-    // Same URL from two stores should only appear once
-    expect(known.walmart).toHaveLength(1);
+    // Same URL from two stores should only appear once (on top of seeds)
+    const blantons = known.walmart.filter(p => p.url === "https://walmart.com/ip/blantons/123");
+    expect(blantons).toHaveLength(1);
   });
 
-  it("skips bottles without URLs", () => {
+  it("returns seeds even when state has no URLs", () => {
     const state = {
       walmart: {
         store1: { bottles: { "Blanton's": { sku: "123" } } }, // no url
@@ -4323,16 +4326,19 @@ describe("loadKnownProducts", () => {
     };
     loadKnownProducts(state);
     const known = _getKnownProducts();
-    expect(known.walmart).toBeUndefined(); // no valid products → key not set
+    // walmart should have seed URLs even though state had no URLs
+    expect(known.walmart.length).toBeGreaterThan(0);
   });
 
-  it("handles empty state", () => {
+  it("populates seed URLs on empty state", () => {
     loadKnownProducts({});
     const known = _getKnownProducts();
-    expect(Object.keys(known)).toHaveLength(0);
+    // Should have seed retailers (walmart, totalwine)
+    expect(known.walmart.length).toBeGreaterThan(0);
+    expect(known.totalwine.length).toBeGreaterThan(0);
   });
 
-  it("skips stores without bottles key", () => {
+  it("populates seeds even when state has no bottles key", () => {
     const state = {
       walmart: {
         store1: { lastScanned: "2024-01-01" }, // no bottles
@@ -4340,7 +4346,21 @@ describe("loadKnownProducts", () => {
     };
     loadKnownProducts(state);
     const known = _getKnownProducts();
-    expect(known.walmart).toBeUndefined();
+    // walmart should still have seed URLs
+    expect(known.walmart.length).toBeGreaterThan(0);
+  });
+
+  it("seed URLs include walmart and totalwine", () => {
+    loadKnownProducts({});
+    const known = _getKnownProducts();
+    expect(known.walmart.some(p => p.url.includes("walmart.com/ip/"))).toBe(true);
+    expect(known.totalwine.some(p => p.url.includes("totalwine.com/"))).toBe(true);
+  });
+
+  it("does not have internal _urls_ keys after load", () => {
+    loadKnownProducts({});
+    const known = _getKnownProducts();
+    expect(Object.keys(known).some(k => k.startsWith("_urls_"))).toBe(false);
   });
 });
 
@@ -4420,12 +4440,8 @@ describe("checkWalmartKnownUrls", () => {
   });
 
   it("skips non-Walmart URLs", async () => {
-    const state = {
-      walmart: {
-        s1: { bottles: { "Blanton's": { url: "https://costco.com/blantons" } } },
-      },
-    };
-    loadKnownProducts(state);
+    // Set known products directly (bypassing seeds) to test URL filtering only
+    _setKnownProducts({ walmart: [{ name: "Blanton's", url: "https://costco.com/blantons" }] });
     const result = await runWithFakeTimers(() => checkWalmartKnownUrls(store));
     expect(result).toEqual([]);
     expect(mocks.fetch).not.toHaveBeenCalled();
@@ -4445,6 +4461,156 @@ describe("checkWalmartKnownUrls", () => {
     const result = await runWithFakeTimers(() => checkWalmartKnownUrls(store));
     expect(result).toEqual([]);
     vi.restoreAllMocks();
+  });
+});
+
+// ─── checkCostcoKnownUrls ──────────────────────────────────────────────────
+
+describe("checkCostcoKnownUrls", () => {
+  beforeEach(() => {
+    _resetKnownProducts();
+    mocks.fetch.mockReset();
+    mocks.gotScraping.mockReset();
+  });
+
+  it("returns empty when no known costco products", async () => {
+    loadKnownProducts({});
+    const result = await runWithFakeTimers(() => checkCostcoKnownUrls());
+    expect(result).toEqual([]);
+  });
+
+  it("fetches known costco URLs and parses tiles", async () => {
+    const state = {
+      costco: {
+        s1: { bottles: { "Blanton's Original": { url: "https://www.costco.com/.product.12345.html" } } },
+      },
+    };
+    loadKnownProducts(state);
+    mocks.gotScraping.mockResolvedValueOnce(
+      mockGotResponse(200, `<html><body><div data-testid="ProductTile_12345"><h3>Blanton's Original Single Barrel Bourbon 750ml</h3><span data-testid="Text_Price_12345">$59.99</span><a href="https://www.costco.com/.product.12345.html"></a></div></body></html>`)
+    );
+    const result = await runWithFakeTimers(() => checkCostcoKnownUrls());
+    expect(result.length).toBeGreaterThan(0);
+    expect(result[0].name).toBe("Blanton's Original");
+  });
+
+  it("skips non-Costco URLs", async () => {
+    _setKnownProducts({ costco: [{ name: "Test", url: "https://walmart.com/something" }] });
+    const result = await runWithFakeTimers(() => checkCostcoKnownUrls());
+    expect(result).toEqual([]);
+  });
+
+  it("skips blocked responses", async () => {
+    const state = {
+      costco: {
+        s1: { bottles: { "Blanton's Original": { url: "https://www.costco.com/.product.12345.html" } } },
+      },
+    };
+    loadKnownProducts(state);
+    mocks.gotScraping.mockResolvedValueOnce(
+      mockGotResponse(200, `<html><body>Access Denied</body></html>`)
+    );
+    const result = await runWithFakeTimers(() => checkCostcoKnownUrls());
+    expect(result).toEqual([]);
+  });
+});
+
+// ─── checkTotalWineKnownUrls ────────────────────────────────────────────────
+
+describe("checkTotalWineKnownUrls", () => {
+  const store = { storeId: "1005", name: "Total Wine Tempe" };
+
+  beforeEach(() => {
+    _resetKnownProducts();
+    mocks.fetch.mockReset();
+    mocks.gotScraping.mockReset();
+  });
+
+  it("returns empty when no known totalwine products", async () => {
+    loadKnownProducts({});
+    // totalwine has seed URLs, but checkTotalWineKnownUrls reads from knownProducts.totalwine
+    // Reset to truly empty
+    _resetKnownProducts();
+    const result = await runWithFakeTimers(() => checkTotalWineKnownUrls(store));
+    expect(result).toEqual([]);
+  });
+
+  it("fetches known totalwine URLs with storeId and parses INITIAL_STATE", async () => {
+    const state = {
+      totalwine: {
+        s1: { bottles: { "Blanton's Original": { url: "https://www.totalwine.com/spirits/bourbon/blantons/p/12345" } } },
+      },
+    };
+    loadKnownProducts(state);
+    const initialState = JSON.stringify({
+      search: {
+        results: {
+          products: [{
+            name: "Blanton's Original Single Barrel Bourbon",
+            stockLevel: [{ stock: 5 }],
+            productUrl: "/spirits/bourbon/blantons/p/12345",
+            price: [{ price: "59.99" }],
+          }],
+        },
+      },
+    });
+    mocks.gotScraping.mockResolvedValueOnce(
+      mockGotResponse(200, `<html><script>window.INITIAL_STATE = ${initialState};</script></html>`)
+    );
+    const result = await runWithFakeTimers(() => checkTotalWineKnownUrls(store));
+    expect(result.length).toBeGreaterThan(0);
+    expect(result[0].name).toBe("Blanton's Original");
+  });
+
+  it("appends storeId to product URL", async () => {
+    const state = {
+      totalwine: {
+        s1: { bottles: { "Blanton's Original": { url: "https://www.totalwine.com/spirits/bourbon/blantons/p/12345" } } },
+      },
+    };
+    loadKnownProducts(state);
+    mocks.gotScraping.mockResolvedValueOnce(mockGotResponse(200, "<html>no data</html>"));
+    await runWithFakeTimers(() => checkTotalWineKnownUrls(store));
+    const call = mocks.gotScraping.mock.calls.find(c => c[0]?.url?.includes("totalwine.com"));
+    expect(call[0].url).toContain("storeId=1005");
+  });
+
+  it("skips non-TotalWine URLs", async () => {
+    _setKnownProducts({ totalwine: [{ name: "Test", url: "https://walmart.com/something" }] });
+    const result = await runWithFakeTimers(() => checkTotalWineKnownUrls(store));
+    expect(result).toEqual([]);
+  });
+});
+
+// ─── SEED_PRODUCT_URLS ─────────────────────────────────────────────────────
+
+describe("SEED_PRODUCT_URLS", () => {
+  it("contains walmart and totalwine retailers", () => {
+    expect(SEED_PRODUCT_URLS.walmart.length).toBeGreaterThan(0);
+    expect(SEED_PRODUCT_URLS.totalwine.length).toBeGreaterThan(0);
+  });
+
+  it("walmart seeds have valid walmart.com/ip URLs", () => {
+    for (const seed of SEED_PRODUCT_URLS.walmart) {
+      expect(seed.url).toContain("walmart.com/ip/");
+      expect(seed.name).toBeTruthy();
+    }
+  });
+
+  it("totalwine seeds have valid totalwine.com URLs", () => {
+    for (const seed of SEED_PRODUCT_URLS.totalwine) {
+      expect(seed.url).toContain("totalwine.com/");
+      expect(seed.name).toBeTruthy();
+    }
+  });
+
+  it("seed bottle names match TARGET_BOTTLES", () => {
+    const targetNames = new Set(TARGET_BOTTLES.map(b => b.name));
+    for (const [, seeds] of Object.entries(SEED_PRODUCT_URLS)) {
+      for (const seed of seeds) {
+        expect(targetNames.has(seed.name)).toBe(true);
+      }
+    }
   });
 });
 

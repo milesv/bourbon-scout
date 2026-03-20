@@ -251,21 +251,88 @@ function recordRetailerOutcome(key, success) {
 // bottles that search might miss due to anti-bot blocking.
 let knownProducts = {};
 
+// Seed product URLs for cold-start coverage. These are real product pages that exist
+// even before state.json has any data. State.json URLs are merged on top (may have
+// fresher prices). Costco has no product pages on costco.com for allocated bourbon.
+const SEED_PRODUCT_URLS = {
+  walmart: [
+    { name: "Buffalo Trace", url: "https://www.walmart.com/ip/Buffalo-Trace-Kentucky-Straight-Bourbon-Whiskey-750-ml-Liquor-45-Alcohol/132872863" },
+    { name: "Blanton's Original", url: "https://www.walmart.com/ip/Blanton-s-Single-Barrel-Bourbon-750ml-93-Proof/101986207" },
+    { name: "Blanton's Gold", url: "https://www.walmart.com/ip/Blantons-Gold-Bourbon-750-Ml/1118154348" },
+    { name: "Weller Special Reserve", url: "https://www.walmart.com/ip/Weller-Special-Reserve-Kentucky-Straight-Bourbon-Whiskey-750ml-90-Proof/181841775" },
+    { name: "Weller Antique 107", url: "https://www.walmart.com/ip/WELLER-ANTIQUE-SP-BBN-750ML-107P/129914663" },
+    { name: "Weller 12 Year", url: "https://www.walmart.com/ip/Weller-12yr-Bbn-12-750ml-90pf/199333690" },
+    { name: "Weller Full Proof", url: "https://www.walmart.com/ip/Weller-Full-Proof-Kentucky-Straight-Bourbon-Whiskey-750ml-114-Proof/271272409" },
+    { name: "E.H. Taylor Small Batch", url: "https://www.walmart.com/ip/E-H-Taylor-Small-Batch-Kentucky-Straight-Bourbon-Whiskey-750ml-100-Proof/248113789" },
+    { name: "Eagle Rare 17 Year", url: "https://www.walmart.com/ip/Eagle-Rare-10-Year-Kentucky-Straight-Bourbon-Whiskey-750ml-90-Proof/141486286" },
+    { name: "Stagg Jr", url: "https://www.walmart.com/ip/Stagg-Jr-Kentucky-Straight-Bourbon-Whiskey-750ml-Varying-Proof/961263340" },
+    { name: "George T. Stagg", url: "https://www.walmart.com/ip/George-T-Stagg-Kentucky-Straight-Bourbon-Whiskey-750mL/47934603" },
+    { name: "Pappy Van Winkle 10 Year", url: "https://www.walmart.com/ip/Old-Rip-Van-Winkle-Aged-10-Years-Kentucky-Straight-Bourbon-Whiskey-750ml-107-Proof/173438393" },
+    { name: "Pappy Van Winkle 12 Year", url: "https://www.walmart.com/ip/ORVW-SR-12YR-BBN-750ML-90-4PF/167382862" },
+    { name: "Pappy Van Winkle 15 Year", url: "https://www.walmart.com/ip/Pappy-Van-Winkle-s-15-Years-Old-Family-Reserve-Kentucky-Straight-Bourbon-Whiskey-750ml-107-Proof/46707130" },
+    { name: "Pappy Van Winkle 20 Year", url: "https://www.walmart.com/ip/Pappy-Van-Winkle-s-Family-Reserve-20-Years-Old-Kentucky-Straight-Bourbon-Whiskey-750ml-90-4-Proof/46707131" },
+  ],
+  totalwine: [
+    { name: "Buffalo Trace", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/buffalo-trace-kentucky-straight-bourbon-whiskey/p/102882750" },
+    { name: "Blanton's Original", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/blantons-single-barrel-bourbon/p/170891050" },
+    { name: "Blanton's Gold", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/blantons-gold-bourbon/p/231752750" },
+    { name: "Blanton's Straight from the Barrel", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/blantons-straight-from-the-barrel/p/234524750" },
+    { name: "Weller Special Reserve", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/wl-weller-special-reserve-bourbon/p/13538750" },
+    { name: "Weller Antique 107", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/old-weller-antique-107/p/97087750" },
+    { name: "Weller 12 Year", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/wl-weller-12-year-bourbon/p/105505750" },
+    { name: "Weller Full Proof", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/wl-weller-full-proof/p/191577750" },
+    { name: "Weller Single Barrel", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/wl-weller-single-barrel-bourbon/p/231903750" },
+    { name: "E.H. Taylor Small Batch", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/colonel-eh-taylor-small-batch-bourbon/p/137579750" },
+    { name: "E.H. Taylor Single Barrel", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/colonel-eh-taylor-single-barrel-bourbon/p/125138750" },
+    { name: "E.H. Taylor Barrel Proof", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/colonel-eh-taylor-barrel-proof-bourbon/p/125367750" },
+    { name: "E.H. Taylor Amaranth", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/colonel-eh-taylor-amaranth/p/220278750" },
+    { name: "E.H. Taylor 18 Year Marriage", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/colonel-eh-taylor-18-yr-marriage-bourbon/p/231398750" },
+    { name: "Eagle Rare 17 Year", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/eagle-rare-17-year-kentucky-straight-bourbon-whiskey/p/102755750" },
+    { name: "Stagg Jr", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/stagg-bourbon/p/135217750" },
+    { name: "George T. Stagg", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/george-t-stagg-bourbon/p/102757750" },
+    { name: "William Larue Weller", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/william-larue-weller-kentucky-straight-bourbon-whiskey/p/107589750" },
+    { name: "Thomas H. Handy", url: "https://www.totalwine.com/spirits/american-whiskey/rye-whiskey/thomas-h-handy-sazerac-straight-rye-whiskey/p/102758750" },
+    { name: "Pappy Van Winkle 10 Year", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/old-rip-van-winkle-10-year-bourbon/p/109132750" },
+    { name: "Pappy Van Winkle 12 Year", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/van-winkle-special-reserve-12-year-bourbon/p/106280750" },
+    { name: "Pappy Van Winkle 15 Year", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/pappy-van-winkle-family-reserve-15-year-bourbon/p/96355750" },
+    { name: "Pappy Van Winkle 20 Year", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/pappy-van-winkle-family-reserve-20-year-bourbon/p/97274750" },
+    { name: "Pappy Van Winkle 23 Year", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/pappy-van-winkle-family-reserve-23-year-bourbon/p/106282750" },
+    { name: "Van Winkle Family Reserve Rye", url: "https://www.totalwine.com/spirits/american-whiskey/rye-whiskey/van-winkle-family-reserve-13-year-rye/p/109168750" },
+    { name: "Rock Hill Farms", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/rock-hill-farms-bourbon/p/5343750" },
+  ],
+};
+
 function loadKnownProducts(state) {
   knownProducts = {};
-  for (const [retailerKey, stores] of Object.entries(state)) {
+  // Start with seed URLs (cold-start baseline)
+  for (const [retailerKey, seeds] of Object.entries(SEED_PRODUCT_URLS)) {
     const urls = new Set();
     const products = [];
+    for (const seed of seeds) {
+      urls.add(seed.url);
+      products.push({ name: seed.name, url: seed.url, sku: "", price: "" });
+    }
+    knownProducts[retailerKey] = products;
+    // Store urls Set for dedup when merging state.json below
+    knownProducts[`_urls_${retailerKey}`] = urls;
+  }
+  // Merge state.json URLs on top (may have fresher prices/SKUs)
+  for (const [retailerKey, stores] of Object.entries(state)) {
+    const urls = knownProducts[`_urls_${retailerKey}`] || new Set();
+    if (!knownProducts[retailerKey]) knownProducts[retailerKey] = [];
     for (const storeData of Object.values(stores)) {
       if (!storeData?.bottles) continue;
       for (const [name, bottle] of Object.entries(storeData.bottles)) {
         if (bottle.url && !urls.has(bottle.url)) {
           urls.add(bottle.url);
-          products.push({ name, url: bottle.url, sku: bottle.sku, price: bottle.price });
+          knownProducts[retailerKey].push({ name, url: bottle.url, sku: bottle.sku, price: bottle.price });
         }
       }
     }
-    if (products.length > 0) knownProducts[retailerKey] = products;
+  }
+  // Clean up internal dedup keys
+  for (const key of Object.keys(knownProducts)) {
+    if (key.startsWith("_urls_")) delete knownProducts[key];
   }
 }
 
@@ -1478,15 +1545,49 @@ async function scrapeCostcoOnce(page) {
   return dedupFound(found);
 }
 
+// Check known Costco product URLs from previous finds. Costco product pages use the same
+// data-testid tile structure as search results, so we parse with cheerio.
+async function checkCostcoKnownUrls() {
+  const known = knownProducts.costco || [];
+  if (known.length === 0) return [];
+  const costcoProxy = getRetailerProxyUrl("costco");
+  const found = [];
+  for (const { name, url } of known) {
+    if (!url || !url.includes("costco.com/")) continue;
+    try {
+      const res = await scraperFetchRetry(url, { headers: { ...FETCH_HEADERS }, timeout: 15000, proxyUrl: costcoProxy });
+      if (!res.ok) continue;
+      const html = await res.text();
+      if (isCostcoBlocked(html)) continue;
+      const $ = cheerio.load(html);
+      const matched = matchCostcoTiles($);
+      if (matched.length > 0) {
+        found.push(...matched);
+        console.log(`[costco] Known URL check: ${name} still in stock`);
+      }
+    } catch (err) {
+      console.warn(`[costco] Known URL check failed for ${name}: ${err.message}`);
+    }
+    await sleep(500 + Math.random() * 500);
+  }
+  return found;
+}
+
 // Wrapper: try got-scraping fetch-first (Chrome TLS fingerprint), fall back to browser.
 // Akamai injects sensor JS (_abck cookie) that requires a real browser, but got-scraping
 // may pass the initial request before sensors detect it — worth trying for speed.
 async function scrapeCostcoStore() {
+  // Check known product URLs first (less suspicious, supplements search results)
+  const knownFound = await checkCostcoKnownUrls().catch((err) => {
+    console.warn(`[costco] Known URL check wrapper failed: ${err.message}`);
+    return [];
+  });
+
   // Try fetch-first with got-scraping (Chrome TLS fingerprint)
   const fetchResult = await scrapeCostcoViaFetch();
   if (fetchResult !== null) {
     console.log("[costco] ✓ fast fetch succeeded");
-    return fetchResult;
+    return dedupFound([...knownFound, ...fetchResult]);
   }
 
   // Fetch blocked or no proxy — fall back to clean browser (no stealth/rebrowser).
@@ -1498,7 +1599,7 @@ async function scrapeCostcoStore() {
   } catch (err) {
     console.error(`[costco] Browser launch failed: ${err.message}`);
     trackHealth("costco", "fail");
-    return [];
+    return dedupFound(knownFound);
   }
   try {
     const scraperPromise = scrapeCostcoOnce(page);
@@ -1507,9 +1608,9 @@ async function scrapeCostcoStore() {
     if (result === null) {
       console.warn("[costco] Browser scraper timed out (180s)");
       trackHealth("costco", "blocked");
-      return [];
+      return dedupFound(knownFound);
     }
-    return result;
+    return dedupFound([...knownFound, ...result]);
   } finally {
     await page.close().catch(() => {});
   }
@@ -1787,12 +1888,63 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
   return dedupFound(found);
 }
 
+// Check known Total Wine product URLs from previous finds. Product pages contain
+// INITIAL_STATE JSON with stock info — same extraction as the search fetch path.
+async function checkTotalWineKnownUrls(store) {
+  const known = knownProducts.totalwine || [];
+  if (known.length === 0) return [];
+  const twProxy = getRetailerProxyUrl("totalwine");
+  // Total Wine product pages work without proxy on Mac (direct residential IP)
+  const found = [];
+  for (const { name, url } of known) {
+    if (!url || !url.includes("totalwine.com")) continue;
+    try {
+      // Append storeId for per-store inventory
+      const storeUrl = url.includes("?") ? `${url}&storeId=${store.storeId}` : `${url}?storeId=${store.storeId}`;
+      const res = await scraperFetchRetry(storeUrl, { headers: { ...FETCH_HEADERS }, timeout: 15000, proxyUrl: twProxy || undefined });
+      if (!res.ok) continue;
+      const html = await res.text();
+      const idx = html.indexOf("window.INITIAL_STATE");
+      if (idx === -1) continue;
+      const braceStart = html.indexOf("{", idx);
+      if (braceStart === -1) continue;
+      let depth = 0, inStr = false, escape = false, end = -1;
+      for (let j = braceStart; j < html.length; j++) {
+        const ch = html[j];
+        if (escape) { escape = false; continue; }
+        if (ch === "\\") { escape = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === "{") depth++;
+        else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
+      }
+      if (end === -1) continue;
+      const state = JSON.parse(html.slice(braceStart, end));
+      const matched = matchTotalWineInitialState(state);
+      if (matched.length > 0) {
+        found.push(...matched);
+        console.log(`[totalwine:${store.storeId}] Known URL check: ${name} still in stock`);
+      }
+    } catch (err) {
+      console.warn(`[totalwine:${store.storeId}] Known URL check failed for ${name}: ${err.message}`);
+    }
+    await sleep(500 + Math.random() * 500);
+  }
+  return found;
+}
+
 // Wrapper: try got-scraping fetch-first (Chrome TLS fingerprint), fall back to browser.
 // PerimeterX injects sensor JS (_px* cookies) that requires a real browser, but got-scraping
 // may pass the initial requests before sensors detect it — worth trying for speed.
 // Proxy browser tier removed — PerimeterX always blocks proxy IPs, wasting 180s per store.
 // Direct residential IP browser (headed on Mac) is the only browser fallback.
 async function scrapeTotalWineStore(store) {
+  // Check known product URLs first (less suspicious, supplements search results)
+  const knownFound = await checkTotalWineKnownUrls(store).catch((err) => {
+    console.warn(`[totalwine:${store.storeId}] Known URL check wrapper failed: ${err.message}`);
+    return [];
+  });
+
   // Fetch-first disabled — PerimeterX blocks got-scraping even with proxy (requires JS sensor
   // execution). The clean browser path works reliably so skip the fetch to save ~10s per store.
   // The fetch function is retained for future use if PerimeterX relaxes fetch blocking.
@@ -1801,7 +1953,7 @@ async function scrapeTotalWineStore(store) {
   if (retailerBrowserBlocked["totalwine"]) {
     console.log(`[totalwine:${store.storeId}] Skipping browser — blocked earlier this poll`);
     trackHealth("totalwine", "blocked");
-    return [];
+    return dedupFound(knownFound);
   }
 
   // Direct residential IP browser (no proxy, clean mode — no stealth/rebrowser plugins).
@@ -1817,7 +1969,7 @@ async function scrapeTotalWineStore(store) {
     trackHealth("totalwine", "fail");
     retailerBrowserBlocked["totalwine"] = true;
     releaseLock();
-    return [];
+    return dedupFound(knownFound);
   }
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page, { skipPreWarm });
@@ -1827,13 +1979,13 @@ async function scrapeTotalWineStore(store) {
       console.warn(`[totalwine:${store.storeId}] Browser timed out (180s)`);
       trackHealth("totalwine", "blocked");
       retailerBrowserBlocked["totalwine"] = true;
-      return [];
+      return dedupFound(knownFound);
     }
     const twHealth = scraperHealth["totalwine"];
     if (twHealth && twHealth.queries > 0 && twHealth.blocked >= twHealth.queries * 0.75) {
       retailerBrowserBlocked["totalwine"] = true;
     }
-    return result;
+    return dedupFound([...knownFound, ...result]);
   } finally {
     await page.close().catch(() => {});
     releaseLock();
@@ -2310,13 +2462,15 @@ const SAMSCLUB_PRODUCTS = {
   "Weller Special Reserve":   "prod20595259",
   "E.H. Taylor Small Batch":  "prod25791990",
   "Stagg Jr":                 "prod25430037",
-  "George T. Stagg":          "13735253987",
+  "George T. Stagg":          "prod24381483",
   "Eagle Rare 17 Year":       "prod24381479",
+  "Thomas H. Handy":          "prod24381485",
+  "Elmer T. Lee":             "prod14810163",
   "Pappy Van Winkle 10 Year": "prod25450252",
   "Pappy Van Winkle 12 Year": "prod25450253",
   "Pappy Van Winkle 15 Year": "prod27331296",
   "Pappy Van Winkle 20 Year": "prod27331307",
-  "Pappy Van Winkle 23 Year": "prod2960024",   // generic "Pappy Van Winkle Bourbon" listing
+  "Pappy Van Winkle 23 Year": "prod16460200",
   "Buffalo Trace":            "13791619865",    // canary
 };
 
@@ -2938,7 +3092,7 @@ export {
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
-  shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, checkWalmartKnownUrls, navigateCategory, CATEGORY_URLS,
+  shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
@@ -2964,6 +3118,7 @@ export function _getScanCounter() { return scanCounter; }
 export function _resetRetailerFailures() { for (const k of Object.keys(retailerFailures)) delete retailerFailures[k]; }
 export function _resetKnownProducts() { knownProducts = {}; }
 export function _getKnownProducts() { return knownProducts; }
+export function _setKnownProducts(v) { knownProducts = v; }
 export function _resetRetailerBrowserLocks() { for (const k of Object.keys(retailerBrowserLocks)) delete retailerBrowserLocks[k]; }
 export function _resetRetailerBrowserBlocked() { for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k]; }
 export function _setProxyExhausted(v) { proxyExhausted = v; }
