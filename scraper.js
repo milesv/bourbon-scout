@@ -1407,7 +1407,8 @@ async function scrapeCostcoOnce(page) {
   await sleep(3000 + Math.random() * 2000);
   await solveHumanChallenge(page);
   await humanizePage(page);
-  await navigateCategory(page, "costco");
+  // Category navigation skipped — saves ~15s. Akamai cares about sensor telemetry from
+  // homepage (mouse/scroll events), not navigation depth. Direct search is fine.
 
   const found = [];
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
@@ -1674,9 +1675,10 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
     await sleep(3000 + Math.random() * 2000);
     await solveHumanChallenge(page);
     await humanizePage(page);
-    console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), navigating to category...`);
-    await navigateCategory(page, "totalwine");
-    console.log(`[totalwine:${store.storeId}] Category done (${elapsed()}), starting queries...`);
+    console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
+    // Skip category navigation on cold start — saves ~15-20s that's better spent on queries.
+    // PerimeterX cares about JS sensor telemetry from homepage, not navigation flow.
+    // Warm contexts (subsequent stores) already skip pre-warm entirely.
   } else {
     console.log(`[totalwine:${store.storeId}] Skipping pre-warm (context already warm)`);
   }
@@ -1950,7 +1952,6 @@ async function scrapeWalmartViaBrowser(store, page) {
   await page.goto("https://www.walmart.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
   await humanizePage(page);
-  await navigateCategory(page, "walmart");
 
   const found = [];
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
@@ -2311,8 +2312,12 @@ const SAMSCLUB_PRODUCTS = {
   "Stagg Jr":                 "prod25430037",
   "George T. Stagg":          "13735253987",
   "Eagle Rare 17 Year":       "prod24381479",
-  "Pappy Van Winkle 15 Year": "prod3160426",
-  "Buffalo Trace":            "13791619865",   // canary
+  "Pappy Van Winkle 10 Year": "prod25450252",
+  "Pappy Van Winkle 12 Year": "prod25450253",
+  "Pappy Van Winkle 15 Year": "prod27331296",
+  "Pappy Van Winkle 20 Year": "prod27331307",
+  "Pappy Van Winkle 23 Year": "prod2960024",   // generic "Pappy Van Winkle Bourbon" listing
+  "Buffalo Trace":            "13791619865",    // canary
 };
 
 // Extract product availability from Sam's Club __NEXT_DATA__ JSON.
@@ -2420,7 +2425,6 @@ async function scrapeSamsClubViaBrowser(page) {
   await sleep(5000 + Math.random() * 3000);
   await solveHumanChallenge(page);
   await humanizePage(page);
-  await navigateCategory(page, "samsclub");
 
   const found = [];
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));

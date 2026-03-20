@@ -1716,9 +1716,9 @@ describe("scrapeCostcoOnce", () => {
       { title: "Weller Special Reserve Bourbon 750ml", url: "https://costco.com/weller.product.html", price: "$29.99" },
     ]);
     const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
-    // +2 for homepage pre-warm + category navigation; query rotation means only a subset runs per scan
+    // +1 for homepage pre-warm (category navigation removed to save ~15s); query rotation means only a subset runs per scan
     const expectedQueries = getQueriesForScan(SEARCH_QUERIES).length;
-    expect(mockPage.goto).toHaveBeenCalledTimes(expectedQueries + 2);
+    expect(mockPage.goto).toHaveBeenCalledTimes(expectedQueries + 1);
     expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
   });
 

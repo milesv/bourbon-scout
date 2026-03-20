@@ -12,13 +12,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("node-fetch", () => ({ default: mocks.fetch }));
-vi.mock("rebrowser-playwright-core", () => ({
-  chromium: {},
+vi.mock("playwright-core", () => ({
+  chromium: { launch: mocks.chromiumLaunch },
 }));
-vi.mock("playwright-extra", () => ({
-  addExtra: () => ({ use: mocks.chromiumUse, launch: mocks.chromiumLaunch }),
-}));
-vi.mock("puppeteer-extra-plugin-stealth", () => ({ default: vi.fn() }));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
   writeFile: mocks.writeFile,
