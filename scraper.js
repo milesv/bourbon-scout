@@ -337,19 +337,30 @@ function loadKnownProducts(state) {
 }
 
 // ─── Query Rotation ─────────────────────────────────────────────────────────
-// Instead of running all 14 queries every scan, alternate halves to cut per-scan
-// request volume. Each session fires ~8 queries instead of 14 — less "hammering"
-// behavioral signal. Every bottle still covered within 2 consecutive scans (30 min
-// at 15-min intervals). The canary query always runs for health monitoring.
+// Priority-based query rotation: high-value bottles (BTAC, Pappy, Taylor, Michter's)
+// run every scan (every 30 min). Lower-urgency queries alternate even/odd scans
+// (every 60 min). Total queries per scan: ~9 (7 priority + ~3-4 rotating + canary)
+// instead of 8 — minimal increase, but time-sensitive bottles checked 2× as often.
 let scanCounter = 0;
+
+// Queries that run EVERY scan — bottles that sell out fastest
+const PRIORITY_QUERIES = new Set([
+  "van winkle",             // Pappy 10/12/15/20/23 + Family Reserve Rye 13
+  "george t stagg",         // George T. Stagg (BTAC)
+  "eagle rare 17",          // Eagle Rare 17 Year (BTAC)
+  "thomas handy sazerac",   // Thomas H. Handy (BTAC)
+  "eh taylor",              // All Taylor variants (rare ones sell fast)
+  "michters bourbon",       // Michter's 10 Year
+]);
 
 function getQueriesForScan(allQueries) {
   const canaryQuery = "buffalo trace";
-  const nonCanary = allQueries.filter((q) => q !== canaryQuery);
-  // Split into two groups based on scan parity
-  const group = nonCanary.filter((_, i) => i % 2 === scanCounter % 2);
-  // Always include canary
-  return [...group, canaryQuery];
+  const rotating = allQueries.filter((q) => q !== canaryQuery && !PRIORITY_QUERIES.has(q));
+  // Rotating queries alternate based on scan parity
+  const rotatingGroup = rotating.filter((_, i) => i % 2 === scanCounter % 2);
+  // Priority + rotating subset + canary
+  const priority = allQueries.filter((q) => PRIORITY_QUERIES.has(q));
+  return [...priority, ...rotatingGroup, canaryQuery];
 }
 
 // ─── Target Bottles ──────────────────────────────────────────────────────────
@@ -368,8 +379,8 @@ const SEARCH_QUERIES = [
   "rock hill farms",           // Rock Hill Farms
   "king of kentucky bourbon",  // King of Kentucky
   "old forester bourbon",      // Birthday, President's Choice, 150th Anniversary, King Ranch
-  "michters bourbon",           // Michter's 10 Year Single Barrel (Costco + Total Wine only)
-  "penelope bourbon",           // Penelope Founder's Reserve + Estate Collection (Costco + Total Wine only)
+  "michters bourbon",           // Michter's 10 Year Single Barrel (Costco + Total Wine + Walmart only)
+  "penelope bourbon",           // Penelope Founder's Reserve + Estate Collection (Costco + Total Wine + Walmart only)
   "buffalo trace",              // Canary bottle — always-available health check
 ];
 
@@ -3100,7 +3111,7 @@ export {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
-  createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
+  createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,

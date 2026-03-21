@@ -73,7 +73,7 @@ SAFEWAY_API_KEY=
 | `BACKUP_PROXY_URL` | No | Backup proxy URL (e.g. IPRoyal). Used by retailers listed in `BACKUP_PROXY_RETAILERS` when primary proxy IPs are burned. |
 | `BACKUP_PROXY_RETAILERS` | No | Comma-separated retailer keys to route through backup proxy (e.g. `costco,totalwine`). |
 
-Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, all scrapers fall back to browser-only mode. With `PROXY_URL` set, each retailer gets its own sticky session IP and `got-scraping` fetch-first paths use Chrome TLS fingerprint impersonation for faster, lighter scraping. All browser fallbacks use clean Chrome (no stealth plugin — it's counterproductive) with `headless: false` on Mac. Queries are rotated across scans (half per scan) with human-like pacing to reduce bot detection signals. Retailers that fail 3+ consecutive scans are automatically backed off for 30 minutes.
+Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, all scrapers fall back to browser-only mode. With `PROXY_URL` set, each retailer gets its own sticky session IP and `got-scraping` fetch-first paths use Chrome TLS fingerprint impersonation for faster, lighter scraping. All browser fallbacks use clean Chrome (no stealth plugin — it's counterproductive) with `headless: false` on Mac. Queries use priority-based rotation — high-value bottles (BTAC, Pappy, Taylor, Michter's) are checked every scan while lower-priority queries alternate, with human-like pacing to reduce bot detection signals. Retailers that fail 3+ consecutive scans are automatically backed off for 30 minutes.
 
 ### Run
 
@@ -143,7 +143,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-609 tests across 5 files using [Vitest](https://vitest.dev/):
+610 tests across 5 files using [Vitest](https://vitest.dev/):
 
 ```sh
 npm test                # Run all tests
@@ -152,7 +152,7 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 489 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, query rotation |
+| `test/scraper.test.js` | 490 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation |
 | `test/proxy.test.js` | 36 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |

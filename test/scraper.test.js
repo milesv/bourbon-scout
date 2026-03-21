@@ -73,7 +73,7 @@ import {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
-  refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
+  refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
@@ -4695,7 +4695,17 @@ describe("getQueriesForScan", () => {
     expect(queries1).toContain("buffalo trace");
   });
 
-  it("returns different query sets for even/odd scans", () => {
+  it("priority queries appear in every scan", () => {
+    for (const sc of [0, 1, 2, 3]) {
+      _setScanCounter(sc);
+      const queries = getQueriesForScan(SEARCH_QUERIES);
+      for (const pq of PRIORITY_QUERIES) {
+        expect(queries, `priority query "${pq}" missing in scan ${sc}`).toContain(pq);
+      }
+    }
+  });
+
+  it("rotating queries differ between even/odd scans", () => {
     _setScanCounter(0);
     const even = getQueriesForScan(SEARCH_QUERIES);
 
@@ -4706,19 +4716,23 @@ describe("getQueriesForScan", () => {
     for (const q of even) expect(SEARCH_QUERIES).toContain(q);
     for (const q of odd) expect(SEARCH_QUERIES).toContain(q);
 
-    // They should differ (different halves of non-canary queries)
-    const evenOnly = even.filter((q) => !odd.includes(q));
-    const oddOnly = odd.filter((q) => !even.includes(q));
+    // Non-priority queries should differ between even/odd
+    const evenRotating = even.filter((q) => !PRIORITY_QUERIES.has(q) && q !== "buffalo trace");
+    const oddRotating = odd.filter((q) => !PRIORITY_QUERIES.has(q) && q !== "buffalo trace");
+    const evenOnly = evenRotating.filter((q) => !oddRotating.includes(q));
+    const oddOnly = oddRotating.filter((q) => !evenRotating.includes(q));
     expect(evenOnly.length).toBeGreaterThan(0);
     expect(oddOnly.length).toBeGreaterThan(0);
   });
 
-  it("returns roughly half the queries per scan (plus canary)", () => {
+  it("returns priority + rotating subset + canary per scan", () => {
     _setScanCounter(0);
     const queries = getQueriesForScan(SEARCH_QUERIES);
-    // 14 non-canary queries split in half = 7, plus canary = 8
-    expect(queries.length).toBeGreaterThanOrEqual(8);
-    expect(queries.length).toBeLessThanOrEqual(8);
+    // 6 priority + ~4 rotating (8 non-priority-non-canary / 2) + 1 canary = ~11
+    const rotating = SEARCH_QUERIES.filter((q) => q !== "buffalo trace" && !PRIORITY_QUERIES.has(q));
+    const expectedRotating = Math.ceil(rotating.length / 2);
+    const expected = PRIORITY_QUERIES.size + expectedRotating + 1;
+    expect(queries.length).toBe(expected);
   });
 
   it("_setScanCounter and _getScanCounter work", () => {
