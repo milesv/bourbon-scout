@@ -71,6 +71,7 @@ import {
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
+  METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
@@ -4679,6 +4680,71 @@ describe("SEED_PRODUCT_URLS", () => {
         expect(targetNames.has(seed.name)).toBe(true);
       }
     }
+  });
+});
+
+// ─── Scan Metrics ────────────────────────────────────────────────────────────
+
+describe("scan metrics", () => {
+  it("computeMetricsTrend returns null with fewer than 2 scans", () => {
+    expect(computeMetricsTrend([])).toBeNull();
+    expect(computeMetricsTrend([{ ts: new Date().toISOString(), retailers: {} }])).toBeNull();
+  });
+
+  it("computeMetricsTrend aggregates retailer stats across scans", () => {
+    const scans = [
+      { ts: new Date().toISOString(), retailers: {
+        costco: { queries: 10, ok: 8, blocked: 2, failed: 0, canary: true, found: ["Weller SR"] },
+        kroger: { queries: 11, ok: 11, blocked: 0, failed: 0, canary: true, found: [] },
+      }},
+      { ts: new Date().toISOString(), retailers: {
+        costco: { queries: 10, ok: 6, blocked: 4, failed: 0, canary: false, found: [] },
+        kroger: { queries: 11, ok: 10, blocked: 0, failed: 1, canary: true, found: ["Blanton's Original"] },
+      }},
+    ];
+    const trend = computeMetricsTrend(scans);
+    expect(trend.scans).toBe(2);
+    expect(trend.retailers.costco.totalQueries).toBe(20);
+    expect(trend.retailers.costco.totalOk).toBe(14);
+    expect(trend.retailers.costco.totalBlocked).toBe(6);
+    expect(trend.retailers.costco.canaryHits).toBe(1);
+    expect(trend.retailers.costco.bottlesFound).toEqual(["Weller SR"]);
+    expect(trend.retailers.kroger.canaryHits).toBe(2);
+    expect(trend.retailers.kroger.bottlesFound).toEqual(["Blanton's Original"]);
+  });
+
+  it("buildSummaryEmbed includes 24h trend when provided", () => {
+    const trend = {
+      scans: 5,
+      hours: 24,
+      retailers: {
+        costco: { scans: 5, totalQueries: 50, totalOk: 40, totalBlocked: 10, canaryHits: 4, bottlesFound: ["Weller SR"] },
+        kroger: { scans: 5, totalQueries: 55, totalOk: 55, totalBlocked: 0, canaryHits: 5, bottlesFound: [] },
+      },
+    };
+    const embed = buildSummaryEmbed({
+      storesScanned: 10, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 10, durationSec: 60, trend,
+    });
+    expect(embed.description).toContain("24h trend");
+    expect(embed.description).toContain("5 scans");
+    expect(embed.description).toContain("Weller SR");
+  });
+
+  it("buildSummaryEmbed omits trend with fewer than 2 scans", () => {
+    const embed = buildSummaryEmbed({
+      storesScanned: 10, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 10, durationSec: 60, trend: { scans: 1, retailers: {} },
+    });
+    expect(embed.description).not.toContain("24h trend");
+  });
+
+  it("buildSummaryEmbed omits trend when null", () => {
+    const embed = buildSummaryEmbed({
+      storesScanned: 10, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 10, durationSec: 60, trend: null,
+    });
+    expect(embed.description).not.toContain("24h trend");
   });
 });
 

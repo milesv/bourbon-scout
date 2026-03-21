@@ -25,7 +25,8 @@ Some bottles are retailer-restricted (e.g., Michter's 10 Year and Penelope only 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
 2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 15 broad search queries that cover all 41 bottles. Each retailer gets a dedicated residential IP via per-retailer sticky proxy sessions. If a proxy IP gets blocked mid-scan, it automatically rotates to a fresh IP after 2 consecutive failures. Retailers are staggered 10-30s apart. All 5 browser scrapers use "clean" Chrome — plain `chromium.launch()` without stealth plugin or rebrowser-patches (these CDP modifications are actually fingerprinted by anti-bot systems). On Mac, browsers run headed and minimized via CDP `Browser.setWindowBounds`. 4 of 5 scrapers try `got-scraping` fetch-first (Chrome TLS fingerprint impersonation via JA3/JA4 spoofing) before falling back to browser; Total Wine goes straight to browser (PerimeterX requires JS sensor execution). Persistent browser profiles per retailer (HTTP cache, service workers, IndexedDB persist on disk). Browser scrapers follow a human-like flow: homepage → category page → search queries. Includes a PerimeterX "Press & Hold" challenge solver. Known bottle URLs from previous finds are checked directly before searching. Includes a canary bottle (Buffalo Trace) as a scraper health check. Retailers that fail 3 consecutive scans are automatically backed off for 30 minutes.
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
-4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@here` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators. Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
+4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@here` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators and a 24h trend (per-retailer success rate, canary hit rate, bottles found). Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
+5. **Scan Metrics** — Appends one JSON line per scan to `metrics.jsonl` with per-retailer health stats, canary hits, bottles found, and duration. Enables historical trend analysis: retailer reliability over time, drop patterns, proxy ROI.
 
 ## Setup
 
@@ -143,7 +144,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-610 tests across 5 files using [Vitest](https://vitest.dev/):
+615 tests across 5 files using [Vitest](https://vitest.dev/):
 
 ```sh
 npm test                # Run all tests
@@ -152,7 +153,7 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 490 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, retry mechanisms, bot detection, state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation |
+| `test/scraper.test.js` | 495 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, scan metrics/trends, retry mechanisms, bot detection, state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation |
 | `test/proxy.test.js` | 36 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |

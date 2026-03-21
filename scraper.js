@@ -8,7 +8,7 @@ import { chromium as vanillaChromium } from "playwright-core";
 import { addExtra } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 // node-cron removed — replaced with setTimeout + jitter for variable scan intervals
-import { readFile, writeFile, rename, mkdir, unlink, readdir, rm } from "node:fs/promises";
+import { readFile, writeFile, appendFile, rename, mkdir, unlink, readdir, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 import * as cheerio from "cheerio";
@@ -204,6 +204,7 @@ function trackHealth(key, outcome) {
 }
 
 const STATE_FILE = new URL("./state.json", import.meta.url);
+const METRICS_FILE = new URL("./metrics.jsonl", import.meta.url);
 
 // Per-retailer persistent browser profile directories. Full Chrome profiles
 // (HTTP cache, service workers, IndexedDB, visited history) accumulate on disk,
@@ -450,6 +451,50 @@ async function saveState(state) {
   const tmp = fileURLToPath(STATE_FILE) + ".tmp";
   await writeFile(tmp, JSON.stringify(state, null, 2));
   await rename(tmp, fileURLToPath(STATE_FILE));
+}
+
+// ─── Scan Metrics ────────────────────────────────────────────────────────────
+// Append one JSON line per scan to metrics.jsonl for historical analysis.
+// Each line captures per-retailer health, bottles found, canary status, and scan duration.
+
+async function appendMetrics(entry) {
+  await appendFile(fileURLToPath(METRICS_FILE), JSON.stringify(entry) + "\n");
+}
+
+async function loadRecentMetrics(hours = 24) {
+  try {
+    const raw = await readFile(fileURLToPath(METRICS_FILE), "utf-8");
+    const cutoff = Date.now() - hours * 60 * 60 * 1000;
+    const lines = raw.trim().split("\n").filter(Boolean);
+    const recent = [];
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (new Date(entry.ts).getTime() >= cutoff) recent.push(entry);
+      } catch { /* skip malformed lines */ }
+    }
+    return recent;
+  } catch {
+    return []; // File doesn't exist yet
+  }
+}
+
+function computeMetricsTrend(recentMetrics) {
+  if (recentMetrics.length < 2) return null;
+  const retailers = {};
+  for (const scan of recentMetrics) {
+    if (!scan.retailers) continue;
+    for (const [key, data] of Object.entries(scan.retailers)) {
+      if (!retailers[key]) retailers[key] = { scans: 0, totalQueries: 0, totalOk: 0, totalBlocked: 0, canaryHits: 0, bottlesFound: [] };
+      retailers[key].scans++;
+      retailers[key].totalQueries += data.queries || 0;
+      retailers[key].totalOk += data.ok || 0;
+      retailers[key].totalBlocked += data.blocked || 0;
+      if (data.canary) retailers[key].canaryHits++;
+      if (data.found?.length) retailers[key].bottlesFound.push(...data.found);
+    }
+  }
+  return { scans: recentMetrics.length, hours: 24, retailers };
 }
 
 // ─── State Change Tracking ──────────────────────────────────────────────────
@@ -764,7 +809,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
 const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
 const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens", samsclub: "Sam's Club" };
 
-function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {} }) {
+function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
   desc += `🟢 ${totalNewFinds} new finds   🔵 ${totalStillInStock} still in stock\n`;
   desc += `🔴 ${totalGoneOOS} went OOS    💤 ${nothingCount} nothing`;
@@ -797,6 +842,18 @@ function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, tot
     const pct = h.succeeded / h.queries;
     const emoji = pct >= 0.75 ? "✅" : pct >= 0.25 ? "⚠️" : "❌";
     fields.push({ name: RETAILER_LABELS[key] || key, value: `${emoji} ${h.succeeded}/${h.queries}${canary}`, inline: true });
+  }
+
+  // 24h trend summary from historical metrics
+  if (trend && trend.scans >= 2) {
+    desc += `\n\n**24h trend** (${trend.scans} scans):`;
+    for (const [key, r] of Object.entries(trend.retailers)) {
+      const label = RETAILER_LABELS[key] || key;
+      const pct = r.totalQueries > 0 ? Math.round((r.totalOk / r.totalQueries) * 100) : 0;
+      const canaryPct = r.scans > 0 ? Math.round((r.canaryHits / r.scans) * 100) : 0;
+      const found = r.bottlesFound.length > 0 ? ` │ 🥃 ${[...new Set(r.bottlesFound)].join(", ")}` : "";
+      desc += `\n> ${label}: ${pct}% ok, 🐤 ${canaryPct}%${found}`;
+    }
   }
 
   const embed = {
@@ -2960,6 +3017,7 @@ async function poll() {
   let nothingCount = 0;
   const retailersSeen = new Set();
   const scannedStores = [];
+  const scanFinds = {}; // { retailerKey: Set of bottle names found }
 
   // Reset per-poll state
   refreshProxySession();
@@ -2992,6 +3050,12 @@ async function poll() {
     totalNewFinds += changes.newFinds.length;
     totalStillInStock += changes.stillInStock.length;
     totalGoneOOS += changes.goneOOS.length;
+
+    // Track all found bottles per retailer for metrics
+    if (realInStock.length > 0) {
+      if (!scanFinds[retailer.key]) scanFinds[retailer.key] = new Set();
+      for (const b of realInStock) scanFinds[retailer.key].add(b.name);
+    }
 
     const embeds = buildStoreEmbeds(retailer.key, retailer.name, store, changes);
 
@@ -3090,9 +3154,31 @@ async function poll() {
   await closeRetailerBrowsers().catch((err) => console.error(`[poll] closeRetailerBrowsers failed: ${err.message}`));
   await saveState(state).catch((err) => console.error(`[poll] saveState failed: ${err.message}`));
 
-  // Quiet summary at end of every poll
+  // Build scan metrics entry
   const durationSec = Math.round((Date.now() - scanStart) / 1000);
-  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults });
+  const metricsRetailers = {};
+  for (const retailer of RETAILERS) {
+    const h = scraperHealth[retailer.key];
+    if (!h) continue;
+    metricsRetailers[retailer.key] = {
+      queries: h.queries, ok: h.succeeded, blocked: h.blocked, failed: h.failed,
+      canary: !!canaryResults[retailer.key],
+      found: scanFinds[retailer.key] ? [...scanFinds[retailer.key]] : [],
+    };
+  }
+  const metricsEntry = {
+    ts: new Date().toISOString(), durationSec, storesScanned,
+    newFinds: totalNewFinds, stillInStock: totalStillInStock, goneOOS: totalGoneOOS,
+    retailers: metricsRetailers,
+  };
+
+  // Persist metrics, then load 24h trend for summary embed
+  await appendMetrics(metricsEntry).catch((err) => console.error(`[poll] Metrics append failed: ${err.message}`));
+  const recentMetrics = await loadRecentMetrics(24).catch(() => []);
+  const trend = computeMetricsTrend(recentMetrics);
+
+  // Quiet summary at end of every poll
+  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend });
   await sendDiscordAlert([summary]).catch((err) => console.error(`[poll] Summary send failed: ${err.message}`));
 
   console.log(`[poll] Scan complete — ${storesScanned} stores, ${totalNewFinds} new, ${totalStillInStock} still, ${totalGoneOOS} OOS, ${durationSec}s\n`);
@@ -3109,6 +3195,7 @@ export {
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
+  METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
