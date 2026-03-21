@@ -995,6 +995,23 @@ function parsePrice(str) {
   return match ? parseFloat(match[1]) : 0;
 }
 
+// Filter out miniature bottles (50ml) that slip past EXCLUDE_TERMS because the product
+// title doesn't mention the size. Price is the reliable signal: no allocated 750ml bourbon
+// is under $20, but 50ml miniatures are typically $8-15. Also catches size when available.
+const MIN_BOTTLE_PRICE = 20;
+function filterMiniatures(found) {
+  return found.filter((f) => {
+    const size = (f.size || "").toLowerCase();
+    if (size && size !== "" && size !== "750ml" && size !== "1L" && size !== "1.75L") {
+      const ml = parseInt(size);
+      if (!isNaN(ml) && ml < 200) return false; // Explicit small size (50ml, 100ml)
+    }
+    const price = parsePrice(f.price);
+    if (price > 0 && price < MIN_BOTTLE_PRICE) return false; // Miniature price range
+    return true;
+  });
+}
+
 // Hard timeout for async operations. Returns fallback value on timeout.
 function withTimeout(promise, ms, fallback) {
   let timer;
@@ -3064,6 +3081,8 @@ async function poll() {
 
   // Helper to record results for a store and send alerts
   async function recordResult(retailer, store, inStock) {
+    // Filter out miniature bottles (50ml) that slipped past EXCLUDE_TERMS
+    inStock = filterMiniatures(inStock);
     // Separate canary from allocated bottles — canary never triggers alerts or state
     const canaryFound = inStock.some((b) => CANARY_NAMES.has(b.name));
     if (canaryFound) {
@@ -3223,7 +3242,7 @@ async function poll() {
 
 export {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, MIN_BOTTLE_PRICE, filterMiniatures, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,

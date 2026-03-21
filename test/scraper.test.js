@@ -67,7 +67,7 @@ vi.mock("../lib/geo.js", () => ({
 
 import {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, MIN_BOTTLE_PRICE, filterMiniatures, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
@@ -508,6 +508,37 @@ describe("matchesBottle", () => {
     expect(matchesBottle("Blanton's Original Single Barrel Bourbon 750ml", blantons)).toBe(true);
     const bt = TARGET_BOTTLES.find((b) => b.name === "Buffalo Trace");
     expect(matchesBottle("Buffalo Trace Bourbon 750ml", bt)).toBe(true);
+  });
+
+  it("filterMiniatures removes bottles priced under $20 (50ml miniatures)", () => {
+    const found = [
+      { name: "Blanton's Original", price: "$12.49", size: "", url: "" },     // 50ml — filtered
+      { name: "Weller Special Reserve", price: "$29.99", size: "750ml", url: "" }, // 750ml — kept
+      { name: "Pappy Van Winkle 23 Year", price: "$349.99", size: "", url: "" },   // 750ml — kept
+    ];
+    const filtered = filterMiniatures(found);
+    expect(filtered).toHaveLength(2);
+    expect(filtered.map(f => f.name)).toEqual(["Weller Special Reserve", "Pappy Van Winkle 23 Year"]);
+  });
+
+  it("filterMiniatures removes bottles with explicit small size", () => {
+    const found = [
+      { name: "Blanton's Original", price: "$12.49", size: "50ml", url: "" },  // 50ml — filtered
+      { name: "E.H. Taylor Small Batch", price: "$8.99", size: "100ml", url: "" }, // 100ml — filtered
+      { name: "Weller 12 Year", price: "$45.00", size: "750ml", url: "" },     // 750ml — kept
+    ];
+    const filtered = filterMiniatures(found);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].name).toBe("Weller 12 Year");
+  });
+
+  it("filterMiniatures keeps bottles with no price (unknown, not miniature)", () => {
+    const found = [
+      { name: "Blanton's Original", price: "", size: "", url: "" },  // No price — kept (can't confirm miniature)
+      { name: "Weller SR", price: "N/A", size: "", url: "" },        // N/A — kept
+    ];
+    const filtered = filterMiniatures(found);
+    expect(filtered).toHaveLength(2);
   });
 
   it("matchesBottle respects retailers field for per-retailer filtering", () => {
