@@ -172,18 +172,20 @@ async function runWithFakeTimers(fn) {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 describe("constants", () => {
-  it("SEARCH_QUERIES has 13 broad queries (12 allocated + 1 canary)", () => {
-    expect(SEARCH_QUERIES).toHaveLength(13);
+  it("SEARCH_QUERIES has 15 broad queries (14 allocated + 1 canary)", () => {
+    expect(SEARCH_QUERIES).toHaveLength(15);
     expect(SEARCH_QUERIES).toContain("weller bourbon");
     expect(SEARCH_QUERIES).toContain("van winkle");
     expect(SEARCH_QUERIES).toContain("eh taylor");
     expect(SEARCH_QUERIES).toContain("george t stagg");
     expect(SEARCH_QUERIES).toContain("old forester bourbon");
+    expect(SEARCH_QUERIES).toContain("michters bourbon");
+    expect(SEARCH_QUERIES).toContain("penelope bourbon");
     expect(SEARCH_QUERIES).toContain("buffalo trace");
   });
 
-  it("TARGET_BOTTLES has 38 bottles (37 allocated + 1 canary)", () => {
-    expect(TARGET_BOTTLES).toHaveLength(38);
+  it("TARGET_BOTTLES has 41 bottles (40 allocated + 1 canary)", () => {
+    expect(TARGET_BOTTLES).toHaveLength(41);
     expect(TARGET_BOTTLES[0]).toHaveProperty("name");
     expect(TARGET_BOTTLES[0]).toHaveProperty("searchTerms");
   });
@@ -274,7 +276,7 @@ describe("canary bottle", () => {
 
   it("non-canary bottles do not have canary flag", () => {
     const nonCanary = TARGET_BOTTLES.filter((b) => !b.canary);
-    expect(nonCanary.length).toBe(37);
+    expect(nonCanary.length).toBe(40);
   });
 
   it("matchesBottle works for Buffalo Trace", () => {
@@ -503,6 +505,29 @@ describe("matchesBottle", () => {
     expect(matchesBottle("Blanton's Original Single Barrel Bourbon 750ml", blantons)).toBe(true);
     const bt = TARGET_BOTTLES.find((b) => b.name === "Buffalo Trace");
     expect(matchesBottle("Buffalo Trace Bourbon 750ml", bt)).toBe(true);
+  });
+
+  it("matchesBottle respects retailers field for per-retailer filtering", () => {
+    const michters = TARGET_BOTTLES.find((b) => b.name === "Michter's 10 Year");
+    expect(michters.retailers).toEqual(["costco", "totalwine"]);
+    // Matches at allowed retailers
+    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "costco")).toBe(true);
+    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "totalwine")).toBe(true);
+    // Skips at non-allowed retailers
+    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "walmart")).toBe(false);
+    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "kroger")).toBe(false);
+    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "safeway")).toBe(false);
+    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "walgreens")).toBe(false);
+    // No retailerKey = matches everywhere (backward compat)
+    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters)).toBe(true);
+  });
+
+  it("bottles without retailers field match at all retailers", () => {
+    const blantons = TARGET_BOTTLES.find((b) => b.name === "Blanton's Original");
+    expect(blantons.retailers).toBeUndefined();
+    expect(matchesBottle("Blanton's Original Single Barrel Bourbon", blantons, "walmart")).toBe(true);
+    expect(matchesBottle("Blanton's Original Single Barrel Bourbon", blantons, "costco")).toBe(true);
+    expect(matchesBottle("Blanton's Original Single Barrel Bourbon", blantons, "kroger")).toBe(true);
   });
 
   it("every TARGET_BOTTLE is reachable by at least one SEARCH_QUERY", () => {
@@ -4689,8 +4714,8 @@ describe("getQueriesForScan", () => {
   it("returns roughly half the queries per scan (plus canary)", () => {
     _setScanCounter(0);
     const queries = getQueriesForScan(SEARCH_QUERIES);
-    // 13 non-canary queries split in half = ~6-7, plus canary = ~7-8
-    expect(queries.length).toBeGreaterThanOrEqual(7);
+    // 14 non-canary queries split in half = 7, plus canary = 8
+    expect(queries.length).toBeGreaterThanOrEqual(8);
     expect(queries.length).toBeLessThanOrEqual(8);
   });
 

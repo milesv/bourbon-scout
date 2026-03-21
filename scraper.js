@@ -368,6 +368,8 @@ const SEARCH_QUERIES = [
   "rock hill farms",           // Rock Hill Farms
   "king of kentucky bourbon",  // King of Kentucky
   "old forester bourbon",      // Birthday, President's Choice, 150th Anniversary, King Ranch
+  "michters bourbon",           // Michter's 10 Year Single Barrel (Costco + Total Wine only)
+  "penelope bourbon",           // Penelope Founder's Reserve + Estate Collection (Costco + Total Wine only)
   "buffalo trace",              // Canary bottle — always-available health check
 ];
 
@@ -409,6 +411,9 @@ const TARGET_BOTTLES = [
   { name: "Old Forester President's Choice", searchTerms: ["old forester president's choice", "old forester presidents choice", "old forester president", "president's choice bourbon"] },
   { name: "Old Forester 150th Anniversary", searchTerms: ["old forester 150th", "old forester 150"] },
   { name: "Old Forester King Ranch",    searchTerms: ["old forester king ranch"] },
+  { name: "Michter's 10 Year",            searchTerms: ["michter's 10", "michters 10", "michter's 10 year", "michters 10 year"], retailers: ["costco", "totalwine"] },
+  { name: "Penelope Founder's Reserve",   searchTerms: ["penelope founder", "penelope founder's reserve", "penelope founders reserve"], retailers: ["costco", "totalwine"] },
+  { name: "Penelope Estate Collection",   searchTerms: ["penelope estate", "penelope estate collection"], retailers: ["costco", "totalwine"] },
   // Canary — always-available bottle used as a scraper health check
   { name: "Buffalo Trace", searchTerms: ["buffalo trace"], canary: true },
 ];
@@ -892,9 +897,10 @@ function normalizeText(text) {
 // sampler packs, gift sets, etc. from triggering multiple bottle matches at once.
 const EXCLUDE_TERMS = ["sampler", "gift set", "variety pack", "combo pack", "bundle", "miniature", "mini bottle"];
 
-function matchesBottle(text, bottle) {
+function matchesBottle(text, bottle, retailerKey) {
   const lower = normalizeText(text);
   if (EXCLUDE_TERMS.some((t) => lower.includes(t))) return false;
+  if (retailerKey && bottle.retailers && !bottle.retailers.includes(retailerKey)) return false;
   return bottle.searchTerms.some((term) => lower.includes(term));
 }
 
@@ -1374,7 +1380,7 @@ function matchCostcoTiles($) {
     const url = href || (id ? `https://www.costco.com/.product.${id}.html` : "");
 
     for (const bottle of TARGET_BOTTLES) {
-      if (matchesBottle(title, bottle)) {
+      if (matchesBottle(title, bottle, "costco")) {
         found.push({ name: bottle.name, url, price, sku: id || "", size: parseSize(title), fulfillment: "" });
       }
     }
@@ -1535,7 +1541,7 @@ async function scrapeCostcoOnce(page) {
       for (const p of products) {
         const productUrl = p.url || (p.id ? `https://www.costco.com/.product.${p.id}.html` : "");
         for (const bottle of TARGET_BOTTLES) {
-          if (matchesBottle(p.title, bottle)) {
+          if (matchesBottle(p.title, bottle, "costco")) {
             found.push({ name: bottle.name, url: productUrl, price: p.price, sku: p.id || "", size: parseSize(p.title), fulfillment: "" });
           }
         }
@@ -1640,7 +1646,7 @@ function matchTotalWineInitialState(state) {
     if (!inStock) continue;
 
     for (const bottle of TARGET_BOTTLES) {
-      if (matchesBottle(p.name || "", bottle)) {
+      if (matchesBottle(p.name || "", bottle, "totalwine")) {
         found.push({
           name: bottle.name,
           url: p.productUrl ? (p.productUrl.startsWith("http") ? p.productUrl : `https://www.totalwine.com${p.productUrl}`) : "",
@@ -1865,7 +1871,7 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
           for (const p of items) {
             if (!p.inStock) continue;
             for (const bottle of TARGET_BOTTLES) {
-              if (matchesBottle(p.name, bottle)) {
+              if (matchesBottle(p.name, bottle, "totalwine")) {
                 found.push({
                   name: bottle.name,
                   url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.totalwine.com${p.url}`) : "",
@@ -2002,7 +2008,7 @@ async function scrapeTotalWineStore(store) {
 // Extract matched bottles from Walmart __NEXT_DATA__ JSON.
 // Iterates ALL itemStacks (not just [0]), filters to actual products only,
 // excludes third-party marketplace sellers, and checks fulfillment.
-function matchWalmartNextData(nextData) {
+function matchWalmartNextData(nextData, retailerKey = "walmart") {
   const found = [];
   const allStacks = nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks || [];
   const items = allStacks.filter(Boolean).flatMap((stack) => stack.items || []);
@@ -2021,7 +2027,7 @@ function matchWalmartNextData(nextData) {
     if (badge && !(/store|pickup|today/i.test(badge))) continue;
 
     for (const bottle of TARGET_BOTTLES) {
-      if (matchesBottle(item.name, bottle)) {
+      if (matchesBottle(item.name, bottle, retailerKey)) {
         found.push({
           name: bottle.name,
           url: item.canonicalUrl ? `https://www.walmart.com${item.canonicalUrl}` : "",
@@ -2154,7 +2160,7 @@ async function scrapeWalmartViaBrowser(store, page) {
         if (products.length > 0) {
           for (const p of products) {
             for (const bottle of TARGET_BOTTLES) {
-              if (matchesBottle(p.title, bottle)) {
+              if (matchesBottle(p.title, bottle, "walmart")) {
                 found.push({ name: bottle.name, url: p.url, price: p.price, sku: "", size: parseSize(p.title), fulfillment: "" });
               }
             }
@@ -2379,7 +2385,7 @@ async function scrapeWalgreensViaBrowser(page) {
         const priceText = (p.price || "").toLowerCase();
         if (!priceText || priceText.includes("available in store") || priceText.includes("check your")) continue;
         for (const bottle of TARGET_BOTTLES) {
-          if (matchesBottle(p.title, bottle)) {
+          if (matchesBottle(p.title, bottle, "walgreens")) {
             const idMatch = p.url.match(/ID=(\w+)/);
             found.push({
               name: bottle.name,
@@ -2765,7 +2771,7 @@ async function scrapeKrogerStore(store) {
       const inStock = product.items?.some(isKrogerItemInStock);
       if (!inStock) continue;
       for (const bottle of TARGET_BOTTLES) {
-        if (matchesBottle(title, bottle)) {
+        if (matchesBottle(title, bottle, "kroger")) {
           // Prefer the item variant that is actually in-store, not blindly items[0]
           // (which may be a different size at a different price)
           const inStoreItem = product.items?.find(isKrogerItemInStock) || product.items?.[0];
@@ -2842,7 +2848,7 @@ async function scrapeSafewayStore(store) {
       const title = product.name || product.productTitle || "";
       if (product.inStock !== true && product.inStock !== 1) continue;
       for (const bottle of TARGET_BOTTLES) {
-        if (matchesBottle(title, bottle)) {
+        if (matchesBottle(title, bottle, "safeway")) {
           const fulfillmentParts = [];
           if (product.curbsideEligible) fulfillmentParts.push("Curbside");
           if (product.deliveryEligible) fulfillmentParts.push("Delivery");
