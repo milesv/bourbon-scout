@@ -509,12 +509,12 @@ describe("matchesBottle", () => {
 
   it("matchesBottle respects retailers field for per-retailer filtering", () => {
     const michters = TARGET_BOTTLES.find((b) => b.name === "Michter's 10 Year");
-    expect(michters.retailers).toEqual(["costco", "totalwine"]);
+    expect(michters.retailers).toEqual(["costco", "totalwine", "walmart"]);
     // Matches at allowed retailers
     expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "costco")).toBe(true);
     expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "totalwine")).toBe(true);
+    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "walmart")).toBe(true);
     // Skips at non-allowed retailers
-    expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "walmart")).toBe(false);
     expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "kroger")).toBe(false);
     expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "safeway")).toBe(false);
     expect(matchesBottle("Michter's 10 Year Single Barrel Bourbon 750ml", michters, "walgreens")).toBe(false);

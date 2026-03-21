@@ -411,9 +411,9 @@ const TARGET_BOTTLES = [
   { name: "Old Forester President's Choice", searchTerms: ["old forester president's choice", "old forester presidents choice", "old forester president", "president's choice bourbon"] },
   { name: "Old Forester 150th Anniversary", searchTerms: ["old forester 150th", "old forester 150"] },
   { name: "Old Forester King Ranch",    searchTerms: ["old forester king ranch"] },
-  { name: "Michter's 10 Year",            searchTerms: ["michter's 10", "michters 10", "michter's 10 year", "michters 10 year"], retailers: ["costco", "totalwine"] },
-  { name: "Penelope Founder's Reserve",   searchTerms: ["penelope founder", "penelope founder's reserve", "penelope founders reserve"], retailers: ["costco", "totalwine"] },
-  { name: "Penelope Estate Collection",   searchTerms: ["penelope estate", "penelope estate collection"], retailers: ["costco", "totalwine"] },
+  { name: "Michter's 10 Year",            searchTerms: ["michter's 10", "michters 10", "michter's 10 year", "michters 10 year"], retailers: ["costco", "totalwine", "walmart"] },
+  { name: "Penelope Founder's Reserve",   searchTerms: ["penelope founder", "penelope founder's reserve", "penelope founders reserve"], retailers: ["costco", "totalwine", "walmart"] },
+  { name: "Penelope Estate Collection",   searchTerms: ["penelope estate", "penelope estate collection"], retailers: ["costco", "totalwine", "walmart"] },
   // Canary — always-available bottle used as a scraper health check
   { name: "Buffalo Trace", searchTerms: ["buffalo trace"], canary: true },
 ];
