@@ -496,6 +496,8 @@ describe("matchesBottle", () => {
     expect(matchesBottle("Weller Bundle Special", TARGET_BOTTLES.find((b) => b.name === "Weller Special Reserve"))).toBe(false);
     expect(matchesBottle("EH Taylor Small Batch Miniature 50ml", TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Small Batch"))).toBe(false);
     expect(matchesBottle("Buffalo Trace Mini Bottle Set", TARGET_BOTTLES.find((b) => b.name === "Buffalo Trace"))).toBe(false);
+    expect(matchesBottle("Blanton's Original Single Barrel Bourbon 50ml", blantons)).toBe(false);
+    expect(matchesBottle("Blanton's Original Single Barrel Bourbon 50 ml", blantons)).toBe(false);
   });
 
   it("EXCLUDE_TERMS does not reject legitimate product titles", () => {

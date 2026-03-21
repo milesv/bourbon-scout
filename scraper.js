@@ -895,7 +895,7 @@ function normalizeText(text) {
 
 // Product titles containing these terms are not individual bottles — skip them to prevent
 // sampler packs, gift sets, etc. from triggering multiple bottle matches at once.
-const EXCLUDE_TERMS = ["sampler", "gift set", "variety pack", "combo pack", "bundle", "miniature", "mini bottle"];
+const EXCLUDE_TERMS = ["sampler", "gift set", "variety pack", "combo pack", "bundle", "miniature", "mini bottle", " 50ml", " 50 ml"];
 
 function matchesBottle(text, bottle, retailerKey) {
   const lower = normalizeText(text);
