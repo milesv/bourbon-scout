@@ -1017,20 +1017,35 @@ async function runWithConcurrency(tasks, limit) {
   await Promise.all(executing);
 }
 
-// Headers for fetch-based scrapers (mimics a real Chrome 145 browser navigation).
+// Auto-detect Chrome version from the system binary to keep UA + Sec-CH-UA in sync
+// with the TLS fingerprint. Hardcoded versions drift when Chrome auto-updates,
+// creating a TLS-vs-UA mismatch that anti-bot systems specifically flag.
+const IS_MAC = process.platform === "darwin";
+
+// Synchronous version detection at module load — execFileSync is fast (<50ms)
+let CHROME_VERSION = "146";
+try {
+  if (IS_MAC) {
+    const { execFileSync } = await import("node:child_process");
+    const out = execFileSync("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", ["--version"], { timeout: 5000 }).toString().trim();
+    const match = out.match(/Chrome\s+(\d+)/);
+    if (match) CHROME_VERSION = match[1];
+  }
+} catch { /* use fallback */ }
+
+// Headers for fetch-based scrapers — auto-matched to the system Chrome version.
 // Must include Sec-CH-UA Client Hints alongside Sec-Fetch-* — omitting them creates
 // a fingerprint that matches no real browser and trips bot detectors.
 // Platform-aware: uses macOS UA on Mac (self-hosted runner) to match TLS fingerprint.
-const IS_MAC = process.platform === "darwin";
 const FETCH_HEADERS = {
   "User-Agent": IS_MAC
-    ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    ? `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION}.0.0.0 Safari/537.36`
+    : `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION}.0.0.0 Safari/537.36`,
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
   "Accept-Language": "en-US,en;q=0.9",
   "Accept-Encoding": "gzip, deflate",
   "Referer": "https://www.google.com/",
-  "Sec-CH-UA": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+  "Sec-CH-UA": `"Not:A-Brand";v="99", "Google Chrome";v="${CHROME_VERSION}", "Chromium";v="${CHROME_VERSION}"`,
   "Sec-CH-UA-Mobile": "?0",
   "Sec-CH-UA-Platform": IS_MAC ? '"macOS"' : '"Windows"',
   "Sec-Fetch-Dest": "document",
@@ -2119,6 +2134,21 @@ async function scrapeWalmartViaFetch(store) {
   let failures = 0;
   let validPages = 0;
   let rotated = false;
+
+  // Pre-warm: fetch homepage to get Akamai/PerimeterX session cookies before search.
+  // Same pattern as Costco — Akamai gives lighter treatment to requests with valid session cookies.
+  let cookies = "";
+  try {
+    const homeRes = await scraperFetchRetry("https://www.walmart.com/", {
+      headers: FETCH_HEADERS,
+      timeout: 10000,
+      proxyUrl: getRetailerProxyUrl("walmart"),
+    });
+    const rawSetCookie = homeRes.headers["set-cookie"];
+    const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
+    cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
+  } catch { /* continue without cookies */ }
+
   // Batch queries (2 concurrent) — lower concurrency reduces Akamai/PerimeterX burst detection.
   // With 5 stores potentially running fetch simultaneously, even 2 concurrent queries
   // per store means up to 10 total requests hitting walmart.com at once.
@@ -2129,12 +2159,14 @@ async function scrapeWalmartViaFetch(store) {
     if (failures >= 2 && !rotated) {
       rotated = true;
       rotateRetailerProxy("walmart");
+      cookies = ""; // Clear cookies from old IP's session
       await sleep(1000 + Math.random() * 1000);
     }
     // Inter-query delay with jitter to reduce burst detection
     if (i > 0) await sleep(1500 + Math.random() * 1500);
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
     const headers = { ...FETCH_HEADERS };
+    if (cookies) headers["Cookie"] = cookies;
     if (i > 0) {
       headers["Sec-Fetch-Site"] = "same-origin";
       headers["Referer"] = "https://www.walmart.com/";
@@ -3197,7 +3229,7 @@ export {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
+  IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,

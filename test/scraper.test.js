@@ -73,7 +73,7 @@ import {
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
+  IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
@@ -2182,6 +2182,35 @@ describe("scrapeWalmartViaFetch", () => {
   });
 });
 
+describe("scrapeWalmartViaFetch pre-warm", () => {
+  it("forwards homepage cookies to search requests", async () => {
+    const walmartNextData = {
+      props: { pageProps: { initialData: { searchResult: { itemStacks: [{ items: [{
+        __typename: "Product", name: "Weller Special Reserve Bourbon",
+        availabilityStatusV2: { value: "IN_STOCK" }, canonicalUrl: "/ip/weller/123",
+        priceInfo: { currentPrice: { priceString: "$29.99" } }, sellerName: "Walmart.com",
+      }] }] } } } },
+    };
+    const html = `<html><script id="__NEXT_DATA__" type="application/json">${JSON.stringify(walmartNextData)}</script></html>`;
+    mocks.gotScraping.mockImplementation(({ url }) => {
+      if (url === "https://www.walmart.com/") {
+        return Promise.resolve(mockGotResponse(200, "<html>Walmart</html>", {
+          "set-cookie": "ak_bmsc=abc123; Path=/; HttpOnly",
+        }));
+      }
+      return Promise.resolve(mockGotResponse(200, html));
+    });
+    const found = await runWithFakeTimers(() => scrapeWalmartViaFetch(TEST_STORE));
+    expect(found).not.toBeNull();
+    // Verify search calls include Cookie header from pre-warm
+    // gotScraping is called with a single opts object: gotScraping({ url, headers, ... })
+    const searchCalls = mocks.gotScraping.mock.calls.filter((args) => args[0]?.url?.includes("/search?"));
+    expect(searchCalls.length).toBeGreaterThan(0);
+    const searchHeaders = searchCalls[0][0]?.headers || {};
+    expect(searchHeaders["Cookie"]).toBe("ak_bmsc=abc123");
+  });
+});
+
 describe("scrapeWalmartViaFetch edge cases", () => {
   it("returns null when validPages is 0 but no failures exceed threshold", async () => {
     // All queries return HTML without __NEXT_DATA__ — failures increment but don't exceed 3
@@ -3239,6 +3268,14 @@ describe("browser hardening", () => {
     expect(callArgs.args).toContain("--no-first-run");
     expect(callArgs.ignoreDefaultArgs).toEqual(["--enable-automation"]);
     await closeBrowser();
+  });
+
+  it("CHROME_VERSION is a numeric string matching system Chrome", () => {
+    expect(CHROME_VERSION).toMatch(/^\d+$/);
+    // UA, Sec-CH-UA, and Sec-CH-UA all use the same version
+    expect(FETCH_HEADERS["User-Agent"]).toContain(`Chrome/${CHROME_VERSION}.0.0.0`);
+    expect(FETCH_HEADERS["Sec-CH-UA"]).toContain(`"Google Chrome";v="${CHROME_VERSION}"`);
+    expect(FETCH_HEADERS["Sec-CH-UA"]).toContain(`"Chromium";v="${CHROME_VERSION}"`);
   });
 
   it("CHROME_PATH is set on Mac, null otherwise", () => {
