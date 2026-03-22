@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => {
     gotScraping: vi.fn(),
     readFile: vi.fn(),
     writeFile: vi.fn(),
+    appendFile: vi.fn(),
     rename: vi.fn(),
     mkdir: vi.fn().mockResolvedValue(undefined),
     chromiumLaunch: vi.fn(),
@@ -50,6 +51,7 @@ vi.mock("cheerio", async () => await vi.importActual("cheerio"));
 vi.mock("node:fs/promises", () => ({
   readFile: mocks.readFile,
   writeFile: mocks.writeFile,
+  appendFile: mocks.appendFile,
   rename: mocks.rename,
   mkdir: mocks.mkdir,
   readdir: vi.fn().mockResolvedValue([]),
@@ -314,6 +316,22 @@ describe("getGreasedBrand", () => {
 
   it("FETCH_HEADERS Sec-CH-UA matches getGreasedBrand(CHROME_VERSION)", () => {
     expect(FETCH_HEADERS["Sec-CH-UA"]).toBe(getGreasedBrand(Number(CHROME_VERSION)));
+  });
+
+  it("getGreasedBrand handles version 0 (modulo boundary)", () => {
+    const brand = getGreasedBrand(0);
+    expect(brand).toContain(`"Chromium";v="0"`);
+    expect(brand).toContain(`"Google Chrome";v="0"`);
+  });
+
+  it("getGreasedBrand handles high version numbers (200+)", () => {
+    for (const v of [200, 250, 999]) {
+      const brand = getGreasedBrand(v);
+      expect(brand).toContain(`"Chromium";v="${v}"`);
+      expect(brand).toContain(`"Google Chrome";v="${v}"`);
+      // Should always have exactly 3 comma-separated entries
+      expect(brand.split(", ")).toHaveLength(3);
+    }
   });
 });
 
@@ -596,6 +614,37 @@ describe("matchesBottle", () => {
     ];
     const filtered = filterMiniatures(found);
     expect(filtered).toHaveLength(2);
+  });
+
+  it("filterMiniatures keeps bottles priced exactly at $20 boundary", () => {
+    const found = [
+      { name: "Blanton's Original", price: "$20.00", size: "", url: "" },  // Exactly $20 — kept
+      { name: "Weller SR", price: "$19.99", size: "", url: "" },           // Just under — filtered
+    ];
+    const filtered = filterMiniatures(found);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].name).toBe("Blanton's Original");
+  });
+
+  it("filterMiniatures keeps bottles at 200ml size boundary", () => {
+    const found = [
+      { name: "A", price: "$25.00", size: "200ml", url: "" },  // Exactly 200ml — kept (< 200 filtered)
+      { name: "B", price: "$25.00", size: "199ml", url: "" },  // 199ml — filtered
+      { name: "C", price: "$25.00", size: "375ml", url: "" },  // Half bottle — kept
+    ];
+    const filtered = filterMiniatures(found);
+    expect(filtered).toHaveLength(2);
+    expect(filtered.map(f => f.name)).toEqual(["A", "C"]);
+  });
+
+  it("filterMiniatures handles standard large sizes (750ml, 1L, 1.75L)", () => {
+    const found = [
+      { name: "A", price: "$45.00", size: "750ml", url: "" },
+      { name: "B", price: "$80.00", size: "1L", url: "" },
+      { name: "C", price: "$60.00", size: "1.75L", url: "" },
+    ];
+    const filtered = filterMiniatures(found);
+    expect(filtered).toHaveLength(3);
   });
 
   it("matchesBottle respects retailers field for per-retailer filtering", () => {
@@ -4870,6 +4919,50 @@ describe("scan metrics", () => {
       totalGoneOOS: 0, nothingCount: 10, durationSec: 60, trend: null,
     });
     expect(embed.description).not.toContain("24h trend");
+  });
+
+  it("appendMetrics writes JSON line to metrics file", async () => {
+    mocks.appendFile.mockResolvedValueOnce(undefined);
+    const entry = { ts: "2026-03-21T00:00:00Z", retailers: {}, duration: 60 };
+    await appendMetrics(entry);
+    expect(mocks.appendFile).toHaveBeenCalledTimes(1);
+    const [path, data] = mocks.appendFile.mock.calls[0];
+    expect(path).toMatch(/metrics\.jsonl$/);
+    expect(data).toBe(JSON.stringify(entry) + "\n");
+  });
+
+  it("loadRecentMetrics parses JSONL and filters by time cutoff", async () => {
+    const now = Date.now();
+    const recent = { ts: new Date(now - 1000).toISOString(), retailers: {} };
+    const old = { ts: new Date(now - 25 * 60 * 60 * 1000).toISOString(), retailers: {} };
+    mocks.readFile.mockResolvedValueOnce(
+      JSON.stringify(old) + "\n" + JSON.stringify(recent) + "\n"
+    );
+    const result = await loadRecentMetrics(24);
+    expect(result).toHaveLength(1);
+    expect(result[0].ts).toBe(recent.ts);
+  });
+
+  it("loadRecentMetrics returns empty array when file missing", async () => {
+    mocks.readFile.mockRejectedValueOnce(new Error("ENOENT"));
+    const result = await loadRecentMetrics(24);
+    expect(result).toEqual([]);
+  });
+
+  it("loadRecentMetrics skips malformed JSON lines", async () => {
+    const valid = { ts: new Date().toISOString(), retailers: {} };
+    mocks.readFile.mockResolvedValueOnce(
+      "not json\n" + JSON.stringify(valid) + "\n{broken\n"
+    );
+    const result = await loadRecentMetrics(24);
+    expect(result).toHaveLength(1);
+    expect(result[0].ts).toBe(valid.ts);
+  });
+
+  it("loadRecentMetrics handles empty file", async () => {
+    mocks.readFile.mockResolvedValueOnce("");
+    const result = await loadRecentMetrics(24);
+    expect(result).toEqual([]);
   });
 });
 

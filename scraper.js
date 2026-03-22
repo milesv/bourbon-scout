@@ -1002,7 +1002,7 @@ const MIN_BOTTLE_PRICE = 20;
 function filterMiniatures(found) {
   return found.filter((f) => {
     const size = (f.size || "").toLowerCase();
-    if (size && size !== "" && size !== "750ml" && size !== "1L" && size !== "1.75L") {
+    if (size && size !== "" && size !== "750ml" && size !== "1l" && size !== "1.75l") {
       const ml = parseInt(size);
       if (!isNaN(ml) && ml < 200) return false; // Explicit small size (50ml, 100ml)
     }
