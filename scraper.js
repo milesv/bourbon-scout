@@ -2732,7 +2732,6 @@ const SAMSCLUB_PRODUCTS = {
   "Blanton's Original":       "prod23140012",
   "Weller Special Reserve":   "prod20595259",
   "E.H. Taylor Small Batch":  "prod25791990",
-  "E.H. Taylor Single Barrel": "prod17950176",
   "Stagg Jr":                 "prod25430037",
   "George T. Stagg":          "prod24381483",
   "Eagle Rare 17 Year":       "prod24381479",
