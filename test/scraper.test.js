@@ -67,7 +67,7 @@ vi.mock("../lib/geo.js", () => ({
 
 import {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, MIN_BOTTLE_PRICE, filterMiniatures, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, MIN_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
@@ -257,6 +257,63 @@ describe("constants", () => {
     const uaMatch = FETCH_HEADERS["User-Agent"].match(/Chrome\/([\d]+)/);
     const chMatch = FETCH_HEADERS["Sec-CH-UA"].match(/Chrome";v="([\d]+)"/);
     expect(uaMatch[1]).toBe(chMatch[1]);
+  });
+
+  it("FETCH_HEADERS property order matches Chrome HTTP/2 wire order", () => {
+    const keys = Object.keys(FETCH_HEADERS);
+    expect(keys[0]).toBe("Sec-CH-UA");
+    expect(keys[1]).toBe("Sec-CH-UA-Mobile");
+    expect(keys[2]).toBe("Sec-CH-UA-Platform");
+    expect(keys[3]).toBe("Upgrade-Insecure-Requests");
+    expect(keys[4]).toBe("User-Agent");
+    expect(keys[5]).toBe("Accept");
+    expect(keys[6]).toBe("Sec-Fetch-Site");
+    expect(keys[7]).toBe("Sec-Fetch-Mode");
+    expect(keys[8]).toBe("Sec-Fetch-User");
+    expect(keys[9]).toBe("Sec-Fetch-Dest");
+    expect(keys[10]).toBe("Accept-Encoding");
+    expect(keys[11]).toBe("Accept-Language");
+    expect(keys[12]).toBe("Referer");
+    expect(keys[13]).toBe("priority");
+    expect(keys).toHaveLength(14);
+  });
+
+  it("FETCH_HEADERS includes priority header for HTTP/2", () => {
+    expect(FETCH_HEADERS["priority"]).toBe("u=0, i");
+  });
+});
+
+// ─── getGreasedBrand (Chromium Sec-CH-UA GREASE algorithm) ──────────────────
+
+describe("getGreasedBrand", () => {
+  it("generates correct brand for Chrome 145", () => {
+    expect(getGreasedBrand(145)).toBe(
+      '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"'
+    );
+  });
+
+  it("generates correct brand for Chrome 146", () => {
+    expect(getGreasedBrand(146)).toBe(
+      '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"'
+    );
+  });
+
+  it("generates correct brand for Chrome 147", () => {
+    expect(getGreasedBrand(147)).toBe(
+      '"Chromium";v="147", "Google Chrome";v="147", "Not.A/Brand";v="8"'
+    );
+  });
+
+  it("always includes Chromium and Google Chrome entries for versions 130-160", () => {
+    for (let v = 130; v <= 160; v++) {
+      const brand = getGreasedBrand(v);
+      expect(brand).toContain(`"Chromium";v="${v}"`);
+      expect(brand).toContain(`"Google Chrome";v="${v}"`);
+    }
+  });
+
+  it("FETCH_HEADERS Sec-CH-UA matches getGreasedBrand(CHROME_VERSION)", () => {
+    expect(FETCH_HEADERS["Sec-CH-UA"]).toBe(getGreasedBrand(Number(CHROME_VERSION)));
   });
 });
 
@@ -3880,7 +3937,7 @@ describe("Old Forester President search term (#16)", () => {
   });
 });
 
-describe("FETCH_HEADERS Chrome 145 fidelity (#5, #6)", () => {
+describe("FETCH_HEADERS Chrome fidelity (#5, #6)", () => {
   it("Accept header matches full Chrome 145 value", () => {
     expect(FETCH_HEADERS["Accept"]).toContain("image/avif");
     expect(FETCH_HEADERS["Accept"]).toContain("image/webp");

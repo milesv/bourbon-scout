@@ -1050,26 +1050,47 @@ try {
   }
 } catch { /* use fallback */ }
 
-// Headers for fetch-based scrapers — auto-matched to the system Chrome version.
-// Must include Sec-CH-UA Client Hints alongside Sec-Fetch-* — omitting them creates
-// a fingerprint that matches no real browser and trips bot detectors.
-// Platform-aware: uses macOS UA on Mac (self-hosted runner) to match TLS fingerprint.
+// Replicate Chromium's Sec-CH-UA GREASE algorithm (user_agent_utils.cc).
+// Each Chrome major version deterministically selects a grease brand name, version,
+// and entry ordering. Hardcoding a single brand string creates a version mismatch
+// signal when Chrome auto-updates — this function auto-matches any version.
+function getGreasedBrand(majorVersion) {
+  const chars = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
+  const versions = ["8", "99", "24"];
+  const orders = [[0,1,2], [0,2,1], [1,0,2], [1,2,0], [2,0,1], [2,1,0]];
+  const brand = `Not${chars[majorVersion % 11]}A${chars[(majorVersion + 1) % 11]}Brand`;
+  const ver = versions[majorVersion % 3];
+  const order = orders[majorVersion % 6];
+  const entries = [
+    `"${brand}";v="${ver}"`,
+    `"Chromium";v="${majorVersion}"`,
+    `"Google Chrome";v="${majorVersion}"`,
+  ];
+  return order.map(i => entries[i]).join(", ");
+}
+
+// Headers for fetch-based scrapers — property insertion order matches Chrome's HTTP/2
+// wire order. got-scraping's TransformHeadersAgent only sorts HTTP/1.1 headers; on H2,
+// Node's http2.request() sends headers in JS object iteration order (= insertion order).
+// Akamai pattern-matches header order as a zero-CPU bot signal — Client Hints before
+// User-Agent is critical. Platform-aware: macOS UA on Mac to match TLS fingerprint.
 const FETCH_HEADERS = {
+  "Sec-CH-UA": getGreasedBrand(Number(CHROME_VERSION)),
+  "Sec-CH-UA-Mobile": "?0",
+  "Sec-CH-UA-Platform": IS_MAC ? '"macOS"' : '"Windows"',
+  "Upgrade-Insecure-Requests": "1",
   "User-Agent": IS_MAC
     ? `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION}.0.0.0 Safari/537.36`
     : `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION}.0.0.0 Safari/537.36`,
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate",
-  "Referer": "https://www.google.com/",
-  "Sec-CH-UA": `"Not:A-Brand";v="99", "Google Chrome";v="${CHROME_VERSION}", "Chromium";v="${CHROME_VERSION}"`,
-  "Sec-CH-UA-Mobile": "?0",
-  "Sec-CH-UA-Platform": IS_MAC ? '"macOS"' : '"Windows"',
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
   "Sec-Fetch-Site": "cross-site",
+  "Sec-Fetch-Mode": "navigate",
   "Sec-Fetch-User": "?1",
-  "Upgrade-Insecure-Requests": "1",
+  "Sec-Fetch-Dest": "document",
+  "Accept-Encoding": "gzip, deflate",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Referer": "https://www.google.com/",
+  "priority": "u=0, i",
 };
 
 // ─── Browser Management ──────────────────────────────────────────────────────
@@ -3242,7 +3263,7 @@ async function poll() {
 
 export {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, MIN_BOTTLE_PRICE, filterMiniatures, dedupFound, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, MIN_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
