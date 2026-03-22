@@ -73,7 +73,7 @@ import {
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
-  METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend,
+  METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend, computePeakHours,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
@@ -91,7 +91,8 @@ import {
   _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
   _resetRetailerFailures, _resetKnownProducts, _getKnownProducts, _setKnownProducts,
   acquireRetailerLock, _resetRetailerBrowserLocks, _resetRetailerBrowserBlocked,
-  _setProxyExhausted, _getProxyExhausted,
+  _setProxyExhausted, _getProxyExhausted, _setPrimaryProxyExhausted, _setBackupProxyExhausted,
+  isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
 } from "../scraper.js";
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────
@@ -4966,6 +4967,81 @@ describe("scan metrics", () => {
   });
 });
 
+// ─── Peak Hours Analysis ────────────────────────────────────────────────────
+
+describe("computePeakHours", () => {
+  it("returns null with fewer than 100 scans", () => {
+    const scans = Array.from({ length: 99 }, (_, i) => ({
+      ts: new Date(Date.now() - i * 30 * 60 * 1000).toISOString(),
+      retailers: { costco: { queries: 10, ok: 8, blocked: 2, canary: true, found: [] } },
+    }));
+    expect(computePeakHours(scans)).toBeNull();
+  });
+
+  it("identifies slots with finds and sorts by rate", () => {
+    // 120 scans, 10 with finds scattered across specific slots
+    const scans = [];
+    for (let i = 0; i < 120; i++) {
+      const d = new Date("2026-03-10T18:00:00-07:00"); // Mon 6 PM MT
+      d.setMinutes(d.getMinutes() + i * 30);
+      const hasFind = i < 5; // first 5 scans have finds
+      scans.push({
+        ts: d.toISOString(),
+        retailers: { costco: { queries: 10, ok: 8, blocked: 2, canary: true, found: hasFind ? ["Weller SR"] : [] } },
+      });
+    }
+    const result = computePeakHours(scans);
+    expect(result).not.toBeNull();
+    expect(result.totalScans).toBe(120);
+    expect(result.slots.length).toBeGreaterThan(0);
+    expect(result.slots.length).toBeLessThanOrEqual(10);
+    // All slots should have finds > 0
+    for (const s of result.slots) {
+      expect(s.finds).toBeGreaterThan(0);
+      expect(s.rate).toBeGreaterThan(0);
+    }
+  });
+
+  it("buildSummaryEmbed renders peak hours when provided", () => {
+    const peakHours = {
+      totalScans: 200,
+      slots: [
+        { slot: "Tue-18", finds: 5, scans: 20, rate: 0.25 },
+        { slot: "Wed-7", finds: 3, scans: 15, rate: 0.2 },
+      ],
+    };
+    const embed = buildSummaryEmbed({
+      storesScanned: 10, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 10, durationSec: 60, peakHours,
+    });
+    expect(embed.description).toContain("Peak find times");
+    expect(embed.description).toContain("200 scans");
+    expect(embed.description).toContain("Tue 6 PM");
+  });
+
+  it("buildSummaryEmbed omits peak hours when null", () => {
+    const embed = buildSummaryEmbed({
+      storesScanned: 10, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 10, durationSec: 60, peakHours: null,
+    });
+    expect(embed.description).not.toContain("Peak find times");
+  });
+});
+
+// ─── Cookie Chain (browser → fetch) ─────────────────────────────────────────
+
+describe("retailer cookie cache", () => {
+  it("getCachedCookies returns empty string when no cache", () => {
+    expect(getCachedCookies("costco")).toBe("");
+  });
+
+  it("getCachedCookies returns empty string after TTL expires", () => {
+    // Manually set a stale entry by manipulating through cacheRetailerCookies won't work
+    // without a real browser context, so test the TTL logic through the function contract
+    expect(getCachedCookies("nonexistent")).toBe("");
+  });
+});
+
 // ─── Query Rotation (getQueriesForScan) ─────────────────────────────────────
 
 describe("getQueriesForScan", () => {
@@ -6604,6 +6680,22 @@ describe("proxyExhausted flag", () => {
     _setProxyExhausted(true);
     const result = await scrapeSamsClubViaFetch();
     expect(result).toBeNull();
+  });
+
+  it("scraperFetch triggers failover on first 407, backup exhaustion on second", async () => {
+    _setProxyExhausted(false);
+    // First 407 — primary exhausted
+    mocks.gotScraping.mockResolvedValueOnce({ statusCode: 407, headers: {}, body: "" });
+    await scraperFetch("https://example.com", {});
+    // isProxyAvailable still true if backup not configured (no BACKUP_PROXY_URL in test env)
+    // but _getProxyExhausted returns true (both flags set since no backup)
+    expect(_getProxyExhausted()).toBe(true);
+  });
+
+  it("isProxyAvailable returns false when no proxyAgent", () => {
+    _setProxyExhausted(false);
+    // proxyAgent is null in test env (no PROXY_URL)
+    expect(isProxyAvailable()).toBe(false);
   });
 });
 

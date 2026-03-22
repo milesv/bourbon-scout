@@ -155,6 +155,7 @@ function rotateRetailerProxy(retailerKey) {
     retailerProxyAgents[retailerKey] = createProxyAgent(newUrl);
     // Clear stale cookies from old IP — anti-bot ties cookies to IPs
     browserStateCache = null;
+    delete retailerCookieCache[retailerKey];
     if (retailerBrowserCache[retailerKey]) {
       retailerBrowserCache[retailerKey].context.clearCookies().catch(() => {});
     }
@@ -182,14 +183,50 @@ function getRetailerBrowserProxy(retailerKey) {
   return config;
 }
 
+// Check if any proxy is available for fetch paths. Returns false when both primary and
+// backup are exhausted, or when no proxy/backup exists and primary is exhausted.
+function isProxyAvailable() {
+  if (!proxyAgent) return false;
+  if (!primaryProxyExhausted) return true;
+  if (BACKUP_PROXY_URL && !backupProxyExhausted) return true;
+  return false;
+}
+
+// Auto-failover: switch ALL retailers from primary to backup proxy when primary exhausts.
+// Returns true if failover succeeded, false if no backup available.
+function failoverToBackupProxy() {
+  if (!BACKUP_PROXY_URL) return false;
+  console.log("[proxy] Failing over ALL retailers to backup proxy");
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
+  const basePort = 10000 + Math.floor(Math.random() * 9000);
+  for (let i = 0; i < retailers.length; i++) {
+    try {
+      const url = new URL(BACKUP_PROXY_URL);
+      url.port = String(basePort + i);
+      retailerProxyUrls[retailers[i]] = url.toString();
+      retailerProxyAgents[retailers[i]] = createProxyAgent(retailerProxyUrls[retailers[i]]);
+    } catch (err) {
+      console.warn(`[proxy] Failover failed for ${retailers[i]}: ${err.message}`);
+    }
+  }
+  try {
+    const url = new URL(BACKUP_PROXY_URL);
+    url.port = String(basePort + retailers.length);
+    proxySessionUrl = url.toString();
+    proxyAgent = createProxyAgent(proxySessionUrl);
+  } catch {}
+  return true;
+}
+
 // Per-poll health metrics per retailer. Reset each poll().
 // Structure: { retailerKey: { queries: 0, succeeded: 0, failed: 0, blocked: 0 } }
 let scraperHealth = {};
 
-// Set when proxy returns 407 TRAFFIC_EXHAUSTED. Fetch paths check this and skip immediately
-// (return null) instead of wasting time hitting a dead proxy. Browser fallback takes over.
-// Reset at the start of each poll().
-let proxyExhausted = false;
+// Proxy exhaustion tracking. When primary proxy returns 407 TRAFFIC_EXHAUSTED, we attempt
+// automatic failover to BACKUP_PROXY_URL (if configured). If backup also exhausts, fetch
+// paths skip entirely and browser fallback takes over. Reset at the start of each poll().
+let primaryProxyExhausted = false;
+let backupProxyExhausted = false;
 
 function initHealth(key) {
   if (!scraperHealth[key]) scraperHealth[key] = { queries: 0, succeeded: 0, failed: 0, blocked: 0 };
@@ -495,6 +532,37 @@ function computeMetricsTrend(recentMetrics) {
     }
   }
   return { scans: recentMetrics.length, hours: 24, retailers };
+}
+
+// Analyze historical metrics to identify when bottles are most often found.
+// Groups finds by day-of-week + hour (MT) and returns slots ranked by find rate.
+// Returns null until enough data exists (~2 weeks / 100+ scans) for significance.
+function computePeakHours(recentMetrics) {
+  if (recentMetrics.length < 100) return null;
+  const findsBySlot = {};
+  const scansBySlot = {};
+  for (const scan of recentMetrics) {
+    const d = new Date(scan.ts);
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Phoenix", hour: "numeric", hour12: false, weekday: "short",
+    }).formatToParts(d);
+    const hour = parseInt(parts.find(p => p.type === "hour").value, 10);
+    const day = parts.find(p => p.type === "weekday").value;
+    const slot = `${day}-${hour}`;
+    scansBySlot[slot] = (scansBySlot[slot] || 0) + 1;
+    let hasFinds = false;
+    if (scan.retailers) {
+      for (const data of Object.values(scan.retailers)) {
+        if (data.found?.length > 0) { hasFinds = true; break; }
+      }
+    }
+    if (hasFinds) findsBySlot[slot] = (findsBySlot[slot] || 0) + 1;
+  }
+  const slots = Object.keys(scansBySlot)
+    .map(slot => ({ slot, finds: findsBySlot[slot] || 0, scans: scansBySlot[slot], rate: (findsBySlot[slot] || 0) / scansBySlot[slot] }))
+    .filter(s => s.finds > 0)
+    .sort((a, b) => b.rate - a.rate || b.finds - a.finds);
+  return { slots: slots.slice(0, 10), totalScans: recentMetrics.length };
 }
 
 // ─── State Change Tracking ──────────────────────────────────────────────────
@@ -809,7 +877,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
 const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
 const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens", samsclub: "Sam's Club" };
 
-function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null }) {
+function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null, peakHours = null }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
   desc += `🟢 ${totalNewFinds} new finds   🔵 ${totalStillInStock} still in stock\n`;
   desc += `🔴 ${totalGoneOOS} went OOS    💤 ${nothingCount} nothing`;
@@ -853,6 +921,17 @@ function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, tot
       const canaryPct = r.scans > 0 ? Math.round((r.canaryHits / r.scans) * 100) : 0;
       const found = r.bottlesFound.length > 0 ? ` │ 🥃 ${[...new Set(r.bottlesFound)].join(", ")}` : "";
       desc += `\n> ${label}: ${pct}% ok, 🐤 ${canaryPct}%${found}`;
+    }
+  }
+
+  // Peak find times from 14-day metrics history (requires 100+ scans for significance)
+  if (peakHours && peakHours.slots.length > 0) {
+    desc += `\n\n**Peak find times** (${peakHours.totalScans} scans):`;
+    for (const s of peakHours.slots.slice(0, 5)) {
+      const [day, hourStr] = s.slot.split("-");
+      const h = parseInt(hourStr);
+      const timeStr = h === 0 ? "12 AM" : h < 12 ? `${h} AM` : h === 12 ? "12 PM" : `${h - 12} PM`;
+      desc += `\n> ${day} ${timeStr}: ${s.finds}/${s.scans} scans (${Math.round(s.rate * 100)}%)`;
     }
   }
 
@@ -916,10 +995,18 @@ async function scraperFetch(url, { headers, timeout = 15000, proxyUrl, redirect 
   if (proxyUrl) gotOpts.proxyUrl = proxyUrl;
   const response = await gotScraping(gotOpts);
   const statusCode = response.statusCode;
-  // Detect proxy quota exhaustion — stop wasting time on a dead proxy
-  if (statusCode === 407 && !proxyExhausted) {
-    proxyExhausted = true;
-    console.warn("[proxy] Traffic exhausted (407) — disabling fetch paths for this poll, browser fallback will use direct IP");
+  // Detect proxy quota exhaustion — attempt failover to backup proxy
+  if (statusCode === 407) {
+    if (!primaryProxyExhausted) {
+      primaryProxyExhausted = true;
+      console.warn("[proxy] Primary traffic exhausted (407) — attempting failover to backup");
+      if (!failoverToBackupProxy()) {
+        console.warn("[proxy] No backup proxy configured — disabling fetch paths, browser fallback will use direct IP");
+      }
+    } else if (!backupProxyExhausted) {
+      backupProxyExhausted = true;
+      console.warn("[proxy] Backup traffic also exhausted (407) — disabling fetch paths, browser fallback will use direct IP");
+    }
   }
   return {
     ok: statusCode >= 200 && statusCode < 300,
@@ -1161,6 +1248,34 @@ async function closeBrowser() {
 // Within a poll, multiple stores share the same browser via cached context.
 // Between polls, profile data persists even after context.close().
 const retailerBrowserCache = {};
+
+// Per-retailer browser cookie cache: populated after successful browser scrapes,
+// consumed by next poll's fetch pre-warm. Gives fetch paths browser-quality cookies
+// (including Akamai _abck) without needing to execute JS. TTL: 1 hour (_abck expiry).
+const retailerCookieCache = {};
+const COOKIE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+async function cacheRetailerCookies(retailerKey) {
+  const cached = retailerBrowserCache[retailerKey];
+  if (!cached?.context) return;
+  try {
+    const state = await cached.context.storageState();
+    if (!state?.cookies?.length) return;
+    const cookieStr = state.cookies.map(c => `${c.name}=${c.value}`).join("; ");
+    retailerCookieCache[retailerKey] = { cookies: cookieStr, ts: Date.now() };
+    console.log(`[${retailerKey}] Cached ${state.cookies.length} browser cookies for fetch`);
+  } catch { /* best-effort */ }
+}
+
+function getCachedCookies(retailerKey) {
+  const entry = retailerCookieCache[retailerKey];
+  if (!entry) return "";
+  if (Date.now() - entry.ts > COOKIE_CACHE_TTL_MS) {
+    delete retailerCookieCache[retailerKey];
+    return "";
+  }
+  return entry.cookies;
+}
 
 // Per-retailer browser-blocked flag: set when a browser scrape fails (blocked/timeout).
 // Remaining stores skip browser fallback for this poll — if one store is blocked,
@@ -1523,7 +1638,7 @@ function isCostcoBlocked(html) {
 // Try fetching Costco search HTML directly and parsing with cheerio (no browser needed).
 // Returns found[] on success, null if blocked by Akamai Bot Manager.
 async function scrapeCostcoViaFetch() {
-  if (!proxyAgent || proxyExhausted) return null; // skip if no proxy or quota exhausted
+  if (!isProxyAvailable()) return null; // skip if no working proxy
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -1543,6 +1658,9 @@ async function scrapeCostcoViaFetch() {
     const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
     cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
   } catch { /* continue without cookies */ }
+  // Merge browser-quality cookies (incl. Akamai _abck) from previous poll's browser scrape
+  const cachedCostco = getCachedCookies("costco");
+  if (cachedCostco) cookies = cookies ? `${cookies}; ${cachedCostco}` : cachedCostco;
 
   // SOCKS5 proxies (e.g. NordVPN) cap concurrent connections — go sequential.
   // HTTP proxies use 2 concurrent (down from 4) to reduce Akamai burst detection.
@@ -1742,6 +1860,7 @@ async function scrapeCostcoStore() {
       trackHealth("costco", "blocked");
       return dedupFound(knownFound);
     }
+    await cacheRetailerCookies("costco");
     return dedupFound([...knownFound, ...result]);
   } finally {
     await page.close().catch(() => {});
@@ -1785,7 +1904,7 @@ function matchTotalWineInitialState(state) {
 // Try fetching Total Wine search HTML directly and parsing INITIAL_STATE (no browser needed).
 // Returns { name, url, price, sku, size, fulfillment }[] on success, null if blocked.
 async function scrapeTotalWineViaFetch(store) {
-  if (!proxyAgent || proxyExhausted) return null; // skip if no proxy or quota exhausted
+  if (!isProxyAvailable()) return null; // skip if no working proxy
   const twProxy = getRetailerProxyUrl("totalwine");
   const found = [];
   let failures = 0;
@@ -2167,7 +2286,7 @@ function matchWalmartNextData(nextData, retailerKey = "walmart") {
 // Continues on per-query failures; only falls back to browser if majority of queries fail.
 // Returns { name, url, price }[] on success, null if blocked/unavailable.
 async function scrapeWalmartViaFetch(store) {
-  if (proxyExhausted) return null; // skip if proxy quota exhausted
+  if (primaryProxyExhausted && !isProxyAvailable()) return null; // Walmart works without proxy on Mac
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -2186,6 +2305,8 @@ async function scrapeWalmartViaFetch(store) {
     const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
     cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
   } catch { /* continue without cookies */ }
+  const cachedWalmart = getCachedCookies("walmart");
+  if (cachedWalmart) cookies = cookies ? `${cookies}; ${cachedWalmart}` : cachedWalmart;
 
   // Batch queries (2 concurrent) — lower concurrency reduces Akamai/PerimeterX burst detection.
   // With 5 stores potentially running fetch simultaneously, even 2 concurrent queries
@@ -2410,6 +2531,7 @@ async function scrapeWalmartStore(store) {
       retailerBrowserBlocked["walmart"] = true;
       return dedupFound(knownFound);
     }
+    await cacheRetailerCookies("walmart");
     return dedupFound([...knownFound, ...result]);
   } finally {
     await page.close().catch(() => {});
@@ -2610,6 +2732,7 @@ const SAMSCLUB_PRODUCTS = {
   "Blanton's Original":       "prod23140012",
   "Weller Special Reserve":   "prod20595259",
   "E.H. Taylor Small Batch":  "prod25791990",
+  "E.H. Taylor Single Barrel": "prod17950176",
   "Stagg Jr":                 "prod25430037",
   "George T. Stagg":          "prod24381483",
   "Eagle Rare 17 Year":       "prod24381479",
@@ -2645,7 +2768,7 @@ function matchSamsClubProduct(nextData, bottleName) {
 // Fetch-first: check each product page directly via HTTP, extract __NEXT_DATA__.
 // Returns found[] on success, null if blocked (triggers browser fallback).
 async function scrapeSamsClubViaFetch() {
-  if (!proxyAgent || proxyExhausted) return null; // skip if no proxy or quota exhausted
+  if (!isProxyAvailable()) return null; // skip if no working proxy
   const found = [];
   let failures = 0;
   let validPages = 0;
@@ -2664,6 +2787,8 @@ async function scrapeSamsClubViaFetch() {
     const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
     cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
   } catch { /* continue without cookies */ }
+  const cachedSams = getCachedCookies("samsclub");
+  if (cachedSams) cookies = cookies ? `${cookies}; ${cachedSams}` : cachedSams;
 
   const productTasks = entries.map(([bottleName, productId], i) => async () => {
     if (failures > Math.floor(entries.length / 2)) return; // Early-abort — browser will track its own
@@ -2839,6 +2964,7 @@ async function scrapeSamsClubStore() {
         console.warn(`[samsclub] ${scHealth.blocked}/${scHealth.queries} products blocked — retrying`);
         continue;
       }
+      await cacheRetailerCookies("samsclub");
       return result;
     } finally {
       await page.close().catch(() => {});
@@ -3094,7 +3220,8 @@ async function poll() {
   krogerToken = null;
   browserStateCache = null;
   scraperHealth = {};
-  proxyExhausted = false;
+  primaryProxyExhausted = false;
+  backupProxyExhausted = false;
   for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k];
   const canaryResults = {};
   scanCounter++;
@@ -3214,6 +3341,49 @@ async function poll() {
   // Run all stores concurrently (limit 8 — 6 retailers, fetch-first scrapers are lightweight)
   await runWithConcurrency(tasks, 8);
 
+  // Canary-driven retry: if a retailer ran queries but missed canary, the scraper is
+  // likely broken (not "nothing in stock" — Buffalo Trace is always available). Retry once
+  // with a fresh browser context and rotated proxy IP.
+  const canaryRetries = new Set();
+  const retryTasks = [];
+  for (const retailer of RETAILERS) {
+    const h = scraperHealth[retailer.key];
+    if (!h || h.queries === 0) continue;          // skipped — don't retry
+    if (canaryResults[retailer.key]) continue;      // canary found — working fine
+    if (h.succeeded === 0) continue;                // total failure — retry won't help
+    console.log(`[poll] 🐤 ${retailer.name} missed canary — retrying once`);
+    canaryRetries.add(retailer.key);
+    // Clear browser state for fresh approach
+    if (retailerBrowserCache[retailer.key]) {
+      await retailerBrowserCache[retailer.key].context.close().catch(() => {});
+      delete retailerBrowserCache[retailer.key];
+    }
+    rotateRetailerProxy(retailer.key);
+    const stores = storeCache.retailers[retailer.key] || [];
+    if (retailer.scrapeOnce) {
+      retryTasks.push(async () => {
+        try {
+          const inStock = await retailer.scraper();
+          for (const store of stores) {
+            try { await recordResult(retailer, store, inStock); }
+            catch (e) { console.error(`[retry] ${retailer.name} recordResult: ${e.message}`); }
+          }
+        } catch (e) { console.error(`[retry] ${retailer.name}: ${e.message}`); }
+      });
+    } else if (stores[0]) {
+      retryTasks.push(async () => {
+        try {
+          const inStock = await retailer.scraper(stores[0]);
+          await recordResult(retailer, stores[0], inStock);
+        } catch (e) { console.error(`[retry] ${retailer.name}: ${e.message}`); }
+      });
+    }
+  }
+  if (retryTasks.length > 0) {
+    console.log(`[poll] Canary retry: ${retryTasks.length} retailer(s)`);
+    await runWithConcurrency(retryTasks, 4);
+  }
+
   // Record retailer outcomes for adaptive skipping (based on health metrics)
   for (const retailer of RETAILERS) {
     const h = scraperHealth[retailer.key];
@@ -3248,9 +3418,11 @@ async function poll() {
   await appendMetrics(metricsEntry).catch((err) => console.error(`[poll] Metrics append failed: ${err.message}`));
   const recentMetrics = await loadRecentMetrics(24).catch(() => []);
   const trend = computeMetricsTrend(recentMetrics);
+  const longMetrics = await loadRecentMetrics(24 * 14).catch(() => []);
+  const peakHours = computePeakHours(longMetrics);
 
   // Quiet summary at end of every poll
-  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend });
+  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend, peakHours });
   await sendDiscordAlert([summary]).catch((err) => console.error(`[poll] Summary send failed: ${err.message}`));
 
   console.log(`[poll] Scan complete — ${storesScanned} stores, ${totalNewFinds} new, ${totalStillInStock} still, ${totalGoneOOS} OOS, ${durationSec}s\n`);
@@ -3267,10 +3439,11 @@ export {
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
-  METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend,
+  METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend, computePeakHours,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
-  createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
+  createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
+  PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
@@ -3300,8 +3473,10 @@ export function _getKnownProducts() { return knownProducts; }
 export function _setKnownProducts(v) { knownProducts = v; }
 export function _resetRetailerBrowserLocks() { for (const k of Object.keys(retailerBrowserLocks)) delete retailerBrowserLocks[k]; }
 export function _resetRetailerBrowserBlocked() { for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k]; }
-export function _setProxyExhausted(v) { proxyExhausted = v; }
-export function _getProxyExhausted() { return proxyExhausted; }
+export function _setProxyExhausted(v) { primaryProxyExhausted = v; backupProxyExhausted = v; }
+export function _getProxyExhausted() { return primaryProxyExhausted && (backupProxyExhausted || !BACKUP_PROXY_URL); }
+export function _setPrimaryProxyExhausted(v) { primaryProxyExhausted = v; }
+export function _setBackupProxyExhausted(v) { backupProxyExhausted = v; }
 export { acquireRetailerLock };
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
