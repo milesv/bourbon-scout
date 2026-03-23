@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { FALLBACK_STORES } from "../lib/fallback-stores.js";
+import { FALLBACK_STORES, EXTRA_STORES } from "../lib/fallback-stores.js";
 
 describe("FALLBACK_STORES", () => {
   const EXPECTED_RETAILERS = ["costco", "totalwine", "walmart", "safeway", "walgreens", "samsclub", "bevmo", "kroger"];
@@ -55,5 +55,35 @@ describe("FALLBACK_STORES", () => {
         }
       }
     }
+  });
+});
+
+describe("EXTRA_STORES", () => {
+  it("each store has required fields", () => {
+    for (const [retailer, stores] of Object.entries(EXTRA_STORES)) {
+      for (const store of stores) {
+        expect(store).toHaveProperty("storeId");
+        expect(store).toHaveProperty("name");
+        expect(store).toHaveProperty("address");
+        expect(typeof store.storeId).toBe("string");
+        expect(typeof store.name).toBe("string");
+        expect(typeof store.address).toBe("string");
+      }
+    }
+  });
+
+  it("store IDs do not overlap with FALLBACK_STORES", () => {
+    for (const [retailer, extras] of Object.entries(EXTRA_STORES)) {
+      const fallbackIds = new Set((FALLBACK_STORES[retailer] || []).map((s) => s.storeId));
+      for (const store of extras) {
+        expect(fallbackIds.has(store.storeId), `${store.name} (#${store.storeId}) duplicates a fallback store`).toBe(false);
+      }
+    }
+  });
+
+  it("contains Costco Scottsdale and Paradise Valley", () => {
+    const ids = EXTRA_STORES.costco.map((s) => s.storeId);
+    expect(ids).toContain("427");
+    expect(ids).toContain("1058");
   });
 });

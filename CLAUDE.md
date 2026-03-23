@@ -10,7 +10,7 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 7 reta
 - **`browser-profiles/`** — Per-retailer persistent Chrome profile directories (auto-created). Contains HTTP cache, service workers, IndexedDB, visited history. Gitignored.
 - **`lib/geo.js`** — Zip-to-coordinates (`zipToCoords`) via zippopotam.us API and `haversine` distance calculation. No dependencies.
 - **`lib/discover-stores.js`** — Auto-discovers nearby stores for all retailers given a zip code and radius. Caches results to `stores.json` with a 7-day TTL. Uses vanilla `playwright-core` with `--disable-blink-features=AutomationControlled` for browser-based store locators and Kroger REST API for Kroger.
-- **`lib/fallback-stores.js`** — Static hardcoded store data for the 85283 area. Used when browser-based store locators fail (e.g., CI datacenter IPs get blocked).
+- **`lib/fallback-stores.js`** — Static hardcoded store data for the 85283 area. `FALLBACK_STORES` used when browser-based store locators fail (e.g., CI datacenter IPs get blocked). `EXTRA_STORES` contains user-specified stores outside the discovery radius (e.g., Costco Scottsdale #427, Costco Paradise Valley #1058) — always merged after discovery, deduped by storeId.
 - **`state.json`** — Per-store stock state, nested as `{ "retailer": { "storeId": { "bottles": { "name": { url, price, sku, firstSeen, lastSeen, scanCount } }, "lastScanned" } } }`. Auto-generated, safe to delete for a fresh start.
 - **`stores.json`** — Cached store discovery results. Auto-generated, safe to delete to force re-discovery.
 - **`metrics.jsonl`** — Append-only JSONL scan metrics log. One JSON line per scan with per-retailer health (queries/ok/blocked/failed), canary hits, bottles found, scan duration. Used by `loadRecentMetrics()` to compute 24h trends shown in Discord summary embed. Auto-generated, safe to delete (loses history only).
@@ -126,7 +126,7 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-645 tests across 5 files using Vitest (95.1% line coverage):
+648 tests across 5 files using Vitest (95.1% line coverage):
 
 | File | Tests | Focus |
 |------|-------|-------|
@@ -134,7 +134,7 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 | `test/proxy.test.js` | 36 | Proxy routing via got-scraping `proxyUrl` option (Walmart/TotalWine/Costco/Sam's Club) + node-fetch `agent` (Kroger/Safeway), SOCKS5/HTTP protocol auto-detection, fetch-first paths, Costco/TotalWine dedicated browser wrappers, Costco cookie pre-warm, Costco blocked retry recovery, rotateRetailerProxy (port change/retailer isolation/dynamic URL update/log message) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer (incl. Walgreens, Sam's Club), store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance, AbortSignal timeout |
-| `test/fallback-stores.test.js` | 6 | Static store data validation |
+| `test/fallback-stores.test.js` | 9 | Static store data validation, EXTRA_STORES structure and dedup |
 
 ```sh
 npm test             # Run all tests

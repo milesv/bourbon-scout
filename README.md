@@ -144,7 +144,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-645 tests across 5 files using [Vitest](https://vitest.dev/):
+648 tests across 5 files using [Vitest](https://vitest.dev/):
 
 ```sh
 npm test                # Run all tests
@@ -157,4 +157,4 @@ npm test -- --coverage  # With coverage report
 | `test/proxy.test.js` | 36 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |
-| `test/fallback-stores.test.js` | 6 | Static fallback store data validation |
+| `test/fallback-stores.test.js` | 9 | Static fallback store data validation, EXTRA_STORES structure and dedup |
