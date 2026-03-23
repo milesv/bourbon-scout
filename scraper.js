@@ -508,7 +508,9 @@ async function loadRecentMetrics(hours = 24) {
       try {
         const entry = JSON.parse(line);
         if (new Date(entry.ts).getTime() >= cutoff) recent.push(entry);
-      } catch { /* skip malformed lines */ }
+      } catch {
+        console.warn(`[metrics] Skipping malformed line in metrics.jsonl: ${line.slice(0, 80)}...`);
+      }
     }
     return recent;
   } catch {
@@ -633,27 +635,38 @@ function pruneState(state, activeStores) {
 
 // Post a Discord webhook payload with automatic 429 retry (up to 3 attempts).
 async function postDiscordWebhook(payload) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetch(DISCORD_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (res.status === 429) {
-      const body = await res.json().catch(() => ({}));
-      const retryAfter = (body.retry_after || 2) * 1000;
-      console.warn(`[discord] Rate limited — retrying in ${retryAfter}ms`);
-      await sleep(retryAfter);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const res = await fetch(DISCORD_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.status === 429) {
+        const body = await res.json().catch(() => ({}));
+        const retryAfter = (body.retry_after || 2) * 1000;
+        console.warn(`[discord] Rate limited — retrying in ${retryAfter}ms (attempt ${attempt + 1}/5)`);
+        await sleep(retryAfter);
+        continue;
+      }
+      if (res.status >= 500) {
+        console.warn(`[discord] Server error ${res.status} — retrying in 3s (attempt ${attempt + 1}/5)`);
+        await sleep(3000);
+        continue;
+      }
+      if (!res.ok) {
+        console.error(`[discord] Webhook failed: ${res.status} ${await res.text()}`);
+      }
+      return res;
+    } catch (err) {
+      console.warn(`[discord] Network error: ${err.message} — retrying in 3s (attempt ${attempt + 1}/5)`);
+      await sleep(3000);
       continue;
     }
-    if (!res.ok) {
-      console.error(`[discord] Webhook failed: ${res.status} ${await res.text()}`);
-    }
-    return res;
   }
-  console.error("[discord] Webhook failed after 3 retries (rate limited)");
-  throw new Error("Discord webhook failed after 3 retries (rate limited)");
+  console.error("[discord] Webhook failed after 5 retries");
+  throw new Error("Discord webhook failed after 5 retries");
 }
 
 async function sendDiscordAlert(embeds) {
@@ -3358,11 +3371,21 @@ async function poll() {
   // Run all stores concurrently (limit 8 — 6 retailers, fetch-first scrapers are lightweight)
   await runWithConcurrency(tasks, 8);
 
+  // Per-poll time budget: if the main scan took too long (>12 min of a 15-min budget),
+  // skip canary retries to avoid cascading delays into the next poll.
+  const POLL_BUDGET_MS = 15 * 60 * 1000; // 15 minutes
+  const elapsed = Date.now() - scanStart;
+  const budgetRemaining = POLL_BUDGET_MS - elapsed;
+  if (budgetRemaining < 3 * 60 * 1000) {
+    console.warn(`[poll] ⚠️ Budget low (${Math.round(elapsed / 1000)}s elapsed, ${Math.round(budgetRemaining / 1000)}s remaining) — skipping canary retries`);
+  }
+
   // Canary-driven retry: if a retailer ran queries but missed canary, the scraper is
   // likely broken (not "nothing in stock" — Buffalo Trace is always available). Retry once
   // with a fresh browser context and rotated proxy IP.
   const canaryRetries = new Set();
   const retryTasks = [];
+  if (budgetRemaining >= 3 * 60 * 1000) {
   for (const retailer of RETAILERS) {
     const h = scraperHealth[retailer.key];
     if (!h || h.queries === 0) continue;          // skipped — don't retry
@@ -3400,6 +3423,7 @@ async function poll() {
     console.log(`[poll] Canary retry: ${retryTasks.length} retailer(s)`);
     await runWithConcurrency(retryTasks, 4);
   }
+  } // end budget check for canary retries
 
   // Record retailer outcomes for adaptive skipping (based on health metrics)
   for (const retailer of RETAILERS) {
@@ -3470,6 +3494,7 @@ export {
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
+  validateEnv,
   poll,
 };
 
@@ -3498,8 +3523,20 @@ export { acquireRetailerLock };
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
+function validateEnv() {
+  const warnings = [];
+  if (!process.env.DISCORD_WEBHOOK_URL) warnings.push("DISCORD_WEBHOOK_URL not set — alerts will be silently skipped");
+  if (!process.env.ZIP_CODE && !ZIP_CODE) warnings.push("ZIP_CODE not set — store discovery will fail");
+  if (!process.env.KROGER_CLIENT_ID || !process.env.KROGER_CLIENT_SECRET) warnings.push("Kroger API credentials missing — Kroger scraper will be skipped");
+  if (!process.env.SAFEWAY_API_KEY) warnings.push("SAFEWAY_API_KEY not set — Safeway scraper will be skipped");
+  if (!process.env.PROXY_URL && !IS_MAC) warnings.push("No PROXY_URL on non-Mac platform — fetch paths may be blocked on datacenter IPs");
+  return warnings;
+}
+
 async function main() {
   console.log("Bourbon Scout 🥃 starting up...");
+  const envWarnings = validateEnv();
+  for (const w of envWarnings) console.warn(`[startup] ⚠️ ${w}`);
   if (proxyAgent) console.log(`[proxy] Routing scraper traffic through proxy`);
 
   try {
@@ -3577,9 +3614,36 @@ async function main() {
 
 export { main };
 
+// ─── Graceful Shutdown ──────────────────────────────────────────────────────
+// On SIGTERM/SIGINT, let the current poll finish (up to 60s) so in-flight
+// Discord alerts aren't lost. launchd sends SIGTERM on `launchctl stop`.
+let shuttingDown = false;
+function handleShutdown(signal) {
+  if (shuttingDown) return; // Already shutting down
+  shuttingDown = true;
+  console.log(`\n[shutdown] ${signal} received — waiting for current poll to finish...`);
+  const deadline = setTimeout(() => {
+    console.log("[shutdown] Deadline exceeded — forcing exit");
+    process.exit(1);
+  }, 60000);
+  deadline.unref(); // Don't keep the process alive just for the deadline
+  const check = setInterval(() => {
+    if (!polling) {
+      clearInterval(check);
+      clearTimeout(deadline);
+      console.log("[shutdown] Clean exit");
+      process.exit(0);
+    }
+  }, 500);
+  check.unref();
+}
+export { shuttingDown, handleShutdown };
+
 // Only run when executed directly (not imported by tests)
 /* v8 ignore start -- entry point guard */
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  process.on("SIGTERM", () => handleShutdown("SIGTERM"));
+  process.on("SIGINT", () => handleShutdown("SIGINT"));
   main();
 }
 /* v8 ignore stop */

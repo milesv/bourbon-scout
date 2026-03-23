@@ -86,6 +86,7 @@ import {
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
+  validateEnv,
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
   _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
@@ -1627,10 +1628,12 @@ describe("sendDiscordAlert", () => {
 
   it("logs error on webhook failure", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    mocks.fetch.mockResolvedValueOnce({ ok: false, status: 500, text: async () => "Server error" });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.fetch.mockResolvedValueOnce({ ok: false, status: 400, text: async () => "Bad request" });
     await sendDiscordAlert([{ title: "Test" }]);
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("500"));
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("400"));
     consoleSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 });
 
@@ -1678,18 +1681,40 @@ describe("postDiscordWebhook", () => {
     warnSpy.mockRestore();
   });
 
-  it("throws after 3 retries on 429", async () => {
+  it("throws after 5 retries on 429", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     mocks.fetch.mockResolvedValue({ status: 429, json: async () => ({ retry_after: 0.01 }) });
     await expect(runWithFakeTimers(() => postDiscordWebhook({ embeds: [{ title: "Test" }] })))
-      .rejects.toThrow("Discord webhook failed after 3 retries");
-    expect(mocks.fetch).toHaveBeenCalledTimes(3);
+      .rejects.toThrow("Discord webhook failed after 5 retries");
+    expect(mocks.fetch).toHaveBeenCalledTimes(5);
     warnSpy.mockRestore();
   });
 
-  it("does not retry on non-429 errors", async () => {
+  it("retries on 500 server errors", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.fetch
+      .mockResolvedValueOnce({ status: 500 })
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+    await runWithFakeTimers(() => postDiscordWebhook({ embeds: [{ title: "Test" }] }));
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Server error 500"));
+    warnSpy.mockRestore();
+  });
+
+  it("retries on network errors", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.fetch
+      .mockRejectedValueOnce(new Error("fetch failed"))
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+    await runWithFakeTimers(() => postDiscordWebhook({ embeds: [{ title: "Test" }] }));
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Network error"));
+    warnSpy.mockRestore();
+  });
+
+  it("does not retry on 4xx client errors", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    mocks.fetch.mockResolvedValueOnce({ ok: false, status: 500, text: async () => "Server error" });
+    mocks.fetch.mockResolvedValueOnce({ ok: false, status: 400, text: async () => "Bad request" });
     await postDiscordWebhook({ embeds: [{ title: "Test" }] });
     expect(mocks.fetch).toHaveBeenCalledTimes(1);
     errorSpy.mockRestore();
@@ -4885,6 +4910,31 @@ describe("SEED_PRODUCT_URLS", () => {
 });
 
 // ─── Scan Metrics ────────────────────────────────────────────────────────────
+
+// ─── validateEnv ─────────────────────────────────────────────────────────────
+
+describe("validateEnv", () => {
+  it("returns no warnings when all env vars are set", () => {
+    // Test env has all vars set in vi.hoisted
+    expect(validateEnv()).toEqual([]);
+  });
+
+  it("warns when DISCORD_WEBHOOK_URL is missing", () => {
+    const orig = process.env.DISCORD_WEBHOOK_URL;
+    delete process.env.DISCORD_WEBHOOK_URL;
+    const warnings = validateEnv();
+    expect(warnings.some((w) => w.includes("DISCORD_WEBHOOK_URL"))).toBe(true);
+    process.env.DISCORD_WEBHOOK_URL = orig;
+  });
+
+  it("warns when Kroger credentials are missing", () => {
+    const origId = process.env.KROGER_CLIENT_ID;
+    delete process.env.KROGER_CLIENT_ID;
+    const warnings = validateEnv();
+    expect(warnings.some((w) => w.includes("Kroger"))).toBe(true);
+    process.env.KROGER_CLIENT_ID = origId;
+  });
+});
 
 describe("scan metrics", () => {
   it("computeMetricsTrend returns null with fewer than 2 scans", () => {
