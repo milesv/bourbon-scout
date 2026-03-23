@@ -1720,7 +1720,18 @@ async function scrapeCostcoViaFetch() {
       }
       const $ = cheerio.load(html);
       const hasTiles = $('[data-testid^="ProductTile_"]').length > 0;
-      if (!hasTiles) { validPages++; trackHealth("costco", "ok"); return; }
+      if (!hasTiles) {
+        // Distinguish genuine "no results" from soft block (page shell with stripped results)
+        const hasResultsContainer = $('[data-testid="no-results"], [data-testid="search-results"], .MuiGrid-root, main[class]').length > 0;
+        if (hasResultsContainer) {
+          validPages++;
+          trackHealth("costco", "ok"); // Genuine empty result
+        } else {
+          console.warn(`[costco] No tiles and no results container — possible soft block`);
+          trackHealth("costco", "blocked"); // Don't count as valid — may trigger browser fallback
+        }
+        return;
+      }
       validPages++;
       trackHealth("costco", "ok");
       found.push(...matchCostcoTiles($));
@@ -1877,7 +1888,7 @@ async function scrapeCostcoStore() {
     const result = await withTimeout(scraperPromise, 180000, null);
     if (result === null) {
       console.warn("[costco] Browser scraper timed out (180s)");
-      trackHealth("costco", "blocked");
+      trackHealth("costco", "fail");
       return dedupFound(knownFound);
     }
     await cacheRetailerCookies("costco");
@@ -2220,15 +2231,8 @@ async function scrapeTotalWineStore(store) {
   // execution). The clean browser path works reliably so skip the fetch to save ~10s per store.
   // The fetch function is retained for future use if PerimeterX relaxes fetch blocking.
 
-  // Fail-fast: if browser already blocked this poll, skip remaining stores
-  if (retailerBrowserBlocked["totalwine"]) {
-    console.log(`[totalwine:${store.storeId}] Skipping browser — blocked earlier this poll`);
-    trackHealth("totalwine", "blocked");
-    return dedupFound(knownFound);
-  }
-
-  // Direct residential IP browser (no proxy, clean mode — no stealth/rebrowser plugins).
-  // Skip pre-warm if the persistent context was already warmed by a previous store this poll.
+  // Per-store scrapers do NOT use fail-fast — each store tries browser independently.
+  // A fresh page load with different queries may succeed even if a prior store was blocked.
   const skipPreWarm = !!retailerBrowserCache["totalwine"];
   console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP${skipPreWarm ? ", warm" : ""})`);
   const releaseLock = await acquireRetailerLock("totalwine");
@@ -2238,7 +2242,6 @@ async function scrapeTotalWineStore(store) {
   } catch (err) {
     console.error(`[totalwine:${store.storeId}] Browser launch failed: ${err.message}`);
     trackHealth("totalwine", "fail");
-    retailerBrowserBlocked["totalwine"] = true;
     releaseLock();
     return dedupFound(knownFound);
   }
@@ -2248,13 +2251,8 @@ async function scrapeTotalWineStore(store) {
     const result = await withTimeout(scraperPromise, 180000, null);
     if (result === null) {
       console.warn(`[totalwine:${store.storeId}] Browser timed out (180s)`);
-      trackHealth("totalwine", "blocked");
-      retailerBrowserBlocked["totalwine"] = true;
+      trackHealth("totalwine", "fail");
       return dedupFound(knownFound);
-    }
-    const twHealth = scraperHealth["totalwine"];
-    if (twHealth && twHealth.queries > 0 && twHealth.blocked >= twHealth.queries * 0.75) {
-      retailerBrowserBlocked["totalwine"] = true;
     }
     return dedupFound([...knownFound, ...result]);
   } finally {
@@ -2521,15 +2519,7 @@ async function scrapeWalmartStore(store) {
       return dedupFound([...knownFound, ...fetchResult]);
     }
   }
-  // Fail-fast: if a previous store's browser was blocked this poll, skip remaining
-  if (retailerBrowserBlocked["walmart"]) {
-    console.log(`[walmart:${store.storeId}] Skipping browser — blocked earlier this poll`);
-    trackHealth("walmart", "blocked");
-    return dedupFound(knownFound);
-  }
-
-  // Acquire per-retailer lock so only one store uses the browser at a time.
-  // Multiple concurrent pages on one context triggers Akamai/PerimeterX bot detection.
+  // Per-store scrapers do NOT use fail-fast — each store tries browser independently.
   console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser`);
   const releaseLock = await acquireRetailerLock("walmart");
   let page;
@@ -2538,7 +2528,6 @@ async function scrapeWalmartStore(store) {
   } catch (err) {
     console.error(`[walmart:${store.storeId}] Browser launch failed: ${err.message}`);
     trackHealth("walmart", "fail");
-    retailerBrowserBlocked["walmart"] = true;
     releaseLock();
     return dedupFound(knownFound);
   }
@@ -2548,8 +2537,7 @@ async function scrapeWalmartStore(store) {
     const result = await withTimeout(scraperPromise, 180000, null);
     if (result === null) {
       console.warn(`[walmart:${store.storeId}] Browser scraper timed out (180s)`);
-      trackHealth("walmart", "blocked");
-      retailerBrowserBlocked["walmart"] = true;
+      trackHealth("walmart", "fail");
       return dedupFound(knownFound);
     }
     await cacheRetailerCookies("walmart");
@@ -2731,7 +2719,7 @@ async function scrapeWalgreensStore() {
       const result = await withTimeout(scraperPromise, 180000, null);
       if (result === null) {
         console.warn("[walgreens] Browser scraper timed out (180s)");
-        trackHealth("walgreens", "blocked");
+        trackHealth("walgreens", "fail");
         if (attempt === 0) {
           console.warn("[walgreens] Timeout on first attempt — retrying with fresh browser");
           continue; // finally{} closes page
@@ -2981,7 +2969,7 @@ async function scrapeSamsClubStore() {
       const result = await withTimeout(scraperPromise, 180000, null);
       if (result === null) {
         console.warn("[samsclub] Browser scraper timed out (180s)");
-        trackHealth("samsclub", "blocked");
+        trackHealth("samsclub", "fail");
         if (attempt === 0) {
           console.warn("[samsclub] Timeout on first attempt — retrying with fresh browser");
           continue;
@@ -3254,6 +3242,7 @@ async function poll() {
   backupProxyExhausted = false;
   for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k];
   const canaryResults = {};
+  let discordFailures = 0;
   scanCounter++;
   loadKnownProducts(state);
 
@@ -3290,10 +3279,12 @@ async function poll() {
 
     if (changes.newFinds.length > 0) {
       console.log(`[${retailer.key}:${store.storeId}] 🟢 New: ${changes.newFinds.map((b) => b.name).join(", ")}`);
-      await sendUrgentAlert(embeds);
+      try { await sendUrgentAlert(embeds); }
+      catch (err) { discordFailures++; console.error(`[discord] Alert failed for ${retailer.name} ${store.name}: ${err.message}`); }
     } else if (embeds.length > 0) {
       console.log(`[${retailer.key}:${store.storeId}] ${changes.goneOOS.length > 0 ? "🔴 OOS" : "🔵 Re-alert"}`);
-      await sendDiscordAlert(embeds);
+      try { await sendDiscordAlert(embeds); }
+      catch (err) { discordFailures++; console.error(`[discord] Alert failed for ${retailer.name} ${store.name}: ${err.message}`); }
     } else {
       nothingCount++;
       console.log(`[${retailer.key}:${store.storeId}] Nothing new`);
@@ -3378,6 +3369,10 @@ async function poll() {
   const budgetRemaining = POLL_BUDGET_MS - elapsed;
   if (budgetRemaining < 3 * 60 * 1000) {
     console.warn(`[poll] ⚠️ Budget low (${Math.round(elapsed / 1000)}s elapsed, ${Math.round(budgetRemaining / 1000)}s remaining) — skipping canary retries`);
+  }
+
+  if (discordFailures > 0) {
+    console.warn(`[poll] ⚠️ ${discordFailures} Discord alert(s) failed this scan — check webhook status`);
   }
 
   // Canary-driven retry: if a retailer ran queries but missed canary, the scraper is

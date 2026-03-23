@@ -6525,7 +6525,7 @@ describe("scrapeWalmartStore browser timeout path", () => {
     _resetKnownProducts();
   });
 
-  it("marks walmart as blocked and tracks health on browser timeout", async () => {
+  it("tracks health as fail (not blocked) on browser timeout", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -6538,11 +6538,10 @@ describe("scrapeWalmartStore browser timeout path", () => {
     mockPage.$$eval.mockResolvedValue([]);
 
     const result = await runWithFakeTimers(() => scrapeWalmartStore(TEST_STORE));
-    // Should return empty (timeout returns null → dedupFound(knownFound))
     expect(result).toEqual([]);
-    // Health should show blocked from the timeout
+    // Timeout tracks as "fail" (hung process), not "blocked" (bot detection)
     const health = _getScraperHealth();
-    expect(health.walmart?.blocked).toBeGreaterThanOrEqual(1);
+    expect(health.walmart?.failed).toBeGreaterThanOrEqual(1);
     vi.restoreAllMocks();
   });
 });
@@ -6580,7 +6579,7 @@ describe("scrapeTotalWineStore browser timeout path", () => {
     _resetScraperHealth();
   });
 
-  it("returns empty and tracks blocked on browser scraper timeout", async () => {
+  it("returns empty and tracks fail on browser scraper timeout", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -6595,7 +6594,7 @@ describe("scrapeTotalWineStore browser timeout path", () => {
     const result = await runWithFakeTimers(() => scrapeTotalWineStore(TEST_STORE));
     expect(result).toEqual([]);
     const health = _getScraperHealth();
-    expect(health.totalwine?.blocked).toBeGreaterThanOrEqual(1);
+    expect(health.totalwine?.failed).toBeGreaterThanOrEqual(1);
     vi.restoreAllMocks();
   });
 });
@@ -6611,21 +6610,19 @@ describe("scrapeWalgreensStore browser timeout path", () => {
     _resetWalgreensCoords();
   });
 
-  it("returns empty and tracks blocked on browser scraper timeout", async () => {
+  it("returns empty and tracks fail (not blocked) on browser scraper timeout", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
     const { page: mockPage } = setupMockBrowser();
     mocks.zipToCoords.mockResolvedValue({ lat: 33.4152, lng: -111.8315 });
-    // Browser scraper hangs forever → 180s timeout
     mockPage.goto.mockImplementation(() => new Promise(() => {}));
     mockPage.evaluate.mockResolvedValue("");
 
     const result = await runWithFakeTimers(() => scrapeWalgreensStore());
     expect(result).toEqual([]);
     const health = _getScraperHealth();
-    // Both attempts time out: first sets "blocked", then retries and times out again
-    expect(health.walgreens?.blocked).toBeGreaterThanOrEqual(1);
+    expect(health.walgreens?.failed).toBeGreaterThanOrEqual(1);
     vi.restoreAllMocks();
   });
 });
@@ -6640,7 +6637,7 @@ describe("scrapeSamsClubStore browser timeout path", () => {
     _resetScraperHealth();
   });
 
-  it("returns empty and tracks blocked on browser scraper timeout", async () => {
+  it("returns empty and tracks fail on browser scraper timeout", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -6653,7 +6650,7 @@ describe("scrapeSamsClubStore browser timeout path", () => {
     const result = await runWithFakeTimers(() => scrapeSamsClubStore());
     expect(result).toEqual([]);
     const health = _getScraperHealth();
-    expect(health.samsclub?.blocked).toBeGreaterThanOrEqual(1);
+    expect(health.samsclub?.failed).toBeGreaterThanOrEqual(1);
     vi.restoreAllMocks();
   });
 });
@@ -6668,7 +6665,7 @@ describe("scrapeCostcoStore browser timeout path", () => {
     _resetScraperHealth();
   });
 
-  it("returns empty and tracks blocked on browser scraper timeout", async () => {
+  it("returns empty and tracks fail on browser scraper timeout", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -6684,7 +6681,7 @@ describe("scrapeCostcoStore browser timeout path", () => {
     const result = await runWithFakeTimers(() => scrapeCostcoStore(TEST_STORE));
     expect(result).toEqual([]);
     const health = _getScraperHealth();
-    expect(health.costco?.blocked).toBeGreaterThanOrEqual(1);
+    expect(health.costco?.failed).toBeGreaterThanOrEqual(1);
     vi.restoreAllMocks();
   });
 });

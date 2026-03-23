@@ -135,8 +135,8 @@ async function runWithFakeTimers(fn) {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.resetAllMocks();
-  // Default gotScraping mock returns empty HTML (scraper fetch paths use this)
-  mocks.gotScraping.mockResolvedValue(mockGotResponse(200, "<html></html>"));
+  // Default gotScraping mock returns empty HTML with results container (valid empty search)
+  mocks.gotScraping.mockResolvedValue(mockGotResponse(200, '<html><body><div data-testid="no-results">No results</div></body></html>'));
   _resetKrogerToken();
   _resetRetailerBrowserCache();
   _resetRetailerFailures();
@@ -453,7 +453,7 @@ describe("proxy support", () => {
   });
 
   it("scrapeCostcoViaFetch handles pages with no product tiles (valid empty search)", async () => {
-    const html = `<html><body><div class="no-results">No results found</div></body></html>`;
+    const html = `<html><body><div data-testid="no-results">No results found</div></body></html>`;
     mocks.gotScraping.mockImplementation((opts) => {
       if (opts?.url === "https://www.costco.com/") return Promise.resolve(mockGotResponse(200, "", {}));
       return Promise.resolve(mockGotResponse(200, html));
