@@ -1174,6 +1174,7 @@ const FETCH_HEADERS = {
   "Sec-Fetch-Mode": "navigate",
   "Sec-Fetch-User": "?1",
   "Sec-Fetch-Dest": "document",
+  "Cache-Control": "max-age=0",
   "Accept-Encoding": "gzip, deflate",
   "Accept-Language": "en-US,en;q=0.9",
   "Referer": "https://www.google.com/",
@@ -1624,16 +1625,22 @@ function matchCostcoTiles($) {
   return found;
 }
 
-// Akamai challenge patterns to detect blocked responses in fetch HTML.
-const COSTCO_BLOCKED_PATTERNS = [
+// Akamai/PerimeterX challenge patterns to detect blocked responses in fetch HTML.
+// Shared across all fetch paths (Costco, Walmart, Sam's Club).
+const FETCH_BLOCKED_PATTERNS = [
   "Access Denied", "robot", "captcha",
   "Request unsuccessful", "Incapsula",
   "Enable JavaScript", "verify you are human",
-  "_ct_challenge",
+  "_ct_challenge", "px-captcha",
+  "Please verify", "security check",
+  "one more step", "checking your browser",
 ];
-function isCostcoBlocked(html) {
-  return COSTCO_BLOCKED_PATTERNS.some((p) => html.includes(p));
+function isFetchBlocked(html) {
+  const lower = html.length > 10000 ? html.slice(0, 10000).toLowerCase() : html.toLowerCase();
+  return FETCH_BLOCKED_PATTERNS.some((p) => lower.includes(p.toLowerCase()));
 }
+// Backward-compatible alias for Costco-specific callers
+const isCostcoBlocked = isFetchBlocked;
 
 // Try fetching Costco search HTML directly and parsing with cheerio (no browser needed).
 // Returns found[] on success, null if blocked by Akamai Bot Manager.
@@ -2334,6 +2341,7 @@ async function scrapeWalmartViaFetch(store) {
       const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("walmart") });
       if (!res.ok) { failures++; return; }
       const html = await res.text();
+      if (isFetchBlocked(html)) { failures++; return; }
       // Use brace-counting to extract JSON (handles </script> inside JSON strings)
       const idx = html.indexOf('id="__NEXT_DATA__"');
       if (idx === -1) { failures++; return; }
@@ -2587,9 +2595,18 @@ async function scrapeWalgreensViaBrowser(page) {
   console.log(`[walgreens] Homepage loaded (${wgElapsed()})`);
   await sleep(3000 + Math.random() * 2000);
   await solveHumanChallenge(page);
-  // Skip heavy humanization — Walgreens pages have thousands of links that make
-  // humanizePage take 70s+ on page.$$('a[href]'). Quick mouse move is enough.
+  // Walgreens humanization: mouse moves + scroll via wheel events (Akamai tracks scroll
+  // telemetry). Full humanizePage() works now ($$eval fix), but keeping it lighter since
+  // Walgreens pages are heavy and we need speed. Scroll is the highest-value signal.
   await page.mouse.move(400 + Math.random() * 500, 300 + Math.random() * 200, { steps: 10 }).catch(() => {});
+  for (let i = 0; i < 2 + Math.floor(Math.random() * 2); i++) {
+    await page.mouse.wheel(0, 300 + Math.random() * 200).catch(() => {});
+    await sleep(400 + Math.random() * 400);
+  }
+  for (let i = 0; i < 2; i++) {
+    await page.mouse.wheel(0, -(300 + Math.random() * 200)).catch(() => {});
+    await sleep(300 + Math.random() * 300);
+  }
   console.log(`[walgreens] Pre-warm done (${wgElapsed()}), starting queries...`);
 
   let wgConsecutiveBlocks = 0;
@@ -2810,6 +2827,7 @@ async function scrapeSamsClubViaFetch() {
       const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("samsclub") });
       if (!res.ok) { failures++; return; }
       const html = await res.text();
+      if (isFetchBlocked(html)) { failures++; return; }
       // Brace-counting JSON extraction (same as Walmart path)
       const idx = html.indexOf('id="__NEXT_DATA__"');
       if (idx === -1) { failures++; return; }
@@ -3444,7 +3462,7 @@ export {
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
   PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
-  COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
+  FETCH_BLOCKED_PATTERNS, isFetchBlocked, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,

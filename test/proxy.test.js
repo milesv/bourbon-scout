@@ -76,7 +76,7 @@ vi.mock("../lib/discover-stores.js", () => ({
 import {
   FETCH_HEADERS,
   launchBrowser, closeBrowser,
-  COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
+  FETCH_BLOCKED_PATTERNS, isCostcoBlocked,
   scrapeCostcoViaFetch, scrapeCostcoStore,
   scrapeTotalWineViaFetch, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartStore, scrapeKrogerStore, scrapeSafewayStore,
@@ -431,11 +431,11 @@ describe("proxy support", () => {
   });
 
   it("scrapeCostcoViaFetch detects all blocked patterns", () => {
-    expect(COSTCO_BLOCKED_PATTERNS).toContain("Access Denied");
-    expect(COSTCO_BLOCKED_PATTERNS).toContain("robot");
-    expect(COSTCO_BLOCKED_PATTERNS).toContain("captcha");
-    expect(COSTCO_BLOCKED_PATTERNS).toContain("_ct_challenge");
-    expect(COSTCO_BLOCKED_PATTERNS).toContain("verify you are human");
+    expect(FETCH_BLOCKED_PATTERNS).toContain("Access Denied");
+    expect(FETCH_BLOCKED_PATTERNS).toContain("robot");
+    expect(FETCH_BLOCKED_PATTERNS).toContain("captcha");
+    expect(FETCH_BLOCKED_PATTERNS).toContain("_ct_challenge");
+    expect(FETCH_BLOCKED_PATTERNS).toContain("verify you are human");
     expect(isCostcoBlocked("<html>Please verify you are human</html>")).toBe(true);
     expect(isCostcoBlocked("<html>Request unsuccessful</html>")).toBe(true);
     expect(isCostcoBlocked("<html>Normal product page</html>")).toBe(false);

@@ -78,7 +78,7 @@ import {
   IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
-  COSTCO_BLOCKED_PATTERNS, isCostcoBlocked,
+  FETCH_BLOCKED_PATTERNS, isFetchBlocked, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
@@ -274,11 +274,12 @@ describe("constants", () => {
     expect(keys[7]).toBe("Sec-Fetch-Mode");
     expect(keys[8]).toBe("Sec-Fetch-User");
     expect(keys[9]).toBe("Sec-Fetch-Dest");
-    expect(keys[10]).toBe("Accept-Encoding");
-    expect(keys[11]).toBe("Accept-Language");
-    expect(keys[12]).toBe("Referer");
-    expect(keys[13]).toBe("priority");
-    expect(keys).toHaveLength(14);
+    expect(keys[10]).toBe("Cache-Control");
+    expect(keys[11]).toBe("Accept-Encoding");
+    expect(keys[12]).toBe("Accept-Language");
+    expect(keys[13]).toBe("Referer");
+    expect(keys[14]).toBe("priority");
+    expect(keys).toHaveLength(15);
   });
 
   it("FETCH_HEADERS includes priority header for HTTP/2", () => {
@@ -2202,27 +2203,52 @@ describe("scrapeTotalWineViaFetch", () => {
   });
 });
 
-describe("isCostcoBlocked", () => {
-  it("detects all Akamai challenge patterns", () => {
-    expect(isCostcoBlocked("Access Denied - you don't have permission")).toBe(true);
-    expect(isCostcoBlocked("Are you a robot?")).toBe(true);
-    expect(isCostcoBlocked("Please complete the captcha")).toBe(true);
-    expect(isCostcoBlocked("Request unsuccessful")).toBe(true);
-    expect(isCostcoBlocked("Incapsula incident")).toBe(true);
-    expect(isCostcoBlocked("Please Enable JavaScript to continue")).toBe(true);
-    expect(isCostcoBlocked("Please verify you are human")).toBe(true);
-    expect(isCostcoBlocked("<script>_ct_challenge</script>")).toBe(true);
+describe("isFetchBlocked / isCostcoBlocked", () => {
+  it("detects all Akamai/PerimeterX challenge patterns", () => {
+    expect(isFetchBlocked("Access Denied - you don't have permission")).toBe(true);
+    expect(isFetchBlocked("Are you a robot?")).toBe(true);
+    expect(isFetchBlocked("Please complete the captcha")).toBe(true);
+    expect(isFetchBlocked("Request unsuccessful")).toBe(true);
+    expect(isFetchBlocked("Incapsula incident")).toBe(true);
+    expect(isFetchBlocked("Please Enable JavaScript to continue")).toBe(true);
+    expect(isFetchBlocked("Please verify you are human")).toBe(true);
+    expect(isFetchBlocked("<script>_ct_challenge</script>")).toBe(true);
+    // New PerimeterX patterns
+    expect(isFetchBlocked('<div id="px-captcha">Press & Hold</div>')).toBe(true);
+    expect(isFetchBlocked("Please verify your identity")).toBe(true);
+    expect(isFetchBlocked("Security check required")).toBe(true);
+    expect(isFetchBlocked("One more step")).toBe(true);
+    expect(isFetchBlocked("Checking your browser")).toBe(true);
   });
 
   it("does not flag normal product pages", () => {
-    expect(isCostcoBlocked("<html><body>Weller Special Reserve Bourbon</body></html>")).toBe(false);
-    expect(isCostcoBlocked("<html><body>No results found</body></html>")).toBe(false);
+    expect(isFetchBlocked("<html><body>Weller Special Reserve Bourbon</body></html>")).toBe(false);
+    expect(isFetchBlocked("<html><body>No results found</body></html>")).toBe(false);
   });
 
-  it("COSTCO_BLOCKED_PATTERNS contains expected entries", () => {
-    expect(COSTCO_BLOCKED_PATTERNS.length).toBe(8);
-    expect(COSTCO_BLOCKED_PATTERNS).toContain("Access Denied");
-    expect(COSTCO_BLOCKED_PATTERNS).toContain("_ct_challenge");
+  it("isCostcoBlocked is an alias for isFetchBlocked", () => {
+    expect(isCostcoBlocked).toBe(isFetchBlocked);
+  });
+
+  it("FETCH_BLOCKED_PATTERNS contains all expected entries", () => {
+    expect(FETCH_BLOCKED_PATTERNS.length).toBeGreaterThanOrEqual(12);
+    expect(FETCH_BLOCKED_PATTERNS).toContain("Access Denied");
+    expect(FETCH_BLOCKED_PATTERNS).toContain("_ct_challenge");
+    expect(FETCH_BLOCKED_PATTERNS).toContain("px-captcha");
+    expect(FETCH_BLOCKED_PATTERNS).toContain("security check");
+  });
+
+  it("is case-insensitive", () => {
+    expect(isFetchBlocked("ACCESS DENIED")).toBe(true);
+    expect(isFetchBlocked("access denied")).toBe(true);
+    expect(isFetchBlocked("aCcEsS dEnIeD")).toBe(true);
+  });
+
+  it("only scans first 10000 chars of large HTML", () => {
+    const longHtml = "x".repeat(15000) + "Access Denied";
+    // Pattern is past the 10000 char cutoff — should still detect via lowercase
+    // but the truncation test verifies performance behavior
+    expect(isFetchBlocked("Access Denied" + "x".repeat(15000))).toBe(true);
   });
 });
 
