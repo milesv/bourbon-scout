@@ -126,7 +126,7 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-656 tests across 5 files using Vitest (95.1% line coverage):
+659 tests across 5 files using Vitest (95.1% line coverage):
 
 | File | Tests | Focus |
 |------|-------|-------|

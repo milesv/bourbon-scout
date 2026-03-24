@@ -1688,6 +1688,7 @@ async function scrapeCostcoViaFetch() {
 
   // Batch queries with adaptive concurrency
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
+  const failedPriorityQueries = new Set();
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) return; // Early-abort without health tracking — browser will track its own
     // Rotate proxy IP after 2 consecutive failures (likely burned IP)
@@ -1713,9 +1714,9 @@ async function scrapeCostcoViaFetch() {
       if (!res.ok || isCostcoBlocked(html)) {
         await sleep(2000 + Math.random() * 1000);
         const retryRes = await scraperFetch(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("costco") }).catch(() => null);
-        if (!retryRes?.ok) { failures++; return; }
+        if (!retryRes?.ok) { failures++; if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query); return; }
         const retryHtml = await retryRes.text();
-        if (isCostcoBlocked(retryHtml)) { failures++; return; }
+        if (isCostcoBlocked(retryHtml)) { failures++; if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query); return; }
         html = retryHtml;
       }
       const $ = cheerio.load(html);
@@ -1737,9 +1738,33 @@ async function scrapeCostcoViaFetch() {
       found.push(...matchCostcoTiles($));
     } catch {
       failures++;
+      if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query);
     }
   });
   await runWithConcurrency(queryTasks, concurrency);
+
+  // Retry failed priority queries once — these cover Pappy/BTAC/Taylor and can't be silently dropped
+  if (failedPriorityQueries.size > 0 && validPages > 0) {
+    console.log(`[costco] Retrying ${failedPriorityQueries.size} failed priority queries: ${[...failedPriorityQueries].join(", ")}`);
+    await sleep(2000 + Math.random() * 2000);
+    for (const query of failedPriorityQueries) {
+      try {
+        const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
+        const headers = { ...FETCH_HEADERS, "Sec-Fetch-Site": "same-origin", "Referer": "https://www.costco.com/" };
+        if (cookies) headers["Cookie"] = cookies;
+        const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("costco") });
+        if (!res.ok) continue;
+        const html = await res.text();
+        if (isCostcoBlocked(html)) continue;
+        const $ = cheerio.load(html);
+        found.push(...matchCostcoTiles($));
+        trackHealth("costco", "ok");
+        console.log(`[costco] Priority retry succeeded: "${query}"`);
+      } catch { /* already retried, move on */ }
+      await sleep(1000 + Math.random() * 1000);
+    }
+  }
+
   // Require at least 25% of queries to succeed — a single valid page shouldn't
   // suppress browser fallback when most queries were blocked
   const minValid = Math.max(1, Math.ceil(queryTasks.length / 4));
@@ -2330,6 +2355,7 @@ async function scrapeWalmartViaFetch(store) {
   // With 5 stores potentially running fetch simultaneously, even 2 concurrent queries
   // per store means up to 10 total requests hitting walmart.com at once.
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
+  const failedPriorityQueries = new Set();
   const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) return; // Early-abort without health tracking — browser will track its own
     // Rotate proxy IP after 2 consecutive failures (likely burned IP)
@@ -2350,14 +2376,14 @@ async function scrapeWalmartViaFetch(store) {
     }
     try {
       const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("walmart") });
-      if (!res.ok) { failures++; return; }
+      if (!res.ok) { failures++; if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query); return; }
       const html = await res.text();
-      if (isFetchBlocked(html)) { failures++; return; }
+      if (isFetchBlocked(html)) { failures++; if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query); return; }
       // Use brace-counting to extract JSON (handles </script> inside JSON strings)
       const idx = html.indexOf('id="__NEXT_DATA__"');
-      if (idx === -1) { failures++; return; }
+      if (idx === -1) { failures++; if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query); return; }
       const braceStart = html.indexOf("{", idx);
-      if (braceStart === -1) { failures++; return; }
+      if (braceStart === -1) { failures++; if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query); return; }
       let depth = 0, inStr = false, escape = false, end = -1;
       for (let j = braceStart; j < html.length; j++) {
         const ch = html[j];
@@ -2368,18 +2394,58 @@ async function scrapeWalmartViaFetch(store) {
         if (ch === "{") depth++;
         else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
       }
-      if (end === -1) { failures++; return; }
+      if (end === -1) { failures++; if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query); return; }
       const nextData = JSON.parse(html.slice(braceStart, end));
       const hasSearchResult = nextData?.props?.pageProps?.initialData?.searchResult != null;
-      if (!hasSearchResult) { failures++; return; }
+      if (!hasSearchResult) { failures++; if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query); return; }
       validPages++;
       trackHealth("walmart", "ok");
       found.push(...matchWalmartNextData(nextData));
     } catch {
       failures++;
+      if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query);
     }
   });
   await runWithConcurrency(queryTasks, 2);
+
+  // Retry failed priority queries once — Pappy/BTAC/Taylor can't be silently dropped
+  if (failedPriorityQueries.size > 0 && validPages > 0) {
+    console.log(`[walmart:${store.storeId}] Retrying ${failedPriorityQueries.size} failed priority queries: ${[...failedPriorityQueries].join(", ")}`);
+    await sleep(2000 + Math.random() * 2000);
+    for (const query of failedPriorityQueries) {
+      try {
+        const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
+        const headers = { ...FETCH_HEADERS, "Sec-Fetch-Site": "same-origin", "Referer": "https://www.walmart.com/" };
+        if (cookies) headers["Cookie"] = cookies;
+        const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("walmart") });
+        if (!res.ok) continue;
+        const html = await res.text();
+        if (isFetchBlocked(html)) continue;
+        const idx = html.indexOf('id="__NEXT_DATA__"');
+        if (idx === -1) continue;
+        const braceStart = html.indexOf("{", idx);
+        if (braceStart === -1) continue;
+        let depth = 0, inStr = false, escape = false, end = -1;
+        for (let j = braceStart; j < html.length; j++) {
+          const ch = html[j];
+          if (escape) { escape = false; continue; }
+          if (ch === "\\") { escape = true; continue; }
+          if (ch === '"') { inStr = !inStr; continue; }
+          if (inStr) continue;
+          if (ch === "{") depth++;
+          else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
+        }
+        if (end === -1) continue;
+        const nextData = JSON.parse(html.slice(braceStart, end));
+        if (!nextData?.props?.pageProps?.initialData?.searchResult) continue;
+        found.push(...matchWalmartNextData(nextData));
+        trackHealth("walmart", "ok");
+        console.log(`[walmart:${store.storeId}] Priority retry succeeded: "${query}"`);
+      } catch { /* already retried, move on */ }
+      await sleep(1000 + Math.random() * 1000);
+    }
+  }
+
   // Require at least 25% of queries to succeed — a single valid page shouldn't
   // suppress browser fallback when most queries were blocked
   const minValid = Math.max(1, Math.ceil(queryTasks.length / 4));
@@ -2763,6 +2829,13 @@ const SAMSCLUB_PRODUCTS = {
   "Buffalo Trace":            "13791619865",    // canary
 };
 
+// High-value Sam's Club products that deserve retry if their page fetch fails
+const PRIORITY_SAMSCLUB_PRODUCTS = new Set([
+  "George T. Stagg", "Eagle Rare 17 Year", "Thomas H. Handy",
+  "Pappy Van Winkle 10 Year", "Pappy Van Winkle 12 Year",
+  "Pappy Van Winkle 15 Year", "Pappy Van Winkle 20 Year", "Pappy Van Winkle 23 Year",
+]);
+
 // Extract product availability from Sam's Club __NEXT_DATA__ JSON.
 // Product data lives at props.pageProps.initialData.data.product
 // (differs from Walmart's searchResult.itemStacks path).
@@ -2791,6 +2864,7 @@ async function scrapeSamsClubViaFetch() {
   let validPages = 0;
   let rotated = false;
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
+  const failedPriorityProducts = [];
 
   // Pre-warm: fetch homepage to get PerimeterX session cookies before product pages.
   let cookies = "";
@@ -2825,15 +2899,16 @@ async function scrapeSamsClubViaFetch() {
       headers["Referer"] = "https://www.samsclub.com/";
     }
     try {
+      const _prio = PRIORITY_SAMSCLUB_PRODUCTS.has(bottleName);
       const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("samsclub") });
-      if (!res.ok) { failures++; return; }
+      if (!res.ok) { failures++; if (_prio) failedPriorityProducts.push([bottleName, productId]); return; }
       const html = await res.text();
-      if (isFetchBlocked(html)) { failures++; return; }
+      if (isFetchBlocked(html)) { failures++; if (_prio) failedPriorityProducts.push([bottleName, productId]); return; }
       // Brace-counting JSON extraction (same as Walmart path)
       const idx = html.indexOf('id="__NEXT_DATA__"');
-      if (idx === -1) { failures++; return; }
+      if (idx === -1) { failures++; if (_prio) failedPriorityProducts.push([bottleName, productId]); return; }
       const braceStart = html.indexOf("{", idx);
-      if (braceStart === -1) { failures++; return; }
+      if (braceStart === -1) { failures++; if (_prio) failedPriorityProducts.push([bottleName, productId]); return; }
       let depth = 0, inStr = false, escape = false, end = -1;
       for (let j = braceStart; j < html.length; j++) {
         const ch = html[j];
@@ -2844,19 +2919,59 @@ async function scrapeSamsClubViaFetch() {
         if (ch === "{") depth++;
         else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
       }
-      if (end === -1) { failures++; return; }
+      if (end === -1) { failures++; if (_prio) failedPriorityProducts.push([bottleName, productId]); return; }
       const nextData = JSON.parse(html.slice(braceStart, end));
       const product = nextData?.props?.pageProps?.initialData?.data?.product;
-      if (!product?.name) { failures++; return; }
+      if (!product?.name) { failures++; if (_prio) failedPriorityProducts.push([bottleName, productId]); return; }
       validPages++;
       trackHealth("samsclub", "ok");
       const match = matchSamsClubProduct(nextData, bottleName);
       if (match) found.push(match);
     } catch {
       failures++;
+      if (PRIORITY_SAMSCLUB_PRODUCTS.has(bottleName)) failedPriorityProducts.push([bottleName, productId]);
     }
   });
   await runWithConcurrency(productTasks, 2);
+
+  // Retry failed priority products once — Pappy/BTAC can't be silently dropped
+  if (failedPriorityProducts.length > 0 && validPages > 0) {
+    console.log(`[samsclub] Retrying ${failedPriorityProducts.length} failed priority products: ${failedPriorityProducts.map(([n]) => n).join(", ")}`);
+    await sleep(2000 + Math.random() * 2000);
+    for (const [bottleName, productId] of failedPriorityProducts) {
+      try {
+        const url = `https://www.samsclub.com/ip/${productId}`;
+        const headers = { ...FETCH_HEADERS, "Sec-Fetch-Site": "same-origin", "Referer": "https://www.samsclub.com/" };
+        if (cookies) headers["Cookie"] = cookies;
+        const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("samsclub") });
+        if (!res.ok) continue;
+        const html = await res.text();
+        if (isFetchBlocked(html)) continue;
+        const idx = html.indexOf('id="__NEXT_DATA__"');
+        if (idx === -1) continue;
+        const braceStart = html.indexOf("{", idx);
+        if (braceStart === -1) continue;
+        let depth = 0, inStr = false, escape = false, end = -1;
+        for (let j = braceStart; j < html.length; j++) {
+          const ch = html[j];
+          if (escape) { escape = false; continue; }
+          if (ch === "\\") { escape = true; continue; }
+          if (ch === '"') { inStr = !inStr; continue; }
+          if (inStr) continue;
+          if (ch === "{") depth++;
+          else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
+        }
+        if (end === -1) continue;
+        const nextData = JSON.parse(html.slice(braceStart, end));
+        const match = matchSamsClubProduct(nextData, bottleName);
+        if (match) found.push(match);
+        trackHealth("samsclub", "ok");
+        console.log(`[samsclub] Priority retry succeeded: "${bottleName}"`);
+      } catch { /* already retried, move on */ }
+      await sleep(1000 + Math.random() * 1000);
+    }
+  }
+
   // Require at least 25% of products to succeed — low success rate triggers browser fallback
   const minValid = Math.max(1, Math.ceil(entries.length / 4));
   if (validPages < minValid) return null;
@@ -3487,7 +3602,7 @@ export {
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
-  SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
+  SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
   validateEnv,
   poll,

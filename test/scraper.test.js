@@ -84,7 +84,7 @@ import {
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
-  SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
+  SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
   validateEnv,
   poll, main,
@@ -5195,6 +5195,30 @@ describe("getQueriesForScan", () => {
     const queries = getQueriesForScan(SEARCH_QUERIES);
     const canaryCount = queries.filter(q => q === "buffalo trace").length;
     expect(canaryCount).toBe(1);
+  });
+});
+
+// ─── Priority Retry ─────────────────────────────────────────────────────────
+
+describe("PRIORITY_SAMSCLUB_PRODUCTS", () => {
+  it("contains all Pappy Van Winkle variants in SAMSCLUB_PRODUCTS", () => {
+    for (const name of PRIORITY_SAMSCLUB_PRODUCTS) {
+      if (name.startsWith("Pappy")) {
+        expect(SAMSCLUB_PRODUCTS).toHaveProperty(name);
+      }
+    }
+  });
+
+  it("contains BTAC products that have Sam's Club pages", () => {
+    expect(PRIORITY_SAMSCLUB_PRODUCTS.has("George T. Stagg")).toBe(true);
+    expect(PRIORITY_SAMSCLUB_PRODUCTS.has("Eagle Rare 17 Year")).toBe(true);
+    expect(PRIORITY_SAMSCLUB_PRODUCTS.has("Thomas H. Handy")).toBe(true);
+  });
+
+  it("all priority products exist in SAMSCLUB_PRODUCTS", () => {
+    for (const name of PRIORITY_SAMSCLUB_PRODUCTS) {
+      expect(SAMSCLUB_PRODUCTS, `${name} is priority but not in SAMSCLUB_PRODUCTS`).toHaveProperty(name);
+    }
   });
 });
 
