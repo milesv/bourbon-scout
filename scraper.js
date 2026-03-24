@@ -1267,7 +1267,7 @@ const retailerBrowserCache = {};
 // consumed by next poll's fetch pre-warm. Gives fetch paths browser-quality cookies
 // (including Akamai _abck) without needing to execute JS. TTL: 1 hour (_abck expiry).
 const retailerCookieCache = {};
-const COOKIE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const COOKIE_CACHE_TTL_MS = 25 * 60 * 1000; // 25 min — conservative margin under Akamai _abck 30 min expiry
 
 async function cacheRetailerCookies(retailerKey) {
   const cached = retailerBrowserCache[retailerKey];
@@ -1450,24 +1450,33 @@ async function closeRetailerBrowsers() {
 
 // Simulate human-like behavior on a homepage to build trust with anti-bot sensors.
 // Scrolls down, pauses, hovers over a random link, then scrolls back up.
-// Run after homepage pre-warm navigation completes.
-async function humanizePage(page) {
+// Per-retailer pace variance prevents ML models from clustering identical behavior.
+// pace: "fast" (Costco), "medium" (Walmart), "slow" (Total Wine, Sam's Club)
+const HUMANIZE_PACE = {
+  fast:   { moves: [2, 3], scrolls: [1, 2], hoverMs: [800, 1500],  moveDelayMs: [150, 300], scrollDelayMs: [400, 600] },
+  medium: { moves: [2, 4], scrolls: [2, 3], hoverMs: [1000, 2000], moveDelayMs: [200, 400], scrollDelayMs: [500, 700] },
+  slow:   { moves: [3, 5], scrolls: [3, 4], hoverMs: [1500, 3000], moveDelayMs: [250, 500], scrollDelayMs: [600, 900] },
+};
+async function humanizePage(page, { pace = "medium" } = {}) {
   try {
+    const p = HUMANIZE_PACE[pace] || HUMANIZE_PACE.medium;
+    const rng = (min, max) => min + Math.random() * (max - min);
     // Random mouse movements before scrolling (PerimeterX tracks mouse telemetry)
     const viewport = page.viewportSize() || { width: 1366, height: 768 };
-    for (let i = 0; i < 2 + Math.floor(Math.random() * 3); i++) {
+    const moveCount = Math.floor(rng(p.moves[0], p.moves[1] + 1));
+    for (let i = 0; i < moveCount; i++) {
       await page.mouse.move(
         100 + Math.random() * (viewport.width - 200),
         100 + Math.random() * (viewport.height - 200),
-        { steps: 5 + Math.floor(Math.random() * 10) }, // multi-step = realistic curve
+        { steps: 5 + Math.floor(Math.random() * 10) },
       );
-      await sleep(200 + Math.random() * 300);
+      await sleep(rng(p.moveDelayMs[0], p.moveDelayMs[1]));
     }
-    // Scroll down slowly (2-3 viewport heights)
-    const scrollSteps = 2 + Math.floor(Math.random() * 2);
+    // Scroll down slowly
+    const scrollSteps = Math.floor(rng(p.scrolls[0], p.scrolls[1] + 1));
     for (let i = 0; i < scrollSteps; i++) {
       await page.mouse.wheel(0, 300 + Math.random() * 200);
-      await sleep(500 + Math.random() * 500);
+      await sleep(rng(p.scrollDelayMs[0], p.scrollDelayMs[1]));
     }
     // Hover over a random visible link (if any). Use $$eval to count without
     // materializing all elements — page.$$("a[href]") hangs for 10-70s on link-heavy pages.
@@ -1475,13 +1484,13 @@ async function humanizePage(page) {
     if (linkCount > 0) {
       const idx = Math.floor(Math.random() * Math.min(linkCount, 20));
       await page.locator("a[href]").nth(idx).hover().catch(() => {});
-      await sleep(300 + Math.random() * 400);
+      await sleep(rng(p.hoverMs[0], p.hoverMs[1]));
     }
     // Scroll back to top using wheel events (not scrollTo — that's a JS teleport
     // detectable by anti-bot sensors that monitor scroll event patterns)
     for (let i = 0; i < scrollSteps; i++) {
       await page.mouse.wheel(0, -(300 + Math.random() * 200));
-      await sleep(400 + Math.random() * 400);
+      await sleep(rng(p.scrollDelayMs[0], p.scrollDelayMs[1]));
     }
   } catch { /* non-critical — don't break the scraper */ }
 }
@@ -1698,8 +1707,8 @@ async function scrapeCostcoViaFetch() {
       cookies = ""; // Clear cookies from old IP's session
       await sleep(1000 + Math.random() * 1000);
     }
-    // Inter-query delay with jitter to reduce Akamai burst detection
-    if (i > 0) await sleep(1500 + Math.random() * 1500);
+    // Inter-query delay: wider jitter (2-5s, 15% chance of 7-10s "reading" pause)
+    if (i > 0) await sleep(2000 + Math.random() * 3000 + (Math.random() < 0.15 ? 5000 : 0));
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     const headers = { ...FETCH_HEADERS };
     if (cookies) headers["Cookie"] = cookies;
@@ -1779,7 +1788,7 @@ async function scrapeCostcoOnce(page) {
   await page.goto("https://www.costco.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 2000);
   await solveHumanChallenge(page);
-  await humanizePage(page);
+  await humanizePage(page, { pace: "fast" });
   // Category navigation skipped — saves ~15s. Akamai cares about sensor telemetry from
   // homepage (mouse/scroll events), not navigation depth. Direct search is fine.
 
@@ -2080,9 +2089,9 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
     // Pre-warm: visit homepage to let PerimeterX sensor collect behavioral telemetry.
     await page.goto("https://www.totalwine.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
     console.log(`[totalwine:${store.storeId}] Homepage loaded (${elapsed()})`);
-    await sleep(3000 + Math.random() * 2000);
+    await sleep(4000 + Math.random() * 3000); // PerimeterX needs longer JS execution time
     await solveHumanChallenge(page);
-    await humanizePage(page);
+    await humanizePage(page, { pace: "slow" });
     console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
     // Skip category navigation on cold start — saves ~15-20s that's better spent on queries.
     // PerimeterX cares about JS sensor telemetry from homepage, not navigation flow.
@@ -2457,8 +2466,8 @@ async function scrapeWalmartViaFetch(store) {
 async function scrapeWalmartViaBrowser(store, page) {
   // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies
   await page.goto("https://www.walmart.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
-  await sleep(3000 + Math.random() * 2000);
-  await humanizePage(page);
+  await sleep(3000 + Math.random() * 3000);
+  await humanizePage(page, { pace: "medium" });
 
   const found = [];
   for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
@@ -2660,7 +2669,7 @@ async function scrapeWalgreensViaBrowser(page) {
   const wgElapsed = () => `${((Date.now() - wgT0) / 1000).toFixed(1)}s`;
   await page.goto("https://www.walgreens.com/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
   console.log(`[walgreens] Homepage loaded (${wgElapsed()})`);
-  await sleep(3000 + Math.random() * 2000);
+  await sleep(4000 + Math.random() * 3000); // Akamai needs longer sensor execution on heavy Walgreens pages
   await solveHumanChallenge(page);
   // Walgreens humanization: mouse moves + scroll via wheel events (Akamai tracks scroll
   // telemetry). Full humanizePage() works now ($$eval fix), but keeping it lighter since
@@ -2890,7 +2899,8 @@ async function scrapeSamsClubViaFetch() {
       cookies = "";
       await sleep(1000 + Math.random() * 1000);
     }
-    if (i > 0) await sleep(1500 + Math.random() * 1500);
+    // Inter-query delay: wider jitter (2-5s, 15% chance of 7-10s "reading" pause)
+    if (i > 0) await sleep(2000 + Math.random() * 3000 + (Math.random() < 0.15 ? 5000 : 0));
     const url = `https://www.samsclub.com/ip/${productId}`;
     const headers = { ...FETCH_HEADERS };
     if (cookies) headers["Cookie"] = cookies;
@@ -2985,7 +2995,7 @@ async function scrapeSamsClubViaBrowser(page) {
   await page.goto("https://www.samsclub.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(5000 + Math.random() * 3000);
   await solveHumanChallenge(page);
-  await humanizePage(page);
+  await humanizePage(page, { pace: "slow" });
 
   const found = [];
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
