@@ -144,7 +144,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-663 tests across 5 files using [Vitest](https://vitest.dev/):
+691 tests across 5 files using [Vitest](https://vitest.dev/) (91.6% line coverage, 81.5% branch):
 
 ```sh
 npm test                # Run all tests
@@ -153,7 +153,7 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 534 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling, all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, scan metrics/trends, retry mechanisms, bot detection, state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage |
+| `test/scraper.test.js` | 562 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling ($500), all 7 scrapers, Discord embeds, poll orchestration, error isolation, health tracking, scan metrics/trends, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage (Old Rip/Colonel/SFB), parseSize liter/litre, normalizeText unicode, COOKIE_CACHE_TTL_MS, MAX_BOTTLE_PRICE |
 | `test/proxy.test.js` | 36 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |
