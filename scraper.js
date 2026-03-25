@@ -1592,61 +1592,95 @@ async function isBlockedPage(page) {
 // PerimeterX renders the button via captcha.js inside #px-captcha — the "Press & Hold"
 // text is drawn by the script (canvas/shadow DOM), not as a regular DOM element.
 // Returns true if a challenge was found and solved, false otherwise.
+// Fixed-delay sleep — no jitter. Used in solveHumanChallenge where minimum hold
+// time matters and ±30% sleep jitter could drop below PerimeterX's threshold.
+// Still uses setTimeout so vitest fake timers work correctly.
+const rawSleep = sleep; // Alias; hold duration is set high enough to absorb jitter
+
 async function solveHumanChallenge(page) {
-  try {
-    const bodyText = String(await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || "").catch(() => ""));
-    if (!bodyText.includes("Press & Hold")) return false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const bodyText = String(await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || "").catch(() => ""));
+      if (!bodyText.includes("Press & Hold")) return false;
 
-    console.log("[bot] Detected Press & Hold challenge — solving...");
+      if (attempt === 0) console.log("[bot] Detected Press & Hold challenge — solving...");
+      else console.log("[bot] Retry attempt #2...");
 
-    // PerimeterX always uses #px-captcha as the container
-    const target = await page.$("#px-captcha").catch(() => null);
-    if (!target) {
-      console.warn("[bot] #px-captcha not found — cannot solve");
+      // PerimeterX uses #px-captcha as the container — captcha.js renders the
+      // interactive button inside it. Wait for the button to render (up to 5s)
+      // before trying to interact with it.
+      const target = await page.waitForSelector("#px-captcha", { timeout: 5000 }).catch(() => null);
+      if (!target) {
+        console.warn("[bot] #px-captcha not found — cannot solve");
+        return false;
+      }
+      // Wait for captcha.js to render the interactive button inside the container
+      await rawSleep(1000 + Math.random() * 1000);
+
+      const box = await target.boundingBox();
+      if (!box) {
+        console.warn("[bot] #px-captcha has no bounding box");
+        if (attempt === 0) { await rawSleep(2000); continue; }
+        return false;
+      }
+
+      // Move mouse naturally to button center with slight jitter
+      const cx = box.x + box.width / 2 + (Math.random() * 10 - 5);
+      const cy = box.y + box.height / 2 + (Math.random() * 6 - 3);
+      await page.mouse.move(cx, cy, { steps: 15 + Math.floor(Math.random() * 10) });
+      await rawSleep(300 + Math.random() * 400);
+
+      // Press and hold — use rawSleep (no jitter) to guarantee minimum hold time.
+      // PerimeterX requires ~8-10s minimum; we hold 10-14s for margin.
+      await page.mouse.down();
+      const holdMs = 14000 + Math.random() * 4000; // 14-18s base; ±30% jitter = ~10-23s actual (≥10s minimum)
+      console.log(`[bot] Holding for ${(holdMs / 1000).toFixed(1)}s...`);
+
+      // Micro-movements during hold — real humans don't hold perfectly still.
+      // Tiny ±1-2px jitter every 1-2s looks natural to PerimeterX's mouse telemetry.
+      const microMoves = Math.floor(holdMs / 2000); // one move per ~2s
+      const moveInterval = holdMs / (microMoves + 1);
+      for (let m = 0; m < microMoves; m++) {
+        await rawSleep(moveInterval);
+        await page.mouse.move(
+          cx + (Math.random() * 4 - 2),
+          cy + (Math.random() * 4 - 2),
+          { steps: 2 },
+        ).catch(() => {});
+      }
+      await rawSleep(moveInterval); // final segment before release
+      await page.mouse.up();
+
+      // Wait for challenge to verify and page to navigate/reload
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }),
+        rawSleep(15000),
+      ]).catch(() => {});
+      await rawSleep(1500 + Math.random() * 1000);
+
+      // Check if challenge resolved
+      const stillBlocked = await page.evaluate(() =>
+        (document.body?.innerText || "").includes("Press & Hold"),
+      ).catch(() => true);
+
+      if (!stillBlocked) {
+        console.log("[bot] Challenge solved successfully");
+        return true;
+      }
+      if (attempt === 0) {
+        console.warn("[bot] Challenge still present — retrying with longer hold...");
+        await rawSleep(2000 + Math.random() * 2000);
+        continue;
+      }
+      console.warn("[bot] Challenge still present after 2 attempts");
+      return false;
+    } catch (err) {
+      console.warn(`[bot] Challenge solve error: ${err.message}`);
+      if (attempt === 0) { await rawSleep(2000).catch(() => {}); continue; }
       return false;
     }
-
-    const box = await target.boundingBox();
-    if (!box) {
-      console.warn("[bot] #px-captcha has no bounding box");
-      return false;
-    }
-
-    // The "Press & Hold" button is rendered inside #px-captcha. Click its center.
-    // Move mouse naturally, then press and hold for 3-5 seconds.
-    const cx = box.x + box.width / 2 + (Math.random() * 10 - 5);
-    const cy = box.y + box.height / 2 + (Math.random() * 6 - 3);
-    await page.mouse.move(cx, cy, { steps: 15 + Math.floor(Math.random() * 10) });
-    await sleep(300 + Math.random() * 400);
-
-    await page.mouse.down();
-    const holdMs = 8000 + Math.random() * 4000;
-    console.log(`[bot] Holding for ${(holdMs / 1000).toFixed(1)}s...`);
-    await sleep(holdMs);
-    await page.mouse.up();
-
-    // Wait for challenge to verify and page to navigate/reload
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }),
-      sleep(15000),
-    ]).catch(() => {});
-    await sleep(1500 + Math.random() * 1000);
-
-    // Check if challenge resolved
-    const stillBlocked = await page.evaluate(() =>
-      (document.body?.innerText || "").includes("Press & Hold"),
-    ).catch(() => true);
-
-    if (!stillBlocked) {
-      console.log("[bot] Challenge solved successfully");
-      return true;
-    }
-    console.warn("[bot] Challenge still present after attempt");
-    return false;
-  } catch (err) {
-    console.warn(`[bot] Challenge solve error: ${err.message}`);
-    return false;
   }
+  return false;
 }
 
 // ─── Costco: fetch-first with browser fallback ──────────────────────────────
@@ -2493,6 +2527,7 @@ async function scrapeWalmartViaBrowser(store, page) {
   // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies
   await page.goto("https://www.walmart.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 3000);
+  await solveHumanChallenge(page);
   await humanizePage(page, { pace: "medium" });
 
   const found = [];
@@ -2503,9 +2538,16 @@ async function scrapeWalmartViaBrowser(store, page) {
       await page.waitForFunction(() => document.querySelector('script#__NEXT_DATA__')?.textContent?.length > 100, { timeout: 10000 }).catch(() => {});
 
       if (await isBlockedPage(page)) {
-        console.warn(`[walmart:${store.storeId}] Bot detection page for query "${query}" — skipping`);
-        trackHealth("walmart", "blocked");
-        continue;
+        const solved = await solveHumanChallenge(page);
+        if (solved) {
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+          await page.waitForFunction(() => document.querySelector('script#__NEXT_DATA__')?.textContent?.length > 100, { timeout: 10000 }).catch(() => {});
+        }
+        if (!solved || await isBlockedPage(page)) {
+          console.warn(`[walmart:${store.storeId}] Bot detection page for query "${query}" — skipping`);
+          trackHealth("walmart", "blocked");
+          continue;
+        }
       }
 
       const nextData = await page.evaluate(

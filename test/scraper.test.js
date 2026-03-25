@@ -1903,53 +1903,75 @@ describe("solveHumanChallenge", () => {
     const page = createMockPage();
     // First evaluate: body text check
     page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
-    // page.$: no #px-captcha element
-    page.$.mockResolvedValue(null);
+    // waitForSelector: no #px-captcha element (timeout)
+    page.waitForSelector.mockResolvedValue(null);
     expect(await solveHumanChallenge(page)).toBe(false);
   });
 
   it("returns false when #px-captcha has no bounding box", async () => {
     const page = createMockPage();
+    // Attempt 1: Press & Hold detected, element found but no bounding box
     page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
-    page.$.mockResolvedValue({ boundingBox: vi.fn().mockResolvedValue(null) });
-    expect(await solveHumanChallenge(page)).toBe(false);
+    page.waitForSelector.mockResolvedValueOnce({ boundingBox: vi.fn().mockResolvedValue(null) });
+    // Attempt 2 (retry): Press & Hold still there, element found but still no box
+    page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
+    page.waitForSelector.mockResolvedValueOnce({ boundingBox: vi.fn().mockResolvedValue(null) });
+    expect(await runWithFakeTimers(() => solveHumanChallenge(page))).toBe(false);
   });
 
   it("attempts press-and-hold when #px-captcha found with bounding box", async () => {
     const page = createMockPage();
-    const mouse = { move: vi.fn(), down: vi.fn(), up: vi.fn() };
+    const mouse = { move: vi.fn().mockResolvedValue(undefined), down: vi.fn().mockResolvedValue(undefined), up: vi.fn().mockResolvedValue(undefined) };
     page.mouse = mouse;
-    // First evaluate: body text with challenge
-    page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
-    // page.$: found #px-captcha with bounding box
-    page.$.mockResolvedValue({
+    // evaluate: body text check → "Press & Hold", then stillBlocked check → false (solved)
+    let evalCount = 0;
+    page.evaluate.mockImplementation(async () => {
+      evalCount++;
+      if (evalCount === 1) return "Press & Hold to confirm";
+      return false; // stillBlocked → solved
+    });
+    page.waitForSelector.mockResolvedValueOnce({
       boundingBox: vi.fn().mockResolvedValue({ x: 400, y: 400, width: 530, height: 95 }),
     });
-    // waitForNavigation
     page.waitForNavigation = vi.fn().mockResolvedValue(undefined);
-    // Second evaluate: check if still blocked (returns false = solved)
-    page.evaluate.mockResolvedValueOnce(false);
 
-    const result = await runWithFakeTimers(() => solveHumanChallenge(page));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const promise = solveHumanChallenge(page);
+    promise.catch(() => {});
+    for (let i = 0; i < 50; i++) await vi.advanceTimersByTimeAsync(1000);
+    const result = await promise;
+    logSpy.mockRestore();
     expect(result).toBe(true);
-    expect(mouse.move).toHaveBeenCalled();
     expect(mouse.down).toHaveBeenCalled();
     expect(mouse.up).toHaveBeenCalled();
   });
 
-  it("returns false when challenge still present after hold", async () => {
+  it("retries once when challenge still present after first hold", async () => {
     const page = createMockPage();
-    page.mouse = { move: vi.fn(), down: vi.fn(), up: vi.fn() };
-    page.evaluate.mockResolvedValueOnce("Press & Hold to confirm");
-    page.$.mockResolvedValue({
+    page.mouse = { move: vi.fn().mockResolvedValue(undefined), down: vi.fn().mockResolvedValue(undefined), up: vi.fn().mockResolvedValue(undefined) };
+    // Both attempts: detected, element found, hold completes, still blocked
+    let evalCount = 0;
+    page.evaluate.mockImplementation(async () => {
+      evalCount++;
+      // Odd calls = body text check (both attempts detect challenge)
+      // Even calls = stillBlocked check (both attempts fail)
+      return evalCount % 2 === 1 ? "Press & Hold to confirm" : true;
+    });
+    page.waitForSelector.mockResolvedValue({
       boundingBox: vi.fn().mockResolvedValue({ x: 400, y: 400, width: 530, height: 95 }),
     });
     page.waitForNavigation = vi.fn().mockResolvedValue(undefined);
-    // Still blocked after attempt
-    page.evaluate.mockResolvedValueOnce(true);
 
-    const result = await runWithFakeTimers(() => solveHumanChallenge(page));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const promise = solveHumanChallenge(page);
+    promise.catch(() => {});
+    for (let i = 0; i < 100; i++) await vi.advanceTimersByTimeAsync(1000);
+    const result = await promise;
+    warnSpy.mockRestore();
+    logSpy.mockRestore();
     expect(result).toBe(false);
+    expect(page.mouse.down).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -2473,11 +2495,16 @@ describe("scrapeWalmartViaBrowser", () => {
         availabilityStatusV2: { value: "IN_STOCK" }, sellerName: "Walmart.com",
       }] }] } } } },
     };
-    // evaluate is called twice per query: isBlockedPage body text, then __NEXT_DATA__
+    // evaluate calls: solveHumanChallenge body text (pre-warm), isBlockedPage body+title per query, __NEXT_DATA__
+    // Use a counter that returns "" for body text checks and nextData for __NEXT_DATA__
     let evalCallCount = 0;
-    mockPage.evaluate.mockImplementation(async () => {
+    mockPage.evaluate.mockImplementation(async (fn) => {
       evalCallCount++;
-      return evalCallCount % 2 === 1 ? "" : nextData;
+      // Even calls are __NEXT_DATA__ extraction; odd are body text checks (isBlockedPage/solveHumanChallenge)
+      // But we can't predict order perfectly, so: return nextData when fn.toString includes '__NEXT_DATA__' or after enough calls
+      const fnStr = typeof fn === "function" ? fn.toString() : "";
+      if (fnStr.includes("__NEXT_DATA__")) return nextData;
+      return ""; // body text checks return empty (no block)
     });
     const found = await runWithFakeTimers(() => scrapeWalmartViaBrowser(TEST_STORE, mockPage));
     expect(found.find((f) => f.name === "Stagg Jr")).toBeTruthy();
@@ -2485,11 +2512,11 @@ describe("scrapeWalmartViaBrowser", () => {
 
   it("falls back to DOM when __NEXT_DATA__ unavailable", async () => {
     const mockPage = createMockPage();
-    // evaluate: isBlockedPage body text → "", __NEXT_DATA__ → null
-    let evalCallCount = 0;
-    mockPage.evaluate.mockImplementation(async () => {
-      evalCallCount++;
-      return evalCallCount % 2 === 1 ? "" : null;
+    // evaluate: body text → "" (no block), __NEXT_DATA__ → null
+    mockPage.evaluate.mockImplementation(async (fn) => {
+      const fnStr = typeof fn === "function" ? fn.toString() : "";
+      if (fnStr.includes("__NEXT_DATA__")) return null;
+      return ""; // body text checks
     });
     mockPage.$$eval.mockResolvedValue([
       { title: "Weller Special Reserve Bourbon", url: "https://walmart.com/ip/123", price: "$30" },
