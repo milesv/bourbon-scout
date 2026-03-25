@@ -7049,3 +7049,219 @@ describe("COOKIE_CACHE_TTL_MS", () => {
     expect(COOKIE_CACHE_TTL_MS).toBe(25 * 60 * 1000);
   });
 });
+
+// ─── Discord Embed Branch Coverage ──────────────────────────────────────────
+
+describe("truncateDescription OOS branches", () => {
+  it("truncates OOS list when description exceeds limit", () => {
+    const longOOS = Array.from({ length: 500 }, (_, i) => `Bottle Name Number ${i} Extra Long`).join(", ");
+    const desc = `Store info\n\n✅ **IN STOCK**\nBlanton's\n\n❌ **OUT OF STOCK (500)**\n${longOOS}`;
+    const result = truncateDescription(desc);
+    expect(result.length).toBeLessThanOrEqual(DISCORD_DESC_LIMIT);
+    expect(result).toContain("IN STOCK");
+    expect(result).toContain("...");
+  });
+
+  it("returns unchanged when under limit", () => {
+    const desc = "Short description";
+    expect(truncateDescription(desc)).toBe(desc);
+  });
+
+  it("truncates without OOS section when no OOS marker found", () => {
+    const long = "x".repeat(DISCORD_DESC_LIMIT + 100);
+    const result = truncateDescription(long);
+    expect(result.length).toBeLessThanOrEqual(DISCORD_DESC_LIMIT);
+    expect(result).toContain("...");
+  });
+});
+
+describe("buildStoreEmbeds re-alert branch", () => {
+  it("generates blue re-alert embed for still-in-stock bottles", () => {
+    const changes = {
+      newFinds: [],
+      goneOOS: [],
+      stillInStock: [{ name: "Weller Special Reserve", url: "", price: "$29.99", sku: "", size: "750ml", fulfillment: "", scanCount: 4 }],
+    };
+    const store = { storeId: "1234", name: "Test Store", address: "123 Main St, Phoenix, AZ 85001" };
+    const embeds = buildStoreEmbeds("costco", "Costco", store, changes);
+    // Should produce a re-alert embed (blue) when scanCount is divisible by REALERT_EVERY_N_SCANS (4)
+    expect(embeds.length).toBeGreaterThan(0);
+    expect(embeds[0].color).toBe(COLORS.stillIn);
+  });
+
+  it("skips embed when still-in-stock scanCount is not at re-alert interval", () => {
+    const changes = {
+      newFinds: [],
+      goneOOS: [],
+      stillInStock: [{ name: "Weller SR", url: "", price: "$29.99", sku: "", size: "", fulfillment: "", scanCount: 3 }],
+    };
+    const store = { storeId: "1234", name: "Test Store", address: "123 Main St, Phoenix, AZ 85001" };
+    const embeds = buildStoreEmbeds("costco", "Costco", store, changes);
+    expect(embeds).toEqual([]);
+  });
+});
+
+describe("buildSummaryEmbed health field variations", () => {
+  it("shows warning emoji for 25-75% success rate", () => {
+    const health = { costco: { queries: 10, succeeded: 4, blocked: 6, failed: 0 } };
+    const embed = buildSummaryEmbed({
+      storesScanned: 7, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 7, durationSec: 60, health,
+    });
+    const costcoField = embed.fields.find(f => f.name.includes("Costco"));
+    expect(costcoField.value).toContain("⚠️");
+  });
+
+  it("shows error emoji for <25% success rate", () => {
+    const health = { costco: { queries: 10, succeeded: 1, blocked: 9, failed: 0 } };
+    const embed = buildSummaryEmbed({
+      storesScanned: 7, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 7, durationSec: 60, health,
+    });
+    const costcoField = embed.fields.find(f => f.name.includes("Costco"));
+    expect(costcoField.value).toContain("❌");
+  });
+
+  it("shows canary emoji when canary found for retailer", () => {
+    const health = { costco: { queries: 10, succeeded: 8, blocked: 2, failed: 0 } };
+    const canaryResults = { costco: true };
+    const embed = buildSummaryEmbed({
+      storesScanned: 7, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 7, durationSec: 60, health, canaryResults,
+    });
+    const costcoField = embed.fields.find(f => f.name.includes("Costco"));
+    expect(costcoField.value).toContain("🐤");
+  });
+
+  it("renders trend with bottle names found", () => {
+    const trend = {
+      scans: 10, hours: 24,
+      retailers: {
+        costco: { scans: 10, totalQueries: 100, totalOk: 80, totalBlocked: 20, canaryHits: 9, bottlesFound: ["Weller SR", "Weller SR", "Blanton's Original"] },
+      },
+    };
+    const embed = buildSummaryEmbed({
+      storesScanned: 7, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 7, durationSec: 60, trend,
+    });
+    expect(embed.description).toContain("Weller SR");
+    expect(embed.description).toContain("Blanton's Original");
+    expect(embed.description).toContain("80%"); // ok pct
+  });
+
+  it("renders peak hours with midnight and noon formatting", () => {
+    const peakHours = {
+      totalScans: 200,
+      slots: [
+        { slot: "Mon-0", finds: 3, scans: 10, rate: 0.3 },   // midnight
+        { slot: "Wed-12", finds: 2, scans: 10, rate: 0.2 },   // noon
+        { slot: "Fri-17", finds: 1, scans: 10, rate: 0.1 },   // 5 PM
+      ],
+    };
+    const embed = buildSummaryEmbed({
+      storesScanned: 7, retailersScanned: 1, totalNewFinds: 0, totalStillInStock: 0,
+      totalGoneOOS: 0, nothingCount: 7, durationSec: 60, peakHours,
+    });
+    expect(embed.description).toContain("Mon 12 AM");
+    expect(embed.description).toContain("Wed 12 PM");
+    expect(embed.description).toContain("Fri 5 PM");
+  });
+});
+
+describe("buildStoreEmbeds OOS-only changes", () => {
+  it("generates orange embed for bottles gone OOS", () => {
+    const changes = {
+      newFinds: [],
+      goneOOS: [{ name: "Weller SR", lastSeen: new Date().toISOString() }],
+      stillInStock: [],
+    };
+    const store = { storeId: "1234", name: "Test Store", address: "123 Main St, Phoenix, AZ 85001" };
+    const embeds = buildStoreEmbeds("costco", "Costco", store, changes);
+    expect(embeds.length).toBe(1);
+    expect(embeds[0].color).toBe(COLORS.goneOOS);
+  });
+});
+
+describe("computeMetricsTrend data field defaults", () => {
+  it("handles scans with missing ok/blocked/canary fields gracefully", () => {
+    const scans = [
+      { ts: new Date().toISOString(), retailers: { costco: { queries: 10 } } },
+      { ts: new Date().toISOString(), retailers: { costco: { queries: 5, ok: 5 } } },
+    ];
+    const trend = computeMetricsTrend(scans);
+    expect(trend.retailers.costco.totalQueries).toBe(15);
+    expect(trend.retailers.costco.totalOk).toBe(5);
+    expect(trend.retailers.costco.totalBlocked).toBe(0);
+    expect(trend.retailers.costco.canaryHits).toBe(0);
+  });
+});
+
+describe("dedupFound additional edge cases", () => {
+  it("prefers entry with lowest numeric price over N/A", () => {
+    const found = [
+      { name: "Weller SR", price: "N/A", url: "a" },
+      { name: "Weller SR", price: "$29.99", url: "b" },
+    ];
+    const result = dedupFound(found);
+    expect(result).toHaveLength(1);
+    expect(result[0].price).toBe("$29.99");
+  });
+
+  it("keeps first entry when both have zero/unparseable prices", () => {
+    const found = [
+      { name: "Pappy 23", price: "", url: "first" },
+      { name: "Pappy 23", price: "TBD", url: "second" },
+    ];
+    const result = dedupFound(found);
+    expect(result).toHaveLength(1);
+    expect(result[0].url).toBe("first");
+  });
+});
+
+describe("shuffle produces all elements", () => {
+  it("returns array with same elements in potentially different order", () => {
+    const arr = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const copy = [...arr];
+    const shuffled = shuffle(copy);
+    expect([...shuffled].sort((a, b) => a - b)).toEqual(arr);
+    expect(shuffled).toHaveLength(arr.length);
+  });
+
+  it("handles empty array", () => {
+    expect(shuffle([])).toEqual([]);
+  });
+
+  it("handles single element", () => {
+    expect(shuffle([42])).toEqual([42]);
+  });
+});
+
+describe("withTimeout edge cases", () => {
+  it("returns result when promise resolves before timeout", async () => {
+    const result = await withTimeout(Promise.resolve("ok"), 1000, "fallback");
+    expect(result).toBe("ok");
+  });
+
+  it("propagates rejection when promise rejects before timeout", async () => {
+    await expect(withTimeout(Promise.reject(new Error("fail")), 1000, "fallback"))
+      .rejects.toThrow("fail");
+  });
+});
+
+describe("runWithConcurrency error isolation", () => {
+  it("continues running tasks even when one throws", async () => {
+    const results = [];
+    const tasks = [
+      async () => { results.push(1); },
+      async () => { throw new Error("boom"); },
+      async () => { results.push(3); },
+    ];
+    await runWithConcurrency(tasks, 2);
+    expect(results).toEqual([1, 3]);
+  });
+
+  it("handles empty task list", async () => {
+    await runWithConcurrency([], 4);
+    // Should not throw
+  });
+});
