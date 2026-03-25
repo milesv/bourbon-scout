@@ -424,7 +424,7 @@ const SEARCH_QUERIES = [
 
 const TARGET_BOTTLES = [
   { name: "Blanton's Gold",             searchTerms: ["blanton's gold", "blantons gold"] },
-  { name: "Blanton's Straight from the Barrel", searchTerms: ["blanton's straight from the barrel", "blantons straight from the barrel", "blantons sftb", "blanton's sftb"] },
+  { name: "Blanton's Straight from the Barrel", searchTerms: ["blanton's straight from the barrel", "blantons straight from the barrel", "blantons sftb", "blanton's sftb", "blanton's sfb", "blantons sfb"] },
   { name: "Blanton's Special Reserve",  searchTerms: ["blanton's special reserve", "blantons special reserve"] },
   { name: "Blanton's Original",         searchTerms: ["blanton's single barrel", "blantons single barrel", "blanton's original", "blantons original"] },
   { name: "Weller Special Reserve",      searchTerms: ["weller special reserve", "weller sr", "w.l. weller special"] },
@@ -436,7 +436,7 @@ const TARGET_BOTTLES = [
   { name: "E.H. Taylor Small Batch",    searchTerms: ["eh taylor small batch", "e.h. taylor small batch", "colonel e.h. taylor small batch", "col. e.h. taylor small batch", "col e.h. taylor small batch"] },
   { name: "E.H. Taylor Single Barrel",  searchTerms: ["eh taylor single barrel", "e.h. taylor single barrel", "col. e.h. taylor single barrel", "colonel e.h. taylor single barrel"] },
   { name: "E.H. Taylor Barrel Proof",   searchTerms: ["eh taylor barrel proof", "e.h. taylor barrel proof", "col. e.h. taylor barrel proof"] },
-  { name: "E.H. Taylor Straight Rye",   searchTerms: ["eh taylor rye", "e.h. taylor rye", "e.h. taylor straight rye", "col. e.h. taylor straight rye"] },
+  { name: "E.H. Taylor Straight Rye",   searchTerms: ["eh taylor rye", "e.h. taylor rye", "e.h. taylor straight rye", "col. e.h. taylor straight rye", "colonel e.h. taylor rye"] },
   { name: "E.H. Taylor Seasoned Wood",  searchTerms: ["eh taylor seasoned wood", "e.h. taylor seasoned wood"] },
   { name: "E.H. Taylor Four Grain",     searchTerms: ["eh taylor four grain", "e.h. taylor four grain"] },
   { name: "E.H. Taylor Amaranth",       searchTerms: ["eh taylor amaranth", "e.h. taylor amaranth"] },
@@ -449,8 +449,8 @@ const TARGET_BOTTLES = [
   { name: "Thomas H. Handy",            searchTerms: ["thomas h. handy", "thomas handy sazerac", "thomas h handy", "thomas handy"] },
   { name: "Pappy Van Winkle 10 Year",   searchTerms: ["pappy van winkle 10", "old rip van winkle 10"] },
   { name: "Pappy Van Winkle 12 Year",   searchTerms: ["pappy van winkle 12", "van winkle special reserve 12"] },
-  { name: "Pappy Van Winkle 15 Year",   searchTerms: ["pappy van winkle 15"] },
-  { name: "Pappy Van Winkle 20 Year",   searchTerms: ["pappy van winkle 20"] },
+  { name: "Pappy Van Winkle 15 Year",   searchTerms: ["pappy van winkle 15", "old rip van winkle 15"] },
+  { name: "Pappy Van Winkle 20 Year",   searchTerms: ["pappy van winkle 20", "old rip van winkle 20"] },
   { name: "Pappy Van Winkle 23 Year",   searchTerms: ["pappy van winkle 23"] },
   { name: "Van Winkle Family Reserve Rye", searchTerms: ["van winkle family reserve rye", "van winkle rye 13"] },
   { name: "Elmer T. Lee",               searchTerms: ["elmer t. lee", "elmer t lee"] },
@@ -1099,6 +1099,7 @@ function parsePrice(str) {
 // title doesn't mention the size. Price is the reliable signal: no allocated 750ml bourbon
 // is under $20, but 50ml miniatures are typically $8-15. Also catches size when available.
 const MIN_BOTTLE_PRICE = 20;
+const MAX_BOTTLE_PRICE = 500; // No allocated bourbon retails above $350 (Pappy 23). $500+ = secondary market.
 function filterMiniatures(found) {
   return found.filter((f) => {
     const size = (f.size || "").toLowerCase();
@@ -1108,6 +1109,10 @@ function filterMiniatures(found) {
     }
     const price = parsePrice(f.price);
     if (price > 0 && price < MIN_BOTTLE_PRICE) return false; // Miniature price range
+    if (price > 0 && price > MAX_BOTTLE_PRICE) {
+      console.warn(`[filter] Rejected "${f.name}" at ${f.price} — exceeds $${MAX_BOTTLE_PRICE} ceiling`);
+      return false;
+    }
     return true;
   });
 }
@@ -3336,6 +3341,7 @@ const RETAILERS = [
 
 let polling = false;
 let storeCache = null;
+let peakSlotsCache = null; // Populated by poll(), consumed by getNextPollDelayMs() for dynamic boost
 
 async function poll() {
   if (polling) {
@@ -3581,6 +3587,8 @@ async function poll() {
   const trend = computeMetricsTrend(recentMetrics);
   const longMetrics = await loadRecentMetrics(24 * 14).catch(() => []);
   const peakHours = computePeakHours(longMetrics);
+  // Update peak slots cache for dynamic boost scheduling
+  if (peakHours) peakSlotsCache = peakHours;
 
   // Quiet summary at end of every poll
   const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend, peakHours });
@@ -3596,7 +3604,7 @@ async function poll() {
 
 export {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, MIN_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, MIN_BOTTLE_PRICE, MAX_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
@@ -3689,6 +3697,7 @@ async function main() {
     const BOOST_INTERVAL_MS = 20 * 60 * 1000; // 20 min
     const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 min
 
+    // Cache peak hours data — refreshed once per scheduling decision, not per poll
     function getNextPollDelayMs() {
       const { hour, day } = getMTTime();
       if (!isActiveHour(hour)) {
@@ -3703,7 +3712,19 @@ async function main() {
         console.log(`[scheduler] Outside active hours (${h}:${String(m).padStart(2, "0")} MT ${day}) — sleeping ${Math.round(sleepMs / 60000)}min until 5 PM`);
         return sleepMs;
       }
-      const base = isBoostPeriod(hour, day) ? BOOST_INTERVAL_MS : DEFAULT_INTERVAL_MS;
+      // Dynamic boost: use peak hours from metrics when available (≥100 scans),
+      // fall back to hardcoded Tue/Thu schedule otherwise. peakSlotsCache is populated
+      // at the end of each poll() so the scheduler always has fresh data.
+      let boost = isBoostPeriod(hour, day);
+      if (!boost && peakSlotsCache?.slots) {
+        const currentSlot = `${day}-${hour}`;
+        const isPeak = peakSlotsCache.slots.slice(0, 5).some(s => s.slot === currentSlot);
+        if (isPeak) {
+          boost = true;
+          console.log(`[scheduler] Dynamic boost: ${currentSlot} is a peak find time`);
+        }
+      }
+      const base = boost ? BOOST_INTERVAL_MS : DEFAULT_INTERVAL_MS;
       const jitter = (Math.random() - 0.5) * 2 * JITTER_MS;
       const label = base === BOOST_INTERVAL_MS ? "boost" : "default";
       const delayMs = Math.max(60000, base + jitter);

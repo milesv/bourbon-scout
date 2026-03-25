@@ -69,7 +69,7 @@ vi.mock("../lib/geo.js", () => ({
 
 import {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, MIN_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
+  normalizeText, parseSize, parsePrice, matchesBottle, MIN_BOTTLE_PRICE, MAX_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
@@ -648,6 +648,38 @@ describe("matchesBottle", () => {
     ];
     const filtered = filterMiniatures(found);
     expect(filtered).toHaveLength(3);
+  });
+
+  it("filterMiniatures rejects bottles over MAX_BOTTLE_PRICE ceiling", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const found = [
+      { name: "Blanton's Original", price: "$599.99", size: "750ml", url: "" },  // Secondary market — filtered
+      { name: "Pappy Van Winkle 23 Year", price: "$349.99", size: "", url: "" },  // Retail price — kept
+      { name: "Weller Special Reserve", price: "$29.99", size: "", url: "" },      // Normal — kept
+    ];
+    const filtered = filterMiniatures(found);
+    expect(filtered).toHaveLength(2);
+    expect(filtered.map(f => f.name)).toEqual(["Pappy Van Winkle 23 Year", "Weller Special Reserve"]);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("$599.99"));
+    warnSpy.mockRestore();
+  });
+
+  it("searchTerms match 'Old Rip Van Winkle' for Pappy 15 and 20", () => {
+    const pappy15 = TARGET_BOTTLES.find((b) => b.name === "Pappy Van Winkle 15 Year");
+    const pappy20 = TARGET_BOTTLES.find((b) => b.name === "Pappy Van Winkle 20 Year");
+    expect(matchesBottle("Old Rip Van Winkle 15 Year Bourbon", pappy15)).toBe(true);
+    expect(matchesBottle("Old Rip Van Winkle 20 Year Bourbon", pappy20)).toBe(true);
+  });
+
+  it("searchTerms match 'Colonel E.H. Taylor' for Straight Rye", () => {
+    const rye = TARGET_BOTTLES.find((b) => b.name === "E.H. Taylor Straight Rye");
+    expect(matchesBottle("Colonel E.H. Taylor Straight Rye Whiskey 750ml", rye)).toBe(true);
+  });
+
+  it("searchTerms match 'SFB' abbreviation for SFTB", () => {
+    const sftb = TARGET_BOTTLES.find((b) => b.name === "Blanton's Straight from the Barrel");
+    expect(matchesBottle("Blanton's SFB Bourbon 750ml", sftb)).toBe(true);
+    expect(matchesBottle("Blantons SFB 65.3% ABV", sftb)).toBe(true);
   });
 
   it("matchesBottle respects retailers field for per-retailer filtering", () => {
