@@ -7265,3 +7265,213 @@ describe("runWithConcurrency error isolation", () => {
     // Should not throw
   });
 });
+
+// ─── computePeakHours ────────────────────────────────────────────────────────
+
+describe("computePeakHours", () => {
+  it("returns null with fewer than 100 scans", () => {
+    const scans = Array.from({ length: 99 }, (_, i) => ({
+      ts: new Date(Date.now() - i * 30 * 60000).toISOString(),
+      retailers: { costco: { queries: 10, ok: 8, found: [] } },
+    }));
+    expect(computePeakHours(scans)).toBeNull();
+  });
+
+  it("identifies peak hours from 100+ scans with finds", () => {
+    // Create 120 scans — 20 on Mon at 6 PM with finds, rest without
+    const scans = [];
+    for (let i = 0; i < 120; i++) {
+      const d = new Date("2026-03-02T01:00:00Z"); // Mon 6 PM MT = Mon 01:00 UTC
+      d.setHours(d.getHours() + i);
+      const hasFind = i < 20; // First 20 scans have finds
+      scans.push({
+        ts: d.toISOString(),
+        retailers: { costco: { queries: 10, ok: 8, found: hasFind ? ["Weller SR"] : [] } },
+      });
+    }
+    const result = computePeakHours(scans);
+    expect(result).not.toBeNull();
+    expect(result.totalScans).toBe(120);
+    expect(result.slots.length).toBeGreaterThan(0);
+    expect(result.slots[0].finds).toBeGreaterThan(0);
+    expect(result.slots[0].rate).toBeGreaterThan(0);
+  });
+
+  it("returns empty slots when no scans have finds", () => {
+    const scans = Array.from({ length: 100 }, (_, i) => ({
+      ts: new Date(Date.now() - i * 30 * 60000).toISOString(),
+      retailers: { costco: { queries: 10, ok: 8, found: [] } },
+    }));
+    const result = computePeakHours(scans);
+    expect(result.slots).toEqual([]);
+    expect(result.totalScans).toBe(100);
+  });
+});
+
+// ─── getRetailerBrowserProxy ─────────────────────────────────────────────────
+
+describe("getRetailerBrowserProxy / getRetailerProxyUrl", () => {
+  it("getRetailerProxyUrl returns null when no proxy configured", () => {
+    const url = getRetailerProxyUrl("costco");
+    // No PROXY_URL in test env → returns null
+    expect(url).toBeNull();
+  });
+});
+
+// ─── isProxyAvailable edge cases ─────────────────────────────────────────────
+
+describe("isProxyAvailable detailed states", () => {
+  it("returns false when no proxy is set", () => {
+    // Test env has no PROXY_URL
+    expect(isProxyAvailable()).toBe(false);
+  });
+});
+
+// ─── loadRecentMetrics malformed line warning ────────────────────────────────
+
+describe("loadRecentMetrics", () => {
+  it("parses valid JSONL and returns recent entries", async () => {
+    const now = new Date();
+    const line = JSON.stringify({ ts: now.toISOString(), retailers: {}, duration: 60 });
+    mocks.readFile.mockResolvedValueOnce(line + "\n");
+    const result = await loadRecentMetrics(1);
+    expect(result.length).toBe(1);
+    expect(result[0].ts).toBe(now.toISOString());
+  });
+
+  it("skips malformed lines with warning", async () => {
+    const now = new Date();
+    const goodLine = JSON.stringify({ ts: now.toISOString(), retailers: {} });
+    mocks.readFile.mockResolvedValueOnce(goodLine + "\nNOT JSON\n" + goodLine + "\n");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await loadRecentMetrics(1);
+    expect(result.length).toBe(2);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("malformed"));
+    warnSpy.mockRestore();
+  });
+
+  it("returns empty array when file does not exist", async () => {
+    mocks.readFile.mockRejectedValueOnce(new Error("ENOENT"));
+    const result = await loadRecentMetrics(1);
+    expect(result).toEqual([]);
+  });
+});
+
+// ─── appendMetrics ───────────────────────────────────────────────────────────
+
+describe("appendMetrics", () => {
+  it("appends a JSON line to metrics.jsonl", async () => {
+    mocks.appendFile.mockResolvedValueOnce(undefined);
+    const entry = { ts: new Date().toISOString(), duration: 42 };
+    await appendMetrics(entry);
+    expect(mocks.appendFile).toHaveBeenCalledWith(
+      expect.any(String),
+      JSON.stringify(entry) + "\n",
+    );
+  });
+});
+
+// ─── formatBottleLine ────────────────────────────────────────────────────────
+
+describe("formatBottleLine", () => {
+  it("formats bottle with name, price, and URL", () => {
+    const line = formatBottleLine({ name: "Weller SR", price: "$29.99", url: "https://example.com", sku: "123" });
+    expect(line).toContain("Weller SR");
+    expect(line).toContain("$29.99");
+  });
+
+  it("handles missing url gracefully", () => {
+    const line = formatBottleLine({ name: "Pappy 23", price: "$349", url: "", sku: "" });
+    expect(line).toContain("Pappy 23");
+    expect(line).toContain("$349");
+  });
+});
+
+// ─── buildOOSList ────────────────────────────────────────────────────────────
+
+describe("buildOOSList", () => {
+  it("builds comma-separated OOS list from bottle names", () => {
+    const allNames = ["Weller SR", "Blanton's Original", "Pappy 23"];
+    const inStockNames = ["Weller SR"];
+    const result = buildOOSList(allNames, inStockNames);
+    expect(result).toContain("Blanton's Original");
+    expect(result).toContain("Pappy 23");
+    expect(result).not.toContain("Weller SR");
+    expect(result).toContain("OUT OF STOCK (2)");
+  });
+
+  it("returns empty string when all bottles are in stock", () => {
+    const result = buildOOSList(["Weller SR"], ["Weller SR"]);
+    expect(result).toBe("");
+  });
+});
+
+// ─── parseCity / parseState ──────────────────────────────────────────────────
+
+describe("parseCity edge cases", () => {
+  it("parses city from standard US address", () => {
+    expect(parseCity("123 Main St, Phoenix, AZ 85001")).toBe("Phoenix");
+  });
+
+  it("returns empty for unparseable address", () => {
+    expect(parseCity("")).toBe("");
+    expect(parseCity("no commas here")).toBe("");
+  });
+});
+
+describe("parseState", () => {
+  it("parses state from standard US address", () => {
+    expect(parseState("123 Main St, Phoenix, AZ 85001")).toBe("AZ");
+  });
+
+  it("returns empty for unparseable address", () => {
+    expect(parseState("")).toBe("");
+  });
+});
+
+// ─── timeAgo ─────────────────────────────────────────────────────────────────
+
+describe("timeAgo", () => {
+  it("returns human-readable time diff", () => {
+    const now = new Date();
+    const fiveMinAgo = new Date(now - 5 * 60 * 1000).toISOString();
+    const result = timeAgo(fiveMinAgo);
+    expect(result).toContain("5m");
+  });
+
+  it("returns empty for null/empty input", () => {
+    expect(timeAgo("")).toBe("");
+    expect(timeAgo(null)).toBe("");
+  });
+});
+
+// ─── truncateTitle ───────────────────────────────────────────────────────────
+
+describe("truncateTitle", () => {
+  it("truncates title at DISCORD_TITLE_LIMIT", () => {
+    const long = "A".repeat(300);
+    const result = truncateTitle(long);
+    expect(result.length).toBeLessThanOrEqual(DISCORD_TITLE_LIMIT);
+    expect(result).toContain("…"); // Uses ellipsis character, not "..."
+  });
+
+  it("returns unchanged when under limit", () => {
+    expect(truncateTitle("Short title")).toBe("Short title");
+  });
+});
+
+// ─── formatStoreInfo ─────────────────────────────────────────────────────────
+
+describe("formatStoreInfo edge cases", () => {
+  it("handles store with null name", () => {
+    const result = formatStoreInfo("costco", "Costco", { storeId: "123", name: null, address: "123 Main St" });
+    expect(result).toBeDefined();
+    expect(result.storeLine).toContain("123");
+  });
+
+  it("deduplicates store name from retailer name", () => {
+    const result = formatStoreInfo("costco", "Costco", { storeId: "736", name: "Costco Chandler", address: "123 Main St, Chandler, AZ 85248" });
+    // Should not say "Costco Costco Chandler"
+    expect(result.storeLine).not.toContain("Costco Costco");
+  });
+});
