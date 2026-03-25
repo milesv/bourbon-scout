@@ -118,7 +118,7 @@ All config is in `.env`:
 | Costco | Fetch-first (got-scraping) / Playwright | MUI `data-testid` DOM attrs | Akamai Bot Manager | Scrape-once (no store filter in search). Fetch-first via `got-scraping` with Chrome TLS fingerprint + cheerio parsing. Falls back to clean browser (`{ clean: true }`). Next.js App Router — no `__NEXT_DATA__`. |
 | Total Wine | Fetch-first (got-scraping) / Playwright | `window.INITIAL_STATE` JSON | PerimeterX (HUMAN) | Fetch-first via `got-scraping` with Chrome TLS fingerprint extracts `INITIAL_STATE`. Falls back to clean browser (no stealth/rebrowser, headed on Mac (minimized)) via `launchRetailerBrowser("totalwine", { clean: true })`. Mutex-serialized per store. Per-store via `storeId` URL param. Homepage pre-warm before searching. |
 | Walmart | Fetch-first / Playwright | `__NEXT_DATA__` JSON | Akamai + PerimeterX | Brace-counting JSON extraction (handles `</script>` in JSON strings). Falls back to clean browser (`{ clean: true }`). Mutex-serialized. Filters `__typename=Product`, excludes marketplace sellers. Requires `IN_STOCK` status + store/pickup fulfillment badge. `flatMap` across all `itemStacks`. |
-| Kroger | REST API | JSON | None (API key auth) | Shared OAuth token (singleton promise). Broad SEARCH_QUERIES (12) instead of per-bottle (40). 401 auto-clears token. `filter.limit=50`. Paginates to page 2 when first page is full. |
+| Kroger | REST API | JSON | None (API key auth) | Shared OAuth token (singleton promise). Dual approach: `KROGER_PRODUCTS` maps 25 bottles to UPC product IDs for direct `GET /v1/products/{id}` lookups (bypasses search suppression), plus broad `SEARCH_QUERIES` for discovery. Direct lookups run first, search results merged via `dedupFound`. 401 auto-clears token. `filter.limit=50`. Paginates to page 2 when first page is full. Fry's (AZ) shares the same product catalog. |
 | Safeway | REST API | JSON | None (API key auth) | Broad SEARCH_QUERIES. `rows=50`. Paginates to page 2 (`start=50`) when first page is full. Skips silently if API key not set. |
 | Walgreens | Playwright (browser-only) | Server-rendered HTML (CSS selectors) | Akamai Bot Manager | Scrape-once. Clean browser (`{ clean: true }`). `USER_LOC` cookie (base64 JSON with lat/lng/zip) sets store context. No embedded JSON — extracts `.card__product` DOM elements with fallback `[class*='card__product']` + `[data-testid*='product']` selectors. Filters by multiple OOS text patterns ("Not sold at your store", "out of stock", "unavailable"). `zipToCoords` failure returns `[]` immediately instead of wasting a 180s timeout slot. |
 | Sam's Club | Fetch-first / Playwright | `__NEXT_DATA__` JSON (per-product) | PerimeterX | Scrape-once. Falls back to clean browser (`{ clean: true }`). Per-product-URL approach — search excludes spirits. `SAMSCLUB_PRODUCTS` maps 14 bottle names to product IDs (Blanton's, Weller SR, EHT SB, Stagg Jr, George T. Stagg, Eagle Rare 17, Thomas H. Handy, Elmer T. Lee, Pappy 10/12/15/20/23, Buffalo Trace canary). Checks `availabilityStatusV2.value` on each product page. Same Next.js stack as Walmart (same parent company). |
@@ -131,7 +131,7 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-735 tests across 5 files using Vitest (90.1% line coverage, 80.4% branch):
+742 tests across 5 files using Vitest (90.1% line coverage, 80.4% branch):
 
 | File | Tests | Focus |
 |------|-------|-------|

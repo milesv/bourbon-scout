@@ -85,6 +85,7 @@ import {
   getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
+  KROGER_PRODUCTS, checkKrogerKnownProducts,
   trackHealth,
   validateEnv,
   poll, main,
@@ -5628,6 +5629,102 @@ describe("Kroger OAuth failure health tracking", () => {
     const health = _getScraperHealth();
     expect(health.kroger?.failed).toBeGreaterThanOrEqual(1);
     consoleSpy.mockRestore();
+  });
+});
+
+// ─── KROGER_PRODUCTS direct lookup ───────────────────────────────────────────
+
+describe("KROGER_PRODUCTS", () => {
+  it("contains 25 allocated bottles plus canary", () => {
+    const entries = Object.entries(KROGER_PRODUCTS);
+    expect(entries.length).toBe(25);
+    expect(KROGER_PRODUCTS["Buffalo Trace"]).toBeDefined(); // canary
+  });
+
+  it("all product IDs are UPC-format strings", () => {
+    for (const [name, id] of Object.entries(KROGER_PRODUCTS)) {
+      expect(typeof id).toBe("string");
+      expect(id).toMatch(/^\d{13}$/); // 13-digit UPC
+    }
+  });
+
+  it("all bottle names exist in TARGET_BOTTLES", () => {
+    const targetNames = new Set(TARGET_BOTTLES.map(b => b.name));
+    for (const name of Object.keys(KROGER_PRODUCTS)) {
+      expect(targetNames.has(name), `${name} not in TARGET_BOTTLES`).toBe(true);
+    }
+  });
+
+  it("contains all BTAC and Pappy bottles", () => {
+    expect(KROGER_PRODUCTS["George T. Stagg"]).toBeDefined();
+    expect(KROGER_PRODUCTS["Eagle Rare 17 Year"]).toBeDefined();
+    expect(KROGER_PRODUCTS["William Larue Weller"]).toBeDefined();
+    expect(KROGER_PRODUCTS["Thomas H. Handy"]).toBeDefined();
+    expect(KROGER_PRODUCTS["Pappy Van Winkle 10 Year"]).toBeDefined();
+    expect(KROGER_PRODUCTS["Pappy Van Winkle 15 Year"]).toBeDefined();
+    expect(KROGER_PRODUCTS["Pappy Van Winkle 20 Year"]).toBeDefined();
+    expect(KROGER_PRODUCTS["Pappy Van Winkle 23 Year"]).toBeDefined();
+  });
+});
+
+describe("checkKrogerKnownProducts", () => {
+  beforeEach(() => {
+    _resetKrogerToken();
+  });
+
+  it("returns found bottles when API returns in-stock products", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: async () => ({
+        data: {
+          description: "Blanton's Single Barrel Bourbon",
+          productId: "0008024400203",
+          items: [{
+            fulfillment: { inStore: true },
+            inventory: { stockLevel: "HIGH" },
+            price: { regular: 64.99, promo: null },
+            size: "750 ml",
+          }],
+        },
+      }),
+    });
+    const store = { storeId: "kr1", name: "Fry's Tempe" };
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const found = await runWithFakeTimers(() => checkKrogerKnownProducts(store, "test-token"));
+    // Should find multiple bottles (each API call returns the same mock)
+    expect(found.length).toBeGreaterThan(0);
+    expect(found[0]).toHaveProperty("name");
+    expect(found[0]).toHaveProperty("url");
+    expect(found[0]).toHaveProperty("price");
+    expect(found[0].url).toContain("kroger.com/p/");
+    logSpy.mockRestore();
+  });
+
+  it("returns empty when all products are out of stock", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true, status: 200,
+      json: async () => ({
+        data: {
+          description: "Blanton's",
+          productId: "0008024400203",
+          items: [{
+            fulfillment: { inStore: true },
+            inventory: { stockLevel: "TEMPORARILY_OUT_OF_STOCK" },
+            price: { regular: 64.99 },
+          }],
+        },
+      }),
+    });
+    const store = { storeId: "kr1", name: "Fry's" };
+    const found = await runWithFakeTimers(() => checkKrogerKnownProducts(store, "test-token"));
+    expect(found).toEqual([]);
+  });
+
+  it("handles API errors gracefully", async () => {
+    mocks.fetch.mockRejectedValue(new Error("Network error"));
+    const store = { storeId: "kr1", name: "Fry's" };
+    const found = await runWithFakeTimers(() => checkKrogerKnownProducts(store, "test-token"));
+    expect(found).toEqual([]);
   });
 });
 

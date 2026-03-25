@@ -144,7 +144,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-735 tests across 5 files using [Vitest](https://vitest.dev/) (90.1% line coverage, 80.4% branch):
+742 tests across 5 files using [Vitest](https://vitest.dev/) (90.1% line coverage, 80.4% branch):
 
 ```sh
 npm test                # Run all tests

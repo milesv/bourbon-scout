@@ -3152,6 +3152,82 @@ async function getKrogerToken() {
   return krogerTokenPromise;
 }
 
+// Direct Kroger product IDs (UPC codes) for allocated bottles.
+// Used for surgical API lookups via GET /v1/products/{id}?filter.locationId={storeId}
+// which bypass search ranking/suppression. Fry's shares the same catalog.
+const KROGER_PRODUCTS = {
+  "Buffalo Trace":              "0008024400923", // canary
+  "Blanton's Original":         "0008024400203",
+  "Blanton's Gold":             "0008024400939",
+  "E.H. Taylor Small Batch":    "0008800400549",
+  "E.H. Taylor Single Barrel":  "0008800400551",
+  "E.H. Taylor Barrel Proof":   "0008800400552",
+  "E.H. Taylor Straight Rye":   "0008800400550",
+  "E.H. Taylor 18 Year Marriage": "0008800404015",
+  "Weller Special Reserve":     "0008800402574",
+  "Weller Antique 107":         "0008800402564",
+  "Weller 12 Year":             "0008800402774",
+  "Weller Full Proof":          "0008800403149",
+  "Weller C.Y.P.B.":            "0008800403148",
+  "Stagg Jr":                   "0008800401858",
+  "George T. Stagg":            "0008800402784",
+  "Eagle Rare 17 Year":         "0008800402144",
+  "William Larue Weller":       "0008800402595",
+  "Thomas H. Handy":            "0008800400003",
+  "Pappy Van Winkle 10 Year":   "0008931912367",
+  "Pappy Van Winkle 12 Year":   "0008931912373",
+  "Pappy Van Winkle 15 Year":   "0008931912374",
+  "Pappy Van Winkle 20 Year":   "0008931912372",
+  "Pappy Van Winkle 23 Year":   "0008931912378",
+  "Elmer T. Lee":               "0008024400773",
+  "Rock Hill Farms":            "0008024400683",
+};
+
+// Direct product lookup via Kroger API — bypasses search, immune to search suppression.
+// Returns found[] for a specific store. Runs before search queries for fastest detection.
+async function checkKrogerKnownProducts(store, token) {
+  const found = [];
+  const entries = Object.entries(KROGER_PRODUCTS);
+  const krogerAgent = getRetailerProxy("kroger");
+
+  // Run in parallel batches of 5 (API-key auth, no bot detection risk)
+  await Promise.all(entries.map(async ([bottleName, productId], i) => {
+    await sleep(i * 50); // stagger starts
+    try {
+      const url = `https://api.kroger.com/v1/products/${productId}?filter.locationId=${store.storeId}`;
+      const opts = {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(10000),
+      };
+      if (krogerAgent) opts.agent = krogerAgent;
+      const res = await fetchRetry(url, opts);
+      if (!res.ok) return;
+      const data = await res.json();
+      const product = data.data;
+      if (!product) return;
+      // Check in-store availability (same logic as search path)
+      const isKrogerItemInStock = (item) =>
+        item.fulfillment?.inStore === true &&
+        item.inventory?.stockLevel != null &&
+        !String(item.inventory.stockLevel).toLowerCase().includes("out_of_stock");
+      const inStock = product.items?.some(isKrogerItemInStock);
+      if (!inStock) return;
+      const inStoreItem = product.items?.find(isKrogerItemInStock) || product.items?.[0];
+      const price = inStoreItem?.price?.promo ?? inStoreItem?.price?.regular;
+      found.push({
+        name: bottleName,
+        url: `https://www.kroger.com/p/${productId}`,
+        price: price != null ? `$${price.toFixed(2)}` : "",
+        sku: productId,
+        size: inStoreItem?.size || "",
+        fulfillment: inStoreItem?.fulfillment?.inStore ? "In-store" : "",
+      });
+      console.log(`[kroger:${store.storeId}] Direct lookup: ${bottleName} in stock!`);
+    } catch { /* individual product lookup failure — continue */ }
+  }));
+  return found;
+}
+
 async function scrapeKrogerStore(store) {
   /* v8 ignore next 3 -- env guard */
   if (!KROGER_CLIENT_ID || !KROGER_CLIENT_SECRET) {
@@ -3168,7 +3244,10 @@ async function scrapeKrogerStore(store) {
     return [];
   }
 
-  // Use broad SEARCH_QUERIES (12) instead of per-bottle (40) to cut API calls ~70%
+  // Direct product lookups first — bypass search, immune to search suppression
+  const knownFound = await checkKrogerKnownProducts(store, token);
+
+  // Then broad search queries for discovery of bottles not in KROGER_PRODUCTS
   const found = [];
 
   function matchKrogerProducts(products) {
@@ -3241,7 +3320,7 @@ async function scrapeKrogerStore(store) {
       trackHealth("kroger", "fail");
     }
   }));
-  return dedupFound(found);
+  return dedupFound([...knownFound, ...found]);
 }
 
 async function scrapeSafewayStore(store) {
@@ -3618,7 +3697,7 @@ export {
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
-  getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
+  KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
