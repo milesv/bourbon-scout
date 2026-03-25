@@ -518,6 +518,27 @@ async function loadRecentMetrics(hours = 24) {
   }
 }
 
+// Prune old entries from metrics.jsonl to prevent unbounded growth.
+// Called once at startup (not per-poll). Atomic write via tmp+rename.
+async function pruneMetrics(maxDays = 30) {
+  try {
+    const filePath = fileURLToPath(METRICS_FILE);
+    const raw = await readFile(filePath, "utf-8");
+    const cutoff = Date.now() - maxDays * 24 * 60 * 60 * 1000;
+    const lines = raw.trim().split("\n").filter(Boolean);
+    const kept = lines.filter((line) => {
+      try { return new Date(JSON.parse(line).ts).getTime() >= cutoff; }
+      catch { return false; } // drop malformed lines during pruning
+    });
+    if (kept.length < lines.length) {
+      const tmpPath = filePath + ".tmp";
+      await writeFile(tmpPath, kept.join("\n") + "\n");
+      await rename(tmpPath, filePath);
+      console.log(`[metrics] Pruned ${lines.length - kept.length} entries older than ${maxDays} days (${kept.length} kept)`);
+    }
+  } catch { /* file doesn't exist yet — nothing to prune */ }
+}
+
 function computeMetricsTrend(recentMetrics) {
   if (recentMetrics.length < 2) return null;
   const retailers = {};
@@ -3687,7 +3708,7 @@ export {
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
-  METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend, computePeakHours,
+  METRICS_FILE, appendMetrics, loadRecentMetrics, pruneMetrics, computeMetricsTrend, computePeakHours,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
@@ -3754,6 +3775,9 @@ async function main() {
       krogerClientId: KROGER_CLIENT_ID,
       krogerClientSecret: KROGER_CLIENT_SECRET,
     });
+
+    // Prune old metrics entries once at startup (prevents unbounded file growth)
+    await pruneMetrics(30);
 
     const totalStores = Object.values(storeCache.retailers).reduce((sum, arr) => sum + arr.length, 0);
     for (const [key, stores] of Object.entries(storeCache.retailers)) {

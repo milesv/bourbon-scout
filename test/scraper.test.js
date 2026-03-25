@@ -73,7 +73,7 @@ import {
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
-  METRICS_FILE, appendMetrics, loadRecentMetrics, computeMetricsTrend, computePeakHours,
+  METRICS_FILE, appendMetrics, loadRecentMetrics, pruneMetrics, computeMetricsTrend, computePeakHours,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
@@ -7465,6 +7465,54 @@ describe("appendMetrics", () => {
       expect.any(String),
       JSON.stringify(entry) + "\n",
     );
+  });
+});
+
+// ─── pruneMetrics ────────────────────────────────────────────────────────────
+
+describe("pruneMetrics", () => {
+  it("removes entries older than maxDays", async () => {
+    const old = { ts: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(), duration: 1 };
+    const recent = { ts: new Date().toISOString(), duration: 2 };
+    mocks.readFile.mockResolvedValueOnce(JSON.stringify(old) + "\n" + JSON.stringify(recent) + "\n");
+    mocks.writeFile.mockResolvedValueOnce(undefined);
+    mocks.rename.mockResolvedValueOnce(undefined);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await pruneMetrics(30);
+    expect(mocks.writeFile).toHaveBeenCalledWith(
+      expect.stringContaining(".tmp"),
+      expect.stringContaining(JSON.stringify(recent)),
+    );
+    expect(mocks.rename).toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Pruned 1"));
+    logSpy.mockRestore();
+  });
+
+  it("does nothing when all entries are recent", async () => {
+    const recent = { ts: new Date().toISOString(), duration: 1 };
+    mocks.readFile.mockResolvedValueOnce(JSON.stringify(recent) + "\n");
+    await pruneMetrics(30);
+    expect(mocks.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("handles missing file gracefully", async () => {
+    mocks.readFile.mockRejectedValueOnce(new Error("ENOENT"));
+    await pruneMetrics(30); // should not throw
+  });
+
+  it("drops malformed lines during pruning", async () => {
+    const valid = { ts: new Date().toISOString(), duration: 1 };
+    mocks.readFile.mockResolvedValueOnce("not json\n" + JSON.stringify(valid) + "\n");
+    mocks.writeFile.mockResolvedValueOnce(undefined);
+    mocks.rename.mockResolvedValueOnce(undefined);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await pruneMetrics(30);
+    // Malformed line dropped, valid kept
+    expect(mocks.writeFile).toHaveBeenCalledWith(
+      expect.stringContaining(".tmp"),
+      JSON.stringify(valid) + "\n",
+    );
+    logSpy.mockRestore();
   });
 });
 
