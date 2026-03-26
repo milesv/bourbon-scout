@@ -3873,12 +3873,25 @@ async function main() {
     function getNextPollDelayMs() {
       const { hour, day } = getMTTime();
       if (!isActiveHour(hour)) {
-        // Daytime scanning: slower pace (45 min) during 10 AM – 5 PM MT.
-        // Stores restock during business hours — don't go dark.
-        const jitter = (Math.random() - 0.5) * 2 * JITTER_MS;
-        const delayMs = Math.max(60000, DAYTIME_INTERVAL_MS + jitter);
-        console.log(`[scheduler] daytime interval (${day} ${hour}:xx MT) — next poll in ${Math.round(delayMs / 1000)}s`);
-        return delayMs;
+        // Temporary daytime scanning for KoK drop (expires Mon Mar 31 2026 MT).
+        // After expiry, reverts to sleeping until 5 PM.
+        const DAYTIME_SCAN_UNTIL = new Date("2026-03-31T00:00:00-07:00"); // Mon midnight MT
+        if (Date.now() < DAYTIME_SCAN_UNTIL.getTime()) {
+          const jitter = (Math.random() - 0.5) * 2 * JITTER_MS;
+          const delayMs = Math.max(60000, DAYTIME_INTERVAL_MS + jitter);
+          console.log(`[scheduler] daytime interval (${day} ${hour}:xx MT) — next poll in ${Math.round(delayMs / 1000)}s`);
+          return delayMs;
+        }
+        // Normal behavior: sleep until 5 PM MT
+        const now = new Date();
+        const mtHourStr = new Intl.DateTimeFormat("en-US", {
+          timeZone: "America/Phoenix", hour: "numeric", minute: "numeric", hour12: false,
+        }).format(now);
+        const [h, m] = mtHourStr.split(":").map(Number);
+        const minsUntil5PM = (ACTIVE_START - h) * 60 - m;
+        const sleepMs = Math.max(60000, minsUntil5PM * 60 * 1000);
+        console.log(`[scheduler] Outside active hours (${h}:${String(m).padStart(2, "0")} MT ${day}) — sleeping ${Math.round(sleepMs / 60000)}min until 5 PM`);
+        return sleepMs;
       }
       // Dynamic boost: use peak hours from metrics when available (≥100 scans),
       // fall back to hardcoded Tue/Thu schedule otherwise. peakSlotsCache is populated
