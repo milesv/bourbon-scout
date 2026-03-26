@@ -312,6 +312,7 @@ const SEED_PRODUCT_URLS = {
     { name: "Elmer T. Lee", url: "https://www.costco.com/.product.43178.html" },
     { name: "E.H. Taylor Small Batch", url: "https://www.costco.com/.product.775642.html" },
     { name: "Eagle Rare 17 Year", url: "https://www.costco.com/.product.149017.html" },
+    { name: "Jack Daniel's 12 Year", url: "https://www.costco.com/.product.1737672.html" },
   ],
   walmart: [
     { name: "Buffalo Trace", url: "https://www.walmart.com/ip/Buffalo-Trace-Kentucky-Straight-Bourbon-Whiskey-750-ml-Liquor-45-Alcohol/132872863" },
@@ -439,6 +440,7 @@ const SEARCH_QUERIES = [
   "old forester bourbon",      // Birthday, President's Choice, 150th Anniversary, King Ranch
   "michters bourbon",           // Michter's 10 Year Single Barrel (Costco + Total Wine + Walmart only)
   "penelope bourbon",           // Penelope Founder's Reserve + Estate Collection (Costco + Total Wine + Walmart only)
+  "jack daniels aged",           // Jack Daniel's 10/12/14 Year Tennessee Whiskey
   "buffalo trace",              // Canary bottle — always-available health check
 ];
 
@@ -483,6 +485,9 @@ const TARGET_BOTTLES = [
   { name: "Michter's 10 Year",            searchTerms: ["michter's 10", "michters 10", "michter's 10 year", "michters 10 year"], retailers: ["costco", "totalwine", "walmart"] },
   { name: "Penelope Founder's Reserve",   searchTerms: ["penelope founder", "penelope founder's reserve", "penelope founders reserve"], retailers: ["costco", "totalwine", "walmart"] },
   { name: "Penelope Estate Collection",   searchTerms: ["penelope estate", "penelope estate collection"], retailers: ["costco", "totalwine", "walmart"] },
+  { name: "Jack Daniel's 10 Year",       searchTerms: ["jack daniel's 10 year", "jack daniels 10 year", "jack daniel's 10yr", "jack daniels 10yr", "jack daniel's aged 10"] },
+  { name: "Jack Daniel's 12 Year",       searchTerms: ["jack daniel's 12 year", "jack daniels 12 year", "jack daniel's 12yr", "jack daniels 12yr", "jack daniel's aged 12"] },
+  { name: "Jack Daniel's 14 Year",       searchTerms: ["jack daniel's 14 year", "jack daniels 14 year", "jack daniel's 14yr", "jack daniels 14yr", "jack daniel's aged 14"] },
   // Canary — always-available bottle used as a scraper health check
   { name: "Buffalo Trace", searchTerms: ["buffalo trace"], canary: true },
 ];

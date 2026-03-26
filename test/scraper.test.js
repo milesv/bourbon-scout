@@ -178,8 +178,8 @@ async function runWithFakeTimers(fn) {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 describe("constants", () => {
-  it("SEARCH_QUERIES has 15 broad queries (14 allocated + 1 canary)", () => {
-    expect(SEARCH_QUERIES).toHaveLength(15);
+  it("SEARCH_QUERIES has 16 broad queries (15 allocated + 1 canary)", () => {
+    expect(SEARCH_QUERIES).toHaveLength(16);
     expect(SEARCH_QUERIES).toContain("weller bourbon");
     expect(SEARCH_QUERIES).toContain("van winkle");
     expect(SEARCH_QUERIES).toContain("eh taylor");
@@ -187,11 +187,12 @@ describe("constants", () => {
     expect(SEARCH_QUERIES).toContain("old forester bourbon");
     expect(SEARCH_QUERIES).toContain("michters bourbon");
     expect(SEARCH_QUERIES).toContain("penelope bourbon");
+    expect(SEARCH_QUERIES).toContain("jack daniels aged");
     expect(SEARCH_QUERIES).toContain("buffalo trace");
   });
 
-  it("TARGET_BOTTLES has 41 bottles (40 allocated + 1 canary)", () => {
-    expect(TARGET_BOTTLES).toHaveLength(41);
+  it("TARGET_BOTTLES has 44 bottles (43 allocated + 1 canary)", () => {
+    expect(TARGET_BOTTLES).toHaveLength(44);
     expect(TARGET_BOTTLES[0]).toHaveProperty("name");
     expect(TARGET_BOTTLES[0]).toHaveProperty("searchTerms");
   });
@@ -356,7 +357,7 @@ describe("canary bottle", () => {
 
   it("non-canary bottles do not have canary flag", () => {
     const nonCanary = TARGET_BOTTLES.filter((b) => !b.canary);
-    expect(nonCanary.length).toBe(40);
+    expect(nonCanary.length).toBe(43);
   });
 
   it("matchesBottle works for Buffalo Trace", () => {
