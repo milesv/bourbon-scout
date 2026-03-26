@@ -1283,6 +1283,7 @@ async function launchBrowser() {
     headless: true,
     args: [
       "--disable-blink-features=AutomationControlled",
+      "--disable-session-crashed-bubble",
       "--disable-dev-shm-usage",
       "--no-first-run",
       "--disable-component-update",
@@ -1416,6 +1417,7 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
     headless,
     args: [
       "--disable-blink-features=AutomationControlled",
+      "--disable-session-crashed-bubble",
       "--disable-dev-shm-usage",
       "--no-first-run",
       "--disable-component-update",
