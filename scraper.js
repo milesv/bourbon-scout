@@ -49,8 +49,8 @@ function parsePollIntervalMs(cronExpr) {
 }
 
 // ─── Schedule-aware scanning ─────────────────────────────────────────────────
-// Active hours: 5 PM – 10 AM MT. Boost (20 min) on Tue/Thu nights, else 30 min.
-// Arizona = MST year-round (UTC-7, no DST).
+// 24/7 scanning: 30 min default (5 PM – 10 AM MT), 45 min daytime (10 AM – 5 PM),
+// 20 min boost on Tue/Thu nights. Arizona = MST year-round (UTC-7, no DST).
 const ACTIVE_START = 17; // 5 PM MT
 const ACTIVE_END = 10;   // 10 AM MT
 
@@ -313,6 +313,7 @@ const SEED_PRODUCT_URLS = {
     { name: "E.H. Taylor Small Batch", url: "https://www.costco.com/.product.775642.html" },
     { name: "Eagle Rare 17 Year", url: "https://www.costco.com/.product.149017.html" },
     { name: "Jack Daniel's 12 Year", url: "https://www.costco.com/.product.1737672.html" },
+    { name: "King of Kentucky", url: "https://www.costco.com/.product.2045151.html" },
   ],
   walmart: [
     { name: "Buffalo Trace", url: "https://www.walmart.com/ip/Buffalo-Trace-Kentucky-Straight-Bourbon-Whiskey-750-ml-Liquor-45-Alcohol/132872863" },
@@ -3866,21 +3867,18 @@ async function main() {
     const JITTER_MS = 3 * 60 * 1000; // ±3 min
     const BOOST_INTERVAL_MS = 20 * 60 * 1000; // 20 min
     const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 min
+    const DAYTIME_INTERVAL_MS = 45 * 60 * 1000; // 45 min — slower pace during business hours
 
     // Cache peak hours data — refreshed once per scheduling decision, not per poll
     function getNextPollDelayMs() {
       const { hour, day } = getMTTime();
       if (!isActiveHour(hour)) {
-        // Sleep until 5 PM MT today
-        const now = new Date();
-        const mtHourStr = new Intl.DateTimeFormat("en-US", {
-          timeZone: "America/Phoenix", hour: "numeric", minute: "numeric", hour12: false,
-        }).format(now);
-        const [h, m] = mtHourStr.split(":").map(Number);
-        const minsUntil5PM = (ACTIVE_START - h) * 60 - m;
-        const sleepMs = Math.max(60000, minsUntil5PM * 60 * 1000);
-        console.log(`[scheduler] Outside active hours (${h}:${String(m).padStart(2, "0")} MT ${day}) — sleeping ${Math.round(sleepMs / 60000)}min until 5 PM`);
-        return sleepMs;
+        // Daytime scanning: slower pace (45 min) during 10 AM – 5 PM MT.
+        // Stores restock during business hours — don't go dark.
+        const jitter = (Math.random() - 0.5) * 2 * JITTER_MS;
+        const delayMs = Math.max(60000, DAYTIME_INTERVAL_MS + jitter);
+        console.log(`[scheduler] daytime interval (${day} ${hour}:xx MT) — next poll in ${Math.round(delayMs / 1000)}s`);
+        return delayMs;
       }
       // Dynamic boost: use peak hours from metrics when available (≥100 scans),
       // fall back to hardcoded Tue/Thu schedule otherwise. peakSlotsCache is populated
@@ -3912,7 +3910,7 @@ async function main() {
       }, nextMs);
     }
 
-    console.log(`Schedule: 30min default, 20min boost (Tue/Thu nights), active 5 PM – 10 AM MT\n`);
+    console.log(`Schedule: 24/7 — 30min default, 20min boost (Tue/Thu nights), 45min daytime (10 AM – 5 PM MT)\n`);
     /* v8 ignore next -- fire-and-forget initial poll */
     poll()
       .catch((err) => console.error("[startup] Initial poll failed:", err))
