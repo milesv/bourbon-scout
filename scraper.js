@@ -291,8 +291,28 @@ let knownProducts = {};
 
 // Seed product URLs for cold-start coverage. These are real product pages that exist
 // even before state.json has any data. State.json URLs are merged on top (may have
-// fresher prices). Costco has no product pages on costco.com for allocated bourbon.
+// fresher prices). Costco URLs constructed from user-provided item numbers (shelf tags).
 const SEED_PRODUCT_URLS = {
+  costco: [
+    { name: "Weller Antique 107", url: "https://www.costco.com/.product.1037200.html" },
+    { name: "Weller Single Barrel", url: "https://www.costco.com/.product.1482145.html" },
+    { name: "Weller Full Proof", url: "https://www.costco.com/.product.1391743.html" },
+    { name: "Weller 12 Year", url: "https://www.costco.com/.product.822390.html" },
+    { name: "Blanton's Original", url: "https://www.costco.com/.product.122438.html" },
+    { name: "Blanton's Gold", url: "https://www.costco.com/.product.1499833.html" },
+    { name: "Blanton's Straight from the Barrel", url: "https://www.costco.com/.product.1528218.html" },
+    { name: "Stagg Jr", url: "https://www.costco.com/.product.822398.html" },
+    { name: "Old Forester Birthday Bourbon", url: "https://www.costco.com/.product.952976.html" },
+    { name: "Old Forester Birthday Bourbon", url: "https://www.costco.com/.product.1990130.html" },
+    { name: "Pappy Van Winkle 10 Year", url: "https://www.costco.com/.product.724952.html" },
+    { name: "Pappy Van Winkle 12 Year", url: "https://www.costco.com/.product.256230.html" },
+    { name: "Pappy Van Winkle 15 Year", url: "https://www.costco.com/.product.149085.html" },
+    { name: "Pappy Van Winkle 20 Year", url: "https://www.costco.com/.product.256228.html" },
+    { name: "Pappy Van Winkle 23 Year", url: "https://www.costco.com/.product.336624.html" },
+    { name: "Elmer T. Lee", url: "https://www.costco.com/.product.43178.html" },
+    { name: "E.H. Taylor Small Batch", url: "https://www.costco.com/.product.775642.html" },
+    { name: "Eagle Rare 17 Year", url: "https://www.costco.com/.product.149017.html" },
+  ],
   walmart: [
     { name: "Buffalo Trace", url: "https://www.walmart.com/ip/Buffalo-Trace-Kentucky-Straight-Bourbon-Whiskey-750-ml-Liquor-45-Alcohol/132872863" },
     { name: "Blanton's Original", url: "https://www.walmart.com/ip/Blanton-s-Single-Barrel-Bourbon-750ml-93-Proof/101986207" },
