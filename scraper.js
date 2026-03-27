@@ -418,9 +418,17 @@ function getQueriesForScan(allQueries) {
   const rotating = allQueries.filter((q) => q !== canaryQuery && !PRIORITY_QUERIES.has(q));
   // Rotating queries alternate based on scan parity
   const rotatingGroup = rotating.filter((_, i) => i % 2 === scanCounter % 2);
-  // Priority + rotating subset + canary
+  // Canary FIRST (health check runs before anything else), then priority + rotating
   const priority = allQueries.filter((q) => PRIORITY_QUERIES.has(q));
-  return [...priority, ...rotatingGroup, canaryQuery];
+  return [canaryQuery, ...priority, ...rotatingGroup];
+}
+
+// Shuffle queries but keep canary (first element) in position 0.
+// Canary must run first so browser context is still alive for the health check.
+function shuffleKeepCanaryFirst(queries) {
+  if (queries.length <= 1) return queries;
+  const [canary, ...rest] = queries;
+  return [canary, ...shuffle(rest)];
 }
 
 // ─── Target Bottles ──────────────────────────────────────────────────────────
@@ -1786,7 +1794,7 @@ async function scrapeCostcoViaFetch() {
   // Batch queries with adaptive concurrency
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const failedPriorityQueries = new Set();
-  const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
+  const queryTasks = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) return; // Early-abort without health tracking — browser will track its own
     // Rotate proxy IP after 2 consecutive failures (likely burned IP)
     if (failures >= 2 && !rotated) {
@@ -1881,7 +1889,7 @@ async function scrapeCostcoOnce(page) {
   // homepage (mouse/scroll events), not navigation depth. Direct search is fine.
 
   const found = [];
-  for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
+  for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
     const url = `https://www.costco.com/s?keyword=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -2082,7 +2090,7 @@ async function scrapeTotalWineViaFetch(store) {
   // With 4 stores potentially running fetch simultaneously, even 2 concurrent queries
   // per store means up to 8 total requests hitting totalwine.com at once.
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
-  const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
+  const queryTasks = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) return; // Early-abort — browser will track its own
     // Inter-query delay with jitter to reduce burst detection
     if (i > 0) await sleep(1500 + Math.random() * 1500);
@@ -2189,7 +2197,7 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
   }
 
   const found = [];
-  const queries = shuffle(getQueriesForScan(SEARCH_QUERIES));
+  const queries = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES));
   for (let qi = 0; qi < queries.length; qi++) {
     const query = queries[qi];
     const url = `https://www.totalwine.com/search/all?text=${encodeURIComponent(query)}&storeId=${store.storeId}`;
@@ -2453,7 +2461,7 @@ async function scrapeWalmartViaFetch(store) {
   // per store means up to 10 total requests hitting walmart.com at once.
   // isFirst captured in .map() (sequential) to avoid race in concurrent tasks
   const failedPriorityQueries = new Set();
-  const queryTasks = shuffle(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
+  const queryTasks = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES)).map((query, i) => async () => {
     if (failures > 3) return; // Early-abort without health tracking — browser will track its own
     // Rotate proxy IP after 2 consecutive failures (likely burned IP)
     if (failures >= 2 && !rotated) {
@@ -2559,7 +2567,7 @@ async function scrapeWalmartViaBrowser(store, page) {
   await humanizePage(page, { pace: "medium" });
 
   const found = [];
-  for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
+  for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
     const url = `https://www.walmart.com/search?q=${encodeURIComponent(query)}&store_id=${store.storeId}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -2782,7 +2790,7 @@ async function scrapeWalgreensViaBrowser(page) {
   console.log(`[walgreens] Pre-warm done (${wgElapsed()}), starting queries...`);
 
   let wgConsecutiveBlocks = 0;
-  for (const query of shuffle(getQueriesForScan(SEARCH_QUERIES))) {
+  for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
     if (wgConsecutiveBlocks >= 4) { trackHealth("walgreens", "blocked"); continue; }
     const url = `https://www.walgreens.com/search/results.jsp?Ntt=${encodeURIComponent(query)}`;
     try {
@@ -3375,7 +3383,7 @@ async function scrapeKrogerStore(store) {
   }
 
   // Run all queries in parallel (API-key auth, no bot detection risk)
-  await Promise.all(shuffle(getQueriesForScan(SEARCH_QUERIES)).map(async (query, i) => {
+  await Promise.all(shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES)).map(async (query, i) => {
     await sleep(i * 50); // stagger starts to avoid thundering herd
     const baseUrl = `https://api.kroger.com/v1/products?filter.term=${encodeURIComponent(query)}&filter.locationId=${store.storeId}&filter.limit=50`;
     try {
@@ -3448,7 +3456,7 @@ async function scrapeSafewayStore(store) {
   }
 
   // Run all queries in parallel (API-key auth, no bot detection risk)
-  await Promise.all(shuffle(getQueriesForScan(SEARCH_QUERIES)).map(async (query, i) => {
+  await Promise.all(shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES)).map(async (query, i) => {
     await sleep(i * 50); // stagger starts
     const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
     try {
@@ -3665,7 +3673,7 @@ async function poll() {
 
   // Per-poll time budget: if the main scan took too long (>12 min of a 15-min budget),
   // skip canary retries to avoid cascading delays into the next poll.
-  const POLL_BUDGET_MS = 15 * 60 * 1000; // 15 minutes
+  const POLL_BUDGET_MS = 20 * 60 * 1000; // 20 minutes
   const elapsed = Date.now() - scanStart;
   const budgetRemaining = POLL_BUDGET_MS - elapsed;
   if (budgetRemaining < 3 * 60 * 1000) {
@@ -3782,7 +3790,7 @@ export {
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
-  PRIORITY_QUERIES, getQueriesForScan, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
+  PRIORITY_QUERIES, getQueriesForScan, shuffleKeepCanaryFirst, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   FETCH_BLOCKED_PATTERNS, isFetchBlocked, isCostcoBlocked,
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
