@@ -2015,9 +2015,9 @@ async function scrapeCostcoStore() {
   try {
     const scraperPromise = scrapeCostcoOnce(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, null);
+    const result = await withTimeout(scraperPromise, 300000, null);
     if (result === null) {
-      console.warn("[costco] Browser scraper timed out (180s)");
+      console.warn("[costco] Browser scraper timed out (300s)");
       trackHealth("costco", "fail");
       return dedupFound(knownFound);
     }
@@ -2378,9 +2378,9 @@ async function scrapeTotalWineStore(store) {
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page, { skipPreWarm });
     scraperPromise.catch(() => {});
-    const result = await withTimeout(scraperPromise, 180000, null);
+    const result = await withTimeout(scraperPromise, 300000, null);
     if (result === null) {
-      console.warn(`[totalwine:${store.storeId}] Browser timed out (180s)`);
+      console.warn(`[totalwine:${store.storeId}] Browser timed out (300s)`);
       trackHealth("totalwine", "fail");
       return dedupFound(knownFound);
     }
@@ -2713,9 +2713,9 @@ async function scrapeWalmartStore(store) {
   try {
     const scraperPromise = scrapeWalmartViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, null);
+    const result = await withTimeout(scraperPromise, 300000, null);
     if (result === null) {
-      console.warn(`[walmart:${store.storeId}] Browser scraper timed out (180s)`);
+      console.warn(`[walmart:${store.storeId}] Browser scraper timed out (300s)`);
       trackHealth("walmart", "fail");
       return dedupFound(knownFound);
     }
@@ -2895,9 +2895,9 @@ async function scrapeWalgreensStore() {
     try {
       const scraperPromise = scrapeWalgreensViaBrowser(page);
       scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-      const result = await withTimeout(scraperPromise, 180000, null);
+      const result = await withTimeout(scraperPromise, 300000, null);
       if (result === null) {
-        console.warn("[walgreens] Browser scraper timed out (180s)");
+        console.warn("[walgreens] Browser scraper timed out (300s)");
         trackHealth("walgreens", "fail");
         if (attempt === 0) {
           console.warn("[walgreens] Timeout on first attempt — retrying with fresh browser");
@@ -3195,9 +3195,9 @@ async function scrapeSamsClubStore() {
     try {
       const scraperPromise = scrapeSamsClubViaBrowser(page);
       scraperPromise.catch(() => {});
-      const result = await withTimeout(scraperPromise, 180000, null);
+      const result = await withTimeout(scraperPromise, 300000, null);
       if (result === null) {
-        console.warn("[samsclub] Browser scraper timed out (180s)");
+        console.warn("[samsclub] Browser scraper timed out (300s)");
         trackHealth("samsclub", "fail");
         if (attempt === 0) {
           console.warn("[samsclub] Timeout on first attempt — retrying with fresh browser");
@@ -3464,6 +3464,8 @@ async function scrapeSafewayStore(store) {
         headers: {
           "Ocp-Apim-Subscription-Key": SAFEWAY_API_KEY,
           Accept: "application/json",
+          "Origin": "https://www.safeway.com",
+          "Referer": "https://www.safeway.com/",
         },
         signal: AbortSignal.timeout(15000),
       };
@@ -3673,7 +3675,7 @@ async function poll() {
 
   // Per-poll time budget: if the main scan took too long (>12 min of a 15-min budget),
   // skip canary retries to avoid cascading delays into the next poll.
-  const POLL_BUDGET_MS = 20 * 60 * 1000; // 20 minutes
+  const POLL_BUDGET_MS = 25 * 60 * 1000; // 25 minutes
   const elapsed = Date.now() - scanStart;
   const budgetRemaining = POLL_BUDGET_MS - elapsed;
   if (budgetRemaining < 3 * 60 * 1000) {
