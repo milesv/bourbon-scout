@@ -227,18 +227,17 @@ describe("proxy support", () => {
     }
   });
 
-  it("scrapeSafewayStore passes proxy agent on API fetch", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({ primaryProducts: { response: { docs: [] } } }),
-    });
+  it("scrapeSafewayStore passes proxyUrl on API fetch via got-scraping", async () => {
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, JSON.stringify({
+      primaryProducts: { response: { docs: [] } },
+    })));
     await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
-    const safewayCalls = mocks.fetch.mock.calls.filter(
-      ([url]) => typeof url === "string" && url.includes("safeway.com")
+    const safewayCalls = mocks.gotScraping.mock.calls.filter(
+      ([opts]) => opts?.url?.includes("safeway.com")
     );
     expect(safewayCalls.length).toBeGreaterThan(0);
-    for (const [, opts] of safewayCalls) {
-      expect(opts.agent._isProxy).toBe(true);
+    for (const [opts] of safewayCalls) {
+      expect(opts.proxyUrl).toBeTruthy();
     }
   });
 

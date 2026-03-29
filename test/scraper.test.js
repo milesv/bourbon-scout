@@ -2782,16 +2782,17 @@ describe("scrapeKrogerStore", () => {
 // ─── Safeway Scraper ──────────────────────────────────────────────────────────
 
 describe("scrapeSafewayStore", () => {
+  // Safeway now uses got-scraping (Chrome TLS fingerprint) instead of node-fetch.
+  // Helper to create gotScraping mock response with JSON body.
+  const safewayJson = (data) => mockGotResponse(200, JSON.stringify(data));
+
   it("returns products from Safeway API", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        primaryProducts: { response: { docs: [{
-          name: "Weller Special Reserve Bourbon 750ml", inStock: true,
-          url: "/product/weller-sr", price: 32.99,
-        }] } },
-      }),
-    });
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [{
+        name: "Weller Special Reserve Bourbon 750ml", inStock: true,
+        url: "/product/weller-sr", price: 32.99,
+      }] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller).toBeTruthy();
@@ -2800,73 +2801,66 @@ describe("scrapeSafewayStore", () => {
   });
 
   it("filters out-of-stock products", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({ primaryProducts: { response: { docs: [{
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [{
         name: "Weller Special Reserve", inStock: false,
-      }] } } }),
-    });
+      }] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     expect(found).toEqual([]);
   });
 
   it("filters products with undefined/null/0 inStock", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({ primaryProducts: { response: { docs: [
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [
         { name: "Weller Special Reserve", inStock: undefined },
         { name: "Blanton's Gold", inStock: null },
         { name: "Stagg Jr", inStock: 0 },
-      ] } } }),
-    });
+      ] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     expect(found).toEqual([]);
   });
 
   it("accepts inStock === 1 as in-stock (B7)", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({ primaryProducts: { response: { docs: [{
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [{
         name: "Weller Special Reserve Bourbon 750ml", inStock: 1,
         url: "/product/weller-sr", price: 32.99,
-      }] } } }),
-    });
+      }] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
   });
 
   it("rejects truthy-but-not-true/1 inStock values (B7)", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({ primaryProducts: { response: { docs: [
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [
         { name: "Weller Special Reserve", inStock: "yes" },
         { name: "Blanton's Gold", inStock: 2 },
-      ] } } }),
-    });
+      ] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     expect(found).toEqual([]);
   });
 
   it("handles API errors", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    mocks.fetch.mockResolvedValue({ ok: false, status: 500 });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(500, "Server error"));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
   });
 
   it("includes curbside and delivery fulfillment when eligible", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        primaryProducts: { response: { docs: [{
-          name: "Weller Special Reserve Bourbon 750ml", inStock: true,
-          url: "/product/weller-sr", price: 32.99,
-          curbsideEligible: true, deliveryEligible: true,
-          upc: "upc123", pid: "pid456",
-        }] } },
-      }),
-    });
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [{
+        name: "Weller Special Reserve Bourbon 750ml", inStock: true,
+        url: "/product/weller-sr", price: 32.99,
+        curbsideEligible: true, deliveryEligible: true,
+        upc: "upc123", pid: "pid456",
+      }] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller.fulfillment).toContain("Curbside");
@@ -2874,14 +2868,11 @@ describe("scrapeSafewayStore", () => {
   });
 
   it("handles products with productTitle fallback and missing url/price", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        primaryProducts: { response: { docs: [{
-          productTitle: "Weller Special Reserve Bourbon", inStock: true,
-        }] } },
-      }),
-    });
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [{
+        productTitle: "Weller Special Reserve Bourbon", inStock: true,
+      }] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller).toBeTruthy();
@@ -2891,14 +2882,13 @@ describe("scrapeSafewayStore", () => {
   });
 
   it("includes Ocp-Apim-Subscription-Key header", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({ primaryProducts: { response: { docs: [] } } }),
-    });
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [] } },
+    }));
     await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
-    expect(mocks.fetch).toHaveBeenCalledWith(
-      expect.stringContaining("safeway.com"),
+    expect(mocks.gotScraping).toHaveBeenCalledWith(
       expect.objectContaining({
+        url: expect.stringContaining("safeway.com"),
         headers: expect.objectContaining({ "Ocp-Apim-Subscription-Key": "test-safeway-key" }),
       })
     );
@@ -4161,32 +4151,27 @@ describe("truncateTitle (#8, #13)", () => {
 });
 
 describe("Safeway price formatting (#7)", () => {
+  const safewayJson = (data) => mockGotResponse(200, JSON.stringify(data));
+
   it("formats price to 2 decimal places", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        primaryProducts: { response: { docs: [{
-          name: "Weller Special Reserve Bourbon 750ml", inStock: true,
-          url: "/product/weller-sr", price: 33,
-        }] } },
-      }),
-    });
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [{
+        name: "Weller Special Reserve Bourbon 750ml", inStock: true,
+        url: "/product/weller-sr", price: 33,
+      }] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
-    // Should be "$33.00", not "$33"
     expect(weller.price).toBe("$33.00");
   });
 
   it("formats fractional price correctly", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        primaryProducts: { response: { docs: [{
-          name: "Weller Special Reserve Bourbon 750ml", inStock: true,
-          url: "/product/weller-sr", price: 32.5,
-        }] } },
-      }),
-    });
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [{
+        name: "Weller Special Reserve Bourbon 750ml", inStock: true,
+        url: "/product/weller-sr", price: 32.5,
+      }] } },
+    }));
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller.price).toBe("$32.50");
@@ -4298,53 +4283,43 @@ describe("Kroger null inventory false-positive prevention", () => {
 });
 
 describe("Safeway page-2 pagination", () => {
+  const safewayJson = (data) => mockGotResponse(200, JSON.stringify(data));
+
   it("fetches page 2 when first page returns exactly 50 results", async () => {
-    // 50 non-matching products on page 1 triggers pagination
     const page1Docs = Array.from({ length: 50 }, (_, i) => ({
       name: `Random Product ${i}`, inStock: true, price: 10, url: `/p/${i}`,
     }));
-    // Page 2 has a matching bottle
     const page2Docs = [{
       name: "Weller Special Reserve Bourbon 750ml", inStock: true,
       url: "/product/weller-sr", price: 29.99, upc: "upc-weller",
     }];
 
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url.includes("start=50")) {
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({ primaryProducts: { response: { docs: page2Docs } } }),
-        });
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url?.includes("start=50")) {
+        return Promise.resolve(safewayJson({ primaryProducts: { response: { docs: page2Docs } } }));
       }
-      return Promise.resolve({
-        ok: true,
-        json: async () => ({ primaryProducts: { response: { docs: page1Docs } } }),
-      });
+      return Promise.resolve(safewayJson({ primaryProducts: { response: { docs: page1Docs } } }));
     });
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller).toBeTruthy();
     expect(weller.price).toBe("$29.99");
-    // Verify page 2 was fetched
-    const page2Calls = mocks.fetch.mock.calls.filter(
-      (c) => typeof c[0] === "string" && c[0].includes("start=50")
+    const page2Calls = mocks.gotScraping.mock.calls.filter(
+      (c) => c[0]?.url?.includes("start=50")
     );
     expect(page2Calls.length).toBeGreaterThan(0);
   });
 
   it("does not fetch page 2 when results are under 50", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        primaryProducts: { response: { docs: [{
-          name: "Weller Special Reserve Bourbon 750ml", inStock: true,
-          url: "/product/weller-sr", price: 32.99,
-        }] } },
-      }),
-    });
+    mocks.gotScraping.mockResolvedValue(safewayJson({
+      primaryProducts: { response: { docs: [{
+        name: "Weller Special Reserve Bourbon 750ml", inStock: true,
+        url: "/product/weller-sr", price: 32.99,
+      }] } },
+    }));
     await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
-    const page2Calls = mocks.fetch.mock.calls.filter(
-      (c) => typeof c[0] === "string" && c[0].includes("start=50")
+    const page2Calls = mocks.gotScraping.mock.calls.filter(
+      (c) => c[0]?.url?.includes("start=50")
     );
     expect(page2Calls.length).toBe(0);
   });
@@ -4353,16 +4328,12 @@ describe("Safeway page-2 pagination", () => {
     const page1Docs = Array.from({ length: 50 }, (_, i) => ({
       name: `Random Product ${i}`, inStock: true, price: 10, url: `/p/${i}`,
     }));
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url.includes("start=50")) {
-        return Promise.resolve({ ok: false, status: 500 });
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url?.includes("start=50")) {
+        return Promise.resolve(mockGotResponse(500, "Server error"));
       }
-      return Promise.resolve({
-        ok: true,
-        json: async () => ({ primaryProducts: { response: { docs: page1Docs } } }),
-      });
+      return Promise.resolve(safewayJson({ primaryProducts: { response: { docs: page1Docs } } }));
     });
-    // Should not throw — page 2 failure is silently handled
     const found = await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
     expect(found).toEqual([]);
   });

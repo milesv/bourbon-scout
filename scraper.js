@@ -3486,19 +3486,17 @@ async function scrapeSafewayStore(store) {
     await sleep(i * 50); // stagger starts
     const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
     try {
-      const safewayOpts = {
-        headers: {
-          "Ocp-Apim-Subscription-Key": SAFEWAY_API_KEY,
-          Accept: "application/json",
-          "User-Agent": FETCH_HEADERS["User-Agent"],
-          "Origin": "https://www.safeway.com",
-          "Referer": "https://www.safeway.com/",
-        },
-        signal: AbortSignal.timeout(15000),
+      // Use got-scraping (Chrome TLS fingerprint) — Safeway's Azure APIM rejects
+      // node-fetch's TLS handshake with 403. Same pattern as other fetch scrapers.
+      const safewayHeaders = {
+        "Ocp-Apim-Subscription-Key": SAFEWAY_API_KEY,
+        Accept: "application/json",
+        "User-Agent": FETCH_HEADERS["User-Agent"],
+        "Origin": "https://www.safeway.com",
+        "Referer": "https://www.safeway.com/",
       };
-      const safewayAgent = getRetailerProxy("safeway");
-      if (safewayAgent) safewayOpts.agent = safewayAgent;
-      const res = await fetchRetry(url, safewayOpts);
+      const safewayProxy = getRetailerProxyUrl("safeway");
+      const res = await scraperFetchRetry(url, { headers: safewayHeaders, timeout: 15000, proxyUrl: safewayProxy || undefined });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const products = data?.primaryProducts?.response?.docs || [];
@@ -3509,8 +3507,7 @@ async function scrapeSafewayStore(store) {
       if (products.length === 50) {
         try {
           const page2Url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
-          const page2Opts = { ...safewayOpts, signal: AbortSignal.timeout(15000) };
-          const res2 = await fetchRetry(page2Url, page2Opts);
+          const res2 = await scraperFetchRetry(page2Url, { headers: safewayHeaders, timeout: 15000, proxyUrl: safewayProxy || undefined });
           if (res2.ok) {
             const data2 = await res2.json();
             matchSafewayProducts(data2?.primaryProducts?.response?.docs || []);
