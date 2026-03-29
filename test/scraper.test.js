@@ -5679,9 +5679,9 @@ describe("Kroger OAuth failure health tracking", () => {
 // ─── KROGER_PRODUCTS direct lookup ───────────────────────────────────────────
 
 describe("KROGER_PRODUCTS", () => {
-  it("contains 25 allocated bottles plus canary", () => {
+  it("contains 27 allocated bottles plus canary", () => {
     const entries = Object.entries(KROGER_PRODUCTS);
-    expect(entries.length).toBe(25);
+    expect(entries.length).toBe(27);
     expect(KROGER_PRODUCTS["Buffalo Trace"]).toBeDefined(); // canary
   });
 
