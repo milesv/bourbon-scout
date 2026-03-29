@@ -331,6 +331,7 @@ const SEED_PRODUCT_URLS = {
     { name: "Pappy Van Winkle 12 Year", url: "https://www.walmart.com/ip/ORVW-SR-12YR-BBN-750ML-90-4PF/167382862" },
     { name: "Pappy Van Winkle 15 Year", url: "https://www.walmart.com/ip/Pappy-Van-Winkle-s-15-Years-Old-Family-Reserve-Kentucky-Straight-Bourbon-Whiskey-750ml-107-Proof/46707130" },
     { name: "Pappy Van Winkle 20 Year", url: "https://www.walmart.com/ip/Pappy-Van-Winkle-s-Family-Reserve-20-Years-Old-Kentucky-Straight-Bourbon-Whiskey-750ml-90-4-Proof/46707131" },
+    { name: "Jack Daniel's 10 Year", url: "https://www.walmart.com/ip/Jack-Daniel-s-10-Years-Old-Tennessee-Whiskey-700-ml-Bottle/2877322440" },
   ],
   totalwine: [
     { name: "Buffalo Trace", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/buffalo-trace-kentucky-straight-bourbon-whiskey/p/102882750" },
@@ -359,6 +360,9 @@ const SEED_PRODUCT_URLS = {
     { name: "Pappy Van Winkle 23 Year", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/pappy-van-winkle-family-reserve-23-year-bourbon/p/106282750" },
     { name: "Van Winkle Family Reserve Rye", url: "https://www.totalwine.com/spirits/american-whiskey/rye-whiskey/van-winkle-family-reserve-13-year-rye/p/109168750" },
     { name: "Rock Hill Farms", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/rock-hill-farms-bourbon/p/5343750" },
+    { name: "Jack Daniel's 10 Year", url: "https://www.totalwine.com/spirits/american-whiskey/tennessee-whiskey/jack-daniels-10-year-tennessee-whiskey/p/2126220956" },
+    { name: "Jack Daniel's 12 Year", url: "https://www.totalwine.com/spirits/american-whiskey/tennessee-whiskey/jack-daniels-12-yr/p/2126220955" },
+    { name: "Jack Daniel's 14 Year", url: "https://www.totalwine.com/spirits/american-whiskey/jack-daniels-14-year-tennessee-whiskey/p/2126261899" },
   ],
 };
 
