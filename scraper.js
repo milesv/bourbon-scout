@@ -554,10 +554,20 @@ function buildWatchListEmbed(entry) {
     .map((s) => `📍 ${s.name} (#${s.storeId}) — ${s.address}`)
     .join("\n");
   const storeList = storeNames || entry.stores.map((id) => `Store #${id}`).join(", ");
+
+  // When no specific bottle, list all allocated bottles tracked at this retailer
+  let bottleSection = "";
+  if (!entry.bottle) {
+    const retailerBottles = TARGET_BOTTLES
+      .filter((b) => !b.canary && (!b.retailers || b.retailers.includes(entry.retailer)))
+      .map((b) => b.name);
+    bottleSection = `\n\n🥃 **Bottles to watch for (${retailerBottles.length}):**\n${retailerBottles.join(", ")}`;
+  }
+
   return {
     title: truncateTitle(`🔔 INTEL — ${entry.bottle || "Allocated Bourbon"} rumored at ${retailerName}`),
     description: truncateDescription(
-      `${storeList}\n\n📋 **Source:** ${entry.source || "Unknown"}\n📅 **Date:** ${entry.date || "N/A"}\n\n_Adjust scan frequency if you want to increase monitoring._`
+      `${storeList}\n\n📋 **Source:** ${entry.source || "Unknown"}\n📅 **Date:** ${entry.date || "N/A"}${bottleSection}\n\n_Adjust scan frequency if you want to increase monitoring._`
     ),
     color: COLORS.rumor,
     timestamp: new Date().toISOString(),
