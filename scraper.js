@@ -1233,7 +1233,7 @@ async function fetchRetry(url, opts) {
 // Uses Chrome cipher suites + HTTP/2 to defeat Akamai/PerimeterX TLS fingerprinting that
 // trivially identifies node-fetch's Node.js JA3 hash regardless of HTTP header spoofing.
 // node-fetch is still used for Discord webhooks and API endpoints (no bot detection there).
-async function scraperFetch(url, { headers, timeout = 15000, proxyUrl, redirect } = {}) {
+async function scraperFetch(url, { headers, timeout = 15000, proxyUrl, redirect, method, body } = {}) {
   const gotOpts = {
     url,
     headers: headers || {},
@@ -1244,6 +1244,8 @@ async function scraperFetch(url, { headers, timeout = 15000, proxyUrl, redirect 
     retry: { limit: 0 }, // We handle retries ourselves via scraperFetchRetry
   };
   if (proxyUrl) gotOpts.proxyUrl = proxyUrl;
+  if (method) gotOpts.method = method;
+  if (body) gotOpts.body = body;
   const response = await gotScraping(gotOpts);
   const statusCode = response.statusCode;
   // Detect proxy quota exhaustion — attempt failover to backup proxy
