@@ -3417,15 +3417,15 @@ async function getKrogerToken() {
   if (!krogerTokenPromise) {
     krogerTokenPromise = (async () => {
       const authHeader = Buffer.from(`${KROGER_CLIENT_ID}:${KROGER_CLIENT_SECRET}`).toString("base64");
-      const tokenOpts = {
+      // Use got-scraping for Chrome TLS fingerprint — Kroger's API gateway rejects node-fetch's TLS
+      const krogerProxy = getRetailerProxyUrl("kroger");
+      const res = await scraperFetchRetry("https://api.kroger.com/v1/connect/oauth2/token", {
         method: "POST",
         headers: { Authorization: `Basic ${authHeader}`, "Content-Type": "application/x-www-form-urlencoded" },
         body: "grant_type=client_credentials&scope=product.compact",
-        signal: AbortSignal.timeout(15000),
-      };
-      const krogerAgent = getRetailerProxy("kroger");
-      if (krogerAgent) tokenOpts.agent = krogerAgent;
-      const res = await fetchRetry("https://api.kroger.com/v1/connect/oauth2/token", tokenOpts);
+        timeout: 15000,
+        proxyUrl: krogerProxy || undefined,
+      });
       if (!res.ok) throw new Error(`OAuth HTTP ${res.status}`);
       krogerToken = (await res.json()).access_token;
       return krogerToken;
@@ -3472,19 +3472,18 @@ const KROGER_PRODUCTS = {
 async function checkKrogerKnownProducts(store, token) {
   const found = [];
   const entries = Object.entries(KROGER_PRODUCTS);
-  const krogerAgent = getRetailerProxy("kroger");
 
   // Run in parallel batches of 5 (API-key auth, no bot detection risk)
   await Promise.all(entries.map(async ([bottleName, productId], i) => {
     await sleep(i * 50); // stagger starts
     try {
       const url = `https://api.kroger.com/v1/products/${productId}?filter.locationId=${store.storeId}`;
-      const opts = {
+      const krogerDirectProxy = getRetailerProxyUrl("kroger");
+      const res = await scraperFetchRetry(url, {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-        signal: AbortSignal.timeout(10000),
-      };
-      if (krogerAgent) opts.agent = krogerAgent;
-      const res = await fetchRetry(url, opts);
+        timeout: 10000,
+        proxyUrl: krogerDirectProxy || undefined,
+      });
       if (!res.ok) return;
       const data = await res.json();
       const product = data.data;
@@ -3572,13 +3571,13 @@ async function scrapeKrogerStore(store) {
     await sleep(i * 50); // stagger starts to avoid thundering herd
     const baseUrl = `https://api.kroger.com/v1/products?filter.term=${encodeURIComponent(query)}&filter.locationId=${store.storeId}&filter.limit=50`;
     try {
-      const krogerOpts = {
+      // Use got-scraping for Chrome TLS fingerprint — Kroger's API gateway rejects node-fetch
+      const krogerProxy2 = getRetailerProxyUrl("kroger");
+      const res = await scraperFetchRetry(baseUrl, {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-        signal: AbortSignal.timeout(15000),
-      };
-      const krogerAgent2 = getRetailerProxy("kroger");
-      if (krogerAgent2) krogerOpts.agent = krogerAgent2;
-      const res = await fetchRetry(baseUrl, krogerOpts);
+        timeout: 15000,
+        proxyUrl: krogerProxy2 || undefined,
+      });
       // Clear cached token on 401 so next call re-authenticates
       if (res.status === 401) { krogerToken = null; throw new Error("Token expired (401)"); }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -3589,8 +3588,11 @@ async function scrapeKrogerStore(store) {
       // Isolated try/catch: page 2 failure shouldn't lose page 1 data or mark query as failed.
       if (data.data?.length === 50) {
         try {
-          const page2Opts = { ...krogerOpts, signal: AbortSignal.timeout(15000) };
-          const res2 = await fetchRetry(`${baseUrl}&filter.start=50`, page2Opts);
+          const res2 = await scraperFetchRetry(`${baseUrl}&filter.start=50`, {
+            headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+            timeout: 15000,
+            proxyUrl: krogerProxy2 || undefined,
+          });
           if (res2.ok) {
             const data2 = await res2.json();
             matchKrogerProducts(data2.data || []);

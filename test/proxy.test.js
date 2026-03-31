@@ -202,28 +202,24 @@ describe("proxy support", () => {
     delete process.env.CI;
   });
 
-  it("getKrogerToken passes proxy agent on OAuth fetch", async () => {
-    mocks.fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "proxy-token" }) });
+  it("getKrogerToken passes proxyUrl on OAuth fetch via got-scraping", async () => {
+    mocks.gotScraping.mockResolvedValueOnce(mockGotResponse(200, JSON.stringify({ access_token: "proxy-token" })));
     await getKrogerToken();
-    const oauthCall = mocks.fetch.mock.calls.find(
-      ([url]) => typeof url === "string" && url.includes("oauth2/token")
-    );
-    expect(oauthCall).toBeTruthy();
-    expect(oauthCall[1].agent._isProxy).toBe(true);
+    const oauthCalls = mocks.gotScraping.mock.calls.filter(([opts]) => opts?.url?.includes("oauth2/token"));
+    expect(oauthCalls.length).toBeGreaterThan(0);
+    expect(oauthCalls[0][0].proxyUrl).toBeTruthy();
   });
 
-  it("scrapeKrogerStore passes proxy agent on API fetch", async () => {
+  it("scrapeKrogerStore passes proxyUrl on API fetch via got-scraping", async () => {
     _resetKrogerToken();
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
-      .mockResolvedValue({ ok: true, json: async () => ({ data: [] }) });
+    mocks.gotScraping
+      .mockResolvedValueOnce(mockGotResponse(200, JSON.stringify({ access_token: "tk" })))
+      .mockResolvedValue(mockGotResponse(200, JSON.stringify({ data: [] })));
     await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
-    const apiCalls = mocks.fetch.mock.calls.filter(
-      ([url]) => typeof url === "string" && url.includes("api.kroger.com/v1/products")
-    );
+    const apiCalls = mocks.gotScraping.mock.calls.filter(([opts]) => opts?.url?.includes("api.kroger.com/v1/products"));
     expect(apiCalls.length).toBeGreaterThan(0);
-    for (const [, opts] of apiCalls) {
-      expect(opts.agent._isProxy).toBe(true);
+    for (const [opts] of apiCalls) {
+      expect(opts.proxyUrl).toBeTruthy();
     }
   });
 

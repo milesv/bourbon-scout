@@ -2624,35 +2624,36 @@ describe("scrapeWalmartStore", () => {
 
 describe("getKrogerToken", () => {
   it("fetches and caches OAuth token", async () => {
-    mocks.fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "test-token-abc" }) });
+    mocks.gotScraping.mockResolvedValueOnce(mockGotResponse(200, JSON.stringify({ access_token: "test-token-abc" })));
     const token = await getKrogerToken();
     expect(token).toBe("test-token-abc");
     // Second call uses cache
     const token2 = await getKrogerToken();
     expect(token2).toBe("test-token-abc");
-    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    const oauthCalls = mocks.gotScraping.mock.calls.filter(([opts]) => opts?.url?.includes("oauth2/token"));
+    expect(oauthCalls.length).toBe(1);
   });
 
   it("throws on OAuth failure", async () => {
     _resetKrogerToken();
-    mocks.fetch.mockResolvedValueOnce({ ok: false, status: 401 });
+    mocks.gotScraping.mockResolvedValueOnce(mockGotResponse(401));
     await expect(getKrogerToken()).rejects.toThrow("OAuth HTTP 401");
   });
 });
 
 describe("scrapeKrogerStore", () => {
+  // Kroger now uses got-scraping (Chrome TLS fingerprint) instead of node-fetch.
+  const krogerJson = (data) => mockGotResponse(200, JSON.stringify(data));
+
   it("returns products from Kroger API", async () => {
     _resetKrogerToken();
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "kr-token" }) })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({ data: [{
-          description: "Weller Special Reserve Bourbon 750ml",
-          items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 } }],
-          productId: "0001234",
-        }] }),
-      });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "kr-token" }))
+      .mockResolvedValue(krogerJson({ data: [{
+        description: "Weller Special Reserve Bourbon 750ml",
+        items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 } }],
+        productId: "0001234",
+      }] }));
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
   });
@@ -2660,7 +2661,7 @@ describe("scrapeKrogerStore", () => {
   it("returns empty when OAuth fails", async () => {
     _resetKrogerToken();
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    mocks.fetch.mockResolvedValueOnce({ ok: false, status: 500 });
+    mocks.gotScraping.mockResolvedValueOnce(mockGotResponse(500));
     expect(await scrapeKrogerStore(TEST_STORE)).toEqual([]);
     consoleSpy.mockRestore();
   });
@@ -2668,9 +2669,9 @@ describe("scrapeKrogerStore", () => {
   it("handles API error on product search", async () => {
     _resetKrogerToken();
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
-      .mockResolvedValue({ ok: false, status: 500 });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "tk" }))
+      .mockResolvedValue(mockGotResponse(500));
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     expect(found).toEqual([]);
     consoleSpy.mockRestore();
@@ -2678,34 +2679,28 @@ describe("scrapeKrogerStore", () => {
 
   it("filters out-of-stock products", async () => {
     _resetKrogerToken();
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({ data: [{
-          description: "Weller Special Reserve",
-          items: [{ fulfillment: { inStore: false }, inventory: { stockLevel: "TEMPORARILY_OUT_OF_STOCK" } }],
-        }] }),
-      });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "tk" }))
+      .mockResolvedValue(krogerJson({ data: [{
+        description: "Weller Special Reserve",
+        items: [{ fulfillment: { inStore: false }, inventory: { stockLevel: "TEMPORARILY_OUT_OF_STOCK" } }],
+      }] }));
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     expect(found).toEqual([]);
   });
 
   it("prefers in-stock item variant for price over items[0]", async () => {
     _resetKrogerToken();
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({ data: [{
-          description: "Weller Special Reserve Bourbon 750ml",
-          productId: "0001234",
-          items: [
-            { fulfillment: { inStore: false, shipToHome: true }, inventory: { stockLevel: "LOW" }, price: { regular: 99.99 }, size: "1.75L" },
-            { fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" },
-          ],
-        }] }),
-      });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "tk" }))
+      .mockResolvedValue(krogerJson({ data: [{
+        description: "Weller Special Reserve Bourbon 750ml",
+        productId: "0001234",
+        items: [
+          { fulfillment: { inStore: false, shipToHome: true }, inventory: { stockLevel: "LOW" }, price: { regular: 99.99 }, size: "1.75L" },
+          { fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" },
+        ],
+      }] }));
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller).toBeTruthy();
@@ -2715,16 +2710,13 @@ describe("scrapeKrogerStore", () => {
 
   it("uses promo price when available (B5)", async () => {
     _resetKrogerToken();
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({ data: [{
-          description: "Weller Special Reserve Bourbon 750ml",
-          productId: "0001234",
-          items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99, promo: 24.99 }, size: "750ml" }],
-        }] }),
-      });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "tk" }))
+      .mockResolvedValue(krogerJson({ data: [{
+        description: "Weller Special Reserve Bourbon 750ml",
+        productId: "0001234",
+        items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99, promo: 24.99 }, size: "750ml" }],
+      }] }));
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller).toBeTruthy();
@@ -2733,16 +2725,13 @@ describe("scrapeKrogerStore", () => {
 
   it("includes ship-to-home fulfillment when available", async () => {
     _resetKrogerToken();
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({ data: [{
-          description: "Weller Special Reserve Bourbon 750ml",
-          productId: "0001234",
-          items: [{ fulfillment: { inStore: true, shipToHome: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" }],
-        }] }),
-      });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "tk" }))
+      .mockResolvedValue(krogerJson({ data: [{
+        description: "Weller Special Reserve Bourbon 750ml",
+        productId: "0001234",
+        items: [{ fulfillment: { inStore: true, shipToHome: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" }],
+      }] }));
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller.fulfillment).toContain("In-store");
@@ -2751,16 +2740,13 @@ describe("scrapeKrogerStore", () => {
 
   it("handles products without price or size", async () => {
     _resetKrogerToken();
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({ data: [{
-          description: "Weller Special Reserve Bourbon",
-          productId: "0001234",
-          items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" } }],
-        }] }),
-      });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "tk" }))
+      .mockResolvedValue(krogerJson({ data: [{
+        description: "Weller Special Reserve Bourbon",
+        productId: "0001234",
+        items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" } }],
+      }] }));
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     const weller = found.find((f) => f.name === "Weller Special Reserve");
     expect(weller).toBeTruthy();
@@ -2771,9 +2757,9 @@ describe("scrapeKrogerStore", () => {
   it("clears cached token on 401 and logs error", async () => {
     _resetKrogerToken();
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "expired-token" }) })
-      .mockResolvedValue({ ok: false, status: 401 });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "expired-token" }))
+      .mockResolvedValue(mockGotResponse(401));
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
     expect(found).toEqual([]);
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Token expired"));
@@ -4001,59 +3987,40 @@ describe("matchTotalWineInitialState stock signal tightening", () => {
 // ─── Kroger Pagination ───────────────────────────────────────────────────────
 
 describe("scrapeKrogerStore pagination", () => {
+  const krogerJson = (data) => mockGotResponse(200, JSON.stringify(data));
+
   it("fetches page 2 when first page returns exactly 50 results", async () => {
     _resetKrogerToken();
-    // Generate 50 non-matching products for page 1 + 1 matching product on page 2
     const page1Data = Array.from({ length: 50 }, (_, i) => ({
-      description: `Random Product ${i}`,
-      productId: `p${i}`,
+      description: `Random Product ${i}`, productId: `p${i}`,
       items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 10 } }],
     }));
     const page2Data = [{
-      description: "Weller Special Reserve Bourbon 750ml",
-      productId: "p-weller",
+      description: "Weller Special Reserve Bourbon 750ml", productId: "p-weller",
       items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" }],
     }];
 
-    let queryCallCount = 0;
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url.includes("oauth2/token")) {
-        return Promise.resolve({ ok: true, json: async () => ({ access_token: "tk" }) });
-      }
-      if (typeof url === "string" && url.includes("filter.start=50")) {
-        // Page 2 call
-        return Promise.resolve({ ok: true, json: async () => ({ data: page2Data }) });
-      }
-      // Page 1 call
-      queryCallCount++;
-      return Promise.resolve({ ok: true, json: async () => ({ data: page1Data }) });
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url?.includes("oauth2/token")) return Promise.resolve(krogerJson({ access_token: "tk" }));
+      if (opts?.url?.includes("filter.start=50")) return Promise.resolve(krogerJson({ data: page2Data }));
+      return Promise.resolve(krogerJson({ data: page1Data }));
     });
     const found = await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
-    const weller = found.find((f) => f.name === "Weller Special Reserve");
-    expect(weller).toBeTruthy();
-    // Verify page 2 was actually fetched (at least one call with filter.start=50)
-    const page2Calls = mocks.fetch.mock.calls.filter(
-      (c) => typeof c[0] === "string" && c[0].includes("filter.start=50")
-    );
+    expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
+    const page2Calls = mocks.gotScraping.mock.calls.filter(([opts]) => opts?.url?.includes("filter.start=50"));
     expect(page2Calls.length).toBeGreaterThan(0);
   });
 
   it("does not fetch page 2 when results are under 50", async () => {
     _resetKrogerToken();
-    mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tk" }) })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({ data: [{
-          description: "Weller Special Reserve Bourbon 750ml",
-          productId: "0001234",
-          items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 } }],
-        }] }),
-      });
+    mocks.gotScraping
+      .mockResolvedValueOnce(krogerJson({ access_token: "tk" }))
+      .mockResolvedValue(krogerJson({ data: [{
+        description: "Weller Special Reserve Bourbon 750ml", productId: "0001234",
+        items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 } }],
+      }] }));
     await runWithFakeTimers(() => scrapeKrogerStore(TEST_STORE));
-    const page2Calls = mocks.fetch.mock.calls.filter(
-      (c) => typeof c[0] === "string" && c[0].includes("filter.start=50")
-    );
+    const page2Calls = mocks.gotScraping.mock.calls.filter(([opts]) => opts?.url?.includes("filter.start=50"));
     expect(page2Calls.length).toBe(0);
   });
 });
@@ -5610,19 +5577,18 @@ describe("Kroger OAuth retry", () => {
 
   it("retries OAuth token fetch on network error", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // First call fails (network error), second succeeds (fetchRetry behavior)
     let callCount = 0;
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url.includes("oauth2/token")) {
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url?.includes("oauth2/token")) {
         callCount++;
         if (callCount === 1) return Promise.reject(new Error("DNS timeout"));
-        return Promise.resolve({ ok: true, json: async () => ({ access_token: "tok123" }) });
+        return Promise.resolve(mockGotResponse(200, JSON.stringify({ access_token: "tok123" })));
       }
-      return Promise.resolve({ ok: true });
+      return Promise.resolve(mockGotResponse(200, ""));
     });
     const token = await runWithFakeTimers(() => getKrogerToken());
     expect(token).toBe("tok123");
-    expect(callCount).toBe(2); // First failed, second succeeded via fetchRetry
+    expect(callCount).toBe(2);
     warnSpy.mockRestore();
   });
 });
@@ -5638,8 +5604,8 @@ describe("Kroger OAuth failure health tracking", () => {
   it("tracks 'fail' health when OAuth token fetch fails completely", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
-    // Both fetchRetry attempts fail (no valid token)
-    mocks.fetch.mockRejectedValue(new Error("Network down"));
+    // Both scraperFetchRetry attempts fail (no valid token)
+    mocks.gotScraping.mockRejectedValue(new Error("Network down"));
     const store = { storeId: "kr1", name: "Test Kroger" };
     const result = await runWithFakeTimers(() => scrapeKrogerStore(store));
     expect(result).toEqual([]);
@@ -5690,25 +5656,21 @@ describe("checkKrogerKnownProducts", () => {
   });
 
   it("returns found bottles when API returns in-stock products", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true, status: 200,
-      json: async () => ({
-        data: {
-          description: "Blanton's Single Barrel Bourbon",
-          productId: "0008024400203",
-          items: [{
-            fulfillment: { inStore: true },
-            inventory: { stockLevel: "HIGH" },
-            price: { regular: 64.99, promo: null },
-            size: "750 ml",
-          }],
-        },
-      }),
-    });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, JSON.stringify({
+      data: {
+        description: "Blanton's Single Barrel Bourbon",
+        productId: "0008024400203",
+        items: [{
+          fulfillment: { inStore: true },
+          inventory: { stockLevel: "HIGH" },
+          price: { regular: 64.99, promo: null },
+          size: "750 ml",
+        }],
+      },
+    })));
     const store = { storeId: "kr1", name: "Fry's Tempe" };
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const found = await runWithFakeTimers(() => checkKrogerKnownProducts(store, "test-token"));
-    // Should find multiple bottles (each API call returns the same mock)
     expect(found.length).toBeGreaterThan(0);
     expect(found[0]).toHaveProperty("name");
     expect(found[0]).toHaveProperty("url");
@@ -5718,27 +5680,24 @@ describe("checkKrogerKnownProducts", () => {
   });
 
   it("returns empty when all products are out of stock", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true, status: 200,
-      json: async () => ({
-        data: {
-          description: "Blanton's",
-          productId: "0008024400203",
-          items: [{
-            fulfillment: { inStore: true },
-            inventory: { stockLevel: "TEMPORARILY_OUT_OF_STOCK" },
-            price: { regular: 64.99 },
-          }],
-        },
-      }),
-    });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, JSON.stringify({
+      data: {
+        description: "Blanton's",
+        productId: "0008024400203",
+        items: [{
+          fulfillment: { inStore: true },
+          inventory: { stockLevel: "TEMPORARILY_OUT_OF_STOCK" },
+          price: { regular: 64.99 },
+        }],
+      },
+    })));
     const store = { storeId: "kr1", name: "Fry's" };
     const found = await runWithFakeTimers(() => checkKrogerKnownProducts(store, "test-token"));
     expect(found).toEqual([]);
   });
 
   it("handles API errors gracefully", async () => {
-    mocks.fetch.mockRejectedValue(new Error("Network error"));
+    mocks.gotScraping.mockRejectedValue(new Error("Network error"));
     const store = { storeId: "kr1", name: "Fry's" };
     const found = await runWithFakeTimers(() => checkKrogerKnownProducts(store, "test-token"));
     expect(found).toEqual([]);
@@ -5756,16 +5715,15 @@ describe("Kroger page 2 failure isolation", () => {
   it("keeps page 1 results when page 2 json() throws", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
-    // Mock OAuth token
     let tokenFetched = false;
-    mocks.fetch.mockImplementation((url) => {
-      if (typeof url === "string" && url.includes("oauth2/token")) {
+    mocks.gotScraping.mockImplementation((opts) => {
+      if (opts?.url?.includes("oauth2/token")) {
         tokenFetched = true;
-        return Promise.resolve({ ok: true, json: async () => ({ access_token: "tok" }) });
+        return Promise.resolve(mockGotResponse(200, JSON.stringify({ access_token: "tok" })));
       }
-      if (typeof url === "string" && url.includes("filter.start=50")) {
-        // Page 2 returns 200 but malformed JSON
-        return Promise.resolve({ ok: true, status: 200, json: async () => { throw new Error("Malformed JSON"); } });
+      if (opts?.url?.includes("filter.start=50")) {
+        // Page 2 returns malformed body that fails JSON.parse
+        return Promise.resolve(mockGotResponse(200, "not valid json{{{"));
       }
       // Page 1 returns exactly 50 items (triggers page 2 fetch)
       const items = Array.from({ length: 50 }, (_, i) => ({
@@ -5773,15 +5731,13 @@ describe("Kroger page 2 failure isolation", () => {
         productId: `prod${i}`,
         items: [{ fulfillment: { inStore: true }, inventory: { stockLevel: "HIGH" }, price: { regular: 29.99 }, size: "750ml" }],
       }));
-      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: items }) });
+      return Promise.resolve(mockGotResponse(200, JSON.stringify({ data: items })));
     });
     const store = { storeId: "kr1", name: "Test Kroger" };
     const result = await runWithFakeTimers(() => scrapeKrogerStore(store));
     expect(tokenFetched).toBe(true);
-    // Page 1 results should be preserved despite page 2 failure
     expect(result.length).toBeGreaterThan(0);
     expect(result.some(b => b.name === "Weller Special Reserve")).toBe(true);
-    // Health should show "ok" (page 1 succeeded) not "fail"
     const health = _getScraperHealth();
     expect(health.kroger?.succeeded).toBeGreaterThan(0);
     warnSpy.mockRestore();
