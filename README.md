@@ -27,6 +27,8 @@ Some bottles are retailer-restricted (e.g., Michter's 10 Year and Penelope only 
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
 4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@here` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators and a 24h trend (per-retailer success rate, canary hit rate, bottles found). Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 5. **Scan Metrics** — Appends one JSON line per scan to `metrics.jsonl` with per-retailer health stats, canary hits, bottles found, and duration. Enables historical trend analysis: retailer reliability over time, drop patterns, proxy ROI.
+6. **Reddit Intel** — Monitors r/ArizonaWhiskey and r/arizonabourbon for community-reported drops. Posts matching bottle names, store names, or drop keywords (kok, btac, pappy, allocated, drop, etc.) trigger @here gold Discord embeds with post details and links. No proxy or auth needed — uses Reddit's public JSON API.
+7. **Watch List** — Manual human intelligence system for rumored drops. Add entries to `WATCH_LIST` in scraper.js with retailer, store IDs, and source info. Triggers a one-time @here gold Discord notification listing all tracked bottles at that retailer. For tips from private Facebook groups, phone calls, or store visits.
 
 ## Setup
 
@@ -144,7 +146,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-748 tests across 5 files using [Vitest](https://vitest.dev/) (90.1% line coverage, 80.4% branch):
+762 tests across 5 files using [Vitest](https://vitest.dev/) (90.1% line coverage, 80.4% branch):
 
 ```sh
 npm test                # Run all tests
@@ -153,7 +155,7 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 606 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling ($500), all 7 scrapers, Discord embeds (re-alert/OOS/health emoji/canary/trend), poll orchestration, error isolation, health tracking, scan metrics/trends, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage (Old Rip/Colonel/SFB), parseSize liter/litre, normalizeText unicode, truncateDescription OOS, dedupFound N/A, shuffle/withTimeout/runWithConcurrency edges, peak hour formatting |
+| `test/scraper.test.js` | 614 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling ($500), all 7 scrapers, Discord embeds (re-alert/OOS/health emoji/canary/trend), poll orchestration, error isolation, health tracking, scan metrics/trends, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage (Old Rip/Colonel/SFB), parseSize liter/litre, normalizeText unicode, truncateDescription OOS, dedupFound N/A, shuffle/withTimeout/runWithConcurrency edges, peak hour formatting, watch list (key generation/embed/processing), Reddit intel (keywords/subreddits/scraping/dedup) |
 | `test/proxy.test.js` | 36 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |
