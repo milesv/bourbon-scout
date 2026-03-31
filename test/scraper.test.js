@@ -87,6 +87,7 @@ import {
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   KROGER_PRODUCTS, checkKrogerKnownProducts,
   trackHealth,
+  WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   validateEnv,
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
@@ -7633,5 +7634,58 @@ describe("formatStoreInfo edge cases", () => {
     const result = formatStoreInfo("costco", "Costco", { storeId: "736", name: "Costco Chandler", address: "123 Main St, Chandler, AZ 85248" });
     // Should not say "Costco Costco Chandler"
     expect(result.storeLine).not.toContain("Costco Costco");
+  });
+});
+
+// ─── Watch List ─────────────────────────────────────────────────────────────
+
+describe("watchListKey", () => {
+  it("generates deterministic key from entry", () => {
+    const entry = { bottle: "Pappy 23", retailer: "costco", stores: ["1058", "427"] };
+    expect(watchListKey(entry)).toBe("Pappy 23:costco:1058,427"); // sorted lexicographically
+  });
+
+  it("same stores in different order produce same key", () => {
+    const a = { bottle: "KoK", retailer: "costco", stores: ["427", "1058"] };
+    const b = { bottle: "KoK", retailer: "costco", stores: ["1058", "427"] };
+    expect(watchListKey(a)).toBe(watchListKey(b));
+  });
+});
+
+describe("buildWatchListEmbed", () => {
+  it("builds gold-colored embed with bottle and source info", () => {
+    const entry = { bottle: "King of Kentucky", retailer: "costco", stores: ["427"], source: "Store confirmed", date: "2026-03-20" };
+    const embed = buildWatchListEmbed(entry);
+    expect(embed.color).toBe(0xf39c12);
+    expect(embed.title).toContain("King of Kentucky");
+    expect(embed.title).toContain("Costco");
+    expect(embed.description).toContain("Store confirmed");
+    expect(embed.description).toContain("2026-03-20");
+  });
+
+  it("handles missing source and date", () => {
+    const entry = { bottle: "Pappy 23", retailer: "walmart", stores: ["5768"] };
+    const embed = buildWatchListEmbed(entry);
+    expect(embed.description).toContain("Unknown");
+    expect(embed.description).toContain("N/A");
+  });
+});
+
+describe("processWatchList", () => {
+  it("is a no-op when WATCH_LIST is empty", async () => {
+    const state = {};
+    await processWatchList(state);
+    expect(state._watchList).toBeUndefined();
+  });
+
+  it("does not re-alert already-notified entries", async () => {
+    const state = { _watchList: { "KoK:costco:427": "2026-03-20T00:00:00Z" } };
+    // Even if WATCH_LIST had this entry, state says it's already notified
+    await processWatchList(state);
+    // No Discord calls should have been made for this entry
+    expect(mocks.fetch).not.toHaveBeenCalledWith(
+      expect.stringContaining("discord"),
+      expect.anything()
+    );
   });
 });

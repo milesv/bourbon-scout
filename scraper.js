@@ -528,6 +528,64 @@ const TARGET_BOTTLES = [
 // Fast lookup for canary bottles (filtered out of alerts, used in health summary only)
 const CANARY_NAMES = new Set(TARGET_BOTTLES.filter((b) => b.canary).map((b) => b.name));
 
+// Human intelligence watch list — rumored drops at specific stores. Each entry triggers
+// a one-time Discord @here notification on the first scan after being added. Remove
+// entries after the drop is confirmed or passes. No automatic frequency change —
+// the notification lets you decide whether to adjust scan settings.
+const WATCH_LIST = [
+  // { bottle: "King of Kentucky", retailer: "costco", stores: ["427", "1058"], source: "Store confirmed, expected 3/23", date: "2026-03-20" },
+];
+
+// ─── Watch List Processing ──────────────────────────────────────────────────
+// Sends one-time Discord notifications for new WATCH_LIST entries.
+
+function watchListKey(entry) {
+  return `${entry.bottle}:${entry.retailer}:${[...entry.stores].sort().join(",")}`;
+}
+
+const WATCH_LIST_RETAILER_NAMES = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens", samsclub: "Sam's Club" };
+
+function buildWatchListEmbed(entry) {
+  const retailerName = WATCH_LIST_RETAILER_NAMES[entry.retailer] || entry.retailer;
+  const storeNames = (storeCache?.retailers?.[entry.retailer] || [])
+    .filter((s) => entry.stores.includes(s.storeId))
+    .map((s) => `📍 ${s.name} (#${s.storeId}) — ${s.address}`)
+    .join("\n");
+  const storeList = storeNames || entry.stores.map((id) => `Store #${id}`).join(", ");
+  return {
+    title: truncateTitle(`🔔 INTEL — ${entry.bottle} rumored at ${retailerName}`),
+    description: truncateDescription(
+      `${storeList}\n\n📋 **Source:** ${entry.source || "Unknown"}\n📅 **Date:** ${entry.date || "N/A"}\n\n_Adjust scan frequency if you want to increase monitoring._`
+    ),
+    color: COLORS.rumor,
+    timestamp: new Date().toISOString(),
+    footer: { text: `Bourbon Scout 🥃 │ Watch List` },
+  };
+}
+
+async function processWatchList(state) {
+  if (WATCH_LIST.length === 0) return;
+  if (!state._watchList) state._watchList = {};
+  let alertsSent = 0;
+  for (const entry of WATCH_LIST) {
+    const key = watchListKey(entry);
+    if (state._watchList[key]) continue; // Already notified
+    console.log(`[watchlist] New intel: ${entry.bottle} at ${entry.retailer} stores ${entry.stores.join(", ")}`);
+    try {
+      const embed = buildWatchListEmbed(entry);
+      await sendUrgentAlert([embed]);
+      state._watchList[key] = new Date().toISOString();
+      alertsSent++;
+    } catch (err) {
+      console.error(`[watchlist] Failed to send alert: ${err.message}`);
+    }
+  }
+  if (alertsSent > 0) {
+    await saveState(state);
+    console.log(`[watchlist] Sent ${alertsSent} rumor notification(s)`);
+  }
+}
+
 // ─── State Management ────────────────────────────────────────────────────────
 // State is nested by retailer key then store ID:
 // { "costco": { "0489": ["Weller 12 Year"] }, "walmart": { "2436": [] } }
@@ -784,6 +842,7 @@ const COLORS = {
   stillIn:  0x3498db,  // blue — still in stock re-alert
   goneOOS:  0xe67e22,  // orange — went out of stock
   summary:  0x9b59b6,  // purple — scan summary
+  rumor:    0xf39c12,  // gold — human intelligence rumor alert
 };
 
 // ─── Store Info Formatting ──────────────────────────────────────────────────
@@ -3562,6 +3621,7 @@ async function poll() {
 
   const state = await loadState();
   pruneState(state, storeCache.retailers);
+  await processWatchList(state);
   let storesScanned = 0;
   let totalNewFinds = 0;
   let totalStillInStock = 0;
@@ -3829,6 +3889,7 @@ export {
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
+  WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   validateEnv,
   poll,
 };
