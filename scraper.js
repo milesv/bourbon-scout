@@ -598,6 +598,94 @@ async function processWatchList(state) {
   }
 }
 
+// ─── Reddit Intel Scraper ───────────────────────────────────────────────────
+// Monitors r/ArizonaWhiskey (and r/bourbon with AZ filter) for posts mentioning
+// allocated bottles, store names, or drop-related keywords. Sends Discord @here
+// for relevant new posts. No proxy needed — Reddit's JSON API is public.
+
+const REDDIT_INTEL_SUBREDDITS = ["ArizonaWhiskey", "arizonabourbon"];
+const REDDIT_INTEL_KEYWORDS = [
+  // Retailer names
+  "costco", "total wine", "totalwine", "fry's", "frys", "fry's", "walmart", "safeway", "walgreens", "sam's club", "samsclub",
+  // Store locations
+  "scottsdale", "paradise valley", "tempe", "chandler", "gilbert", "mesa", "queen creek",
+  // High-value bottles (short forms used in community posts)
+  "kok", "king of kentucky", "pappy", "van winkle", "btac", "george t stagg", "gts",
+  "william larue", "wlw", "thomas handy", "thh", "eagle rare 17", "er17",
+  "blanton", "weller", "eh taylor", "eht", "stagg jr", "stagg bourbon",
+  "elmer t lee", "etl", "rock hill", "michter's 10", "old forester birthday", "ofbb",
+  "allocated", "drop", "dropped", "shipment", "just got", "in stock", "on shelf",
+];
+
+async function scrapeRedditIntel(state) {
+  if (!state._redditSeen) state._redditSeen = {};
+  let newPosts = 0;
+
+  for (const sub of REDDIT_INTEL_SUBREDDITS) {
+    try {
+      const res = await fetch(`https://www.reddit.com/r/${sub}/new.json?limit=25`, {
+        headers: { "User-Agent": "bourbon-scout/1.0 (allocated bourbon tracker)" },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) { console.warn(`[reddit] r/${sub} returned ${res.status}`); continue; }
+      const data = await res.json();
+      const posts = data?.data?.children || [];
+
+      for (const post of posts) {
+        const p = post.data;
+        if (!p?.id) continue;
+        if (state._redditSeen[p.id]) continue; // Already seen
+
+        // Check if post is recent (last 2 hours) and matches keywords
+        const ageMs = Date.now() - (p.created_utc * 1000);
+        if (ageMs > 2 * 60 * 60 * 1000) continue; // Skip posts older than 2 hours
+
+        const text = `${p.title} ${p.selftext || ""}`.toLowerCase();
+        const matchedKeywords = REDDIT_INTEL_KEYWORDS.filter((kw) => text.includes(kw));
+        if (matchedKeywords.length === 0) continue; // Not relevant
+
+        // Mark as seen regardless of whether alert sends
+        state._redditSeen[p.id] = new Date().toISOString();
+        newPosts++;
+
+        console.log(`[reddit] New intel from r/${sub}: "${p.title}" (keywords: ${matchedKeywords.slice(0, 5).join(", ")})`);
+
+        const embed = {
+          title: truncateTitle(`📡 r/${sub} — ${p.title}`),
+          description: truncateDescription(
+            `${(p.selftext || "").slice(0, 300)}${p.selftext?.length > 300 ? "..." : ""}\n\n` +
+            `👤 u/${p.author} · ⬆️ ${p.score} · 💬 ${p.num_comments}\n` +
+            `🔗 [View post](https://reddit.com${p.permalink})\n` +
+            `🔑 Matched: ${matchedKeywords.slice(0, 8).join(", ")}`
+          ),
+          color: COLORS.rumor,
+          timestamp: new Date(p.created_utc * 1000).toISOString(),
+          footer: { text: `Bourbon Scout 🥃 │ Reddit Intel` },
+        };
+
+        try {
+          await sendUrgentAlert([embed]);
+        } catch (err) {
+          console.error(`[reddit] Failed to send alert: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[reddit] r/${sub} fetch failed: ${err.message}`);
+    }
+  }
+
+  // Prune old seen IDs (keep last 7 days)
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  for (const [id, ts] of Object.entries(state._redditSeen)) {
+    if (new Date(ts).getTime() < cutoff) delete state._redditSeen[id];
+  }
+
+  if (newPosts > 0) {
+    await saveState(state);
+    console.log(`[reddit] Found ${newPosts} new relevant post(s)`);
+  }
+}
+
 // ─── State Management ────────────────────────────────────────────────────────
 // State is nested by retailer key then store ID:
 // { "costco": { "0489": ["Weller 12 Year"] }, "walmart": { "2436": [] } }
@@ -3634,6 +3722,7 @@ async function poll() {
   const state = await loadState();
   pruneState(state, storeCache.retailers);
   await processWatchList(state);
+  await scrapeRedditIntel(state);
   let storesScanned = 0;
   let totalNewFinds = 0;
   let totalStillInStock = 0;
@@ -3902,6 +3991,7 @@ export {
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
+  REDDIT_INTEL_SUBREDDITS, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
   validateEnv,
   poll,
 };

@@ -88,6 +88,7 @@ import {
   KROGER_PRODUCTS, checkKrogerKnownProducts,
   trackHealth,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
+  REDDIT_INTEL_SUBREDDITS, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
   validateEnv,
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
@@ -7687,5 +7688,89 @@ describe("processWatchList", () => {
       expect.stringContaining("discord"),
       expect.anything()
     );
+  });
+});
+
+// ─── Reddit Intel ───────────────────────────────────────────────────────────
+
+describe("REDDIT_INTEL_KEYWORDS", () => {
+  it("contains key retailer names", () => {
+    expect(REDDIT_INTEL_KEYWORDS).toContain("costco");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("total wine");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("frys");
+  });
+
+  it("contains high-value bottle abbreviations", () => {
+    expect(REDDIT_INTEL_KEYWORDS).toContain("kok");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("pappy");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("btac");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("wlw");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("ofbb");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("etl");
+  });
+
+  it("contains drop-related action words", () => {
+    expect(REDDIT_INTEL_KEYWORDS).toContain("drop");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("in stock");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("allocated");
+  });
+});
+
+describe("REDDIT_INTEL_SUBREDDITS", () => {
+  it("monitors ArizonaWhiskey and arizonabourbon", () => {
+    expect(REDDIT_INTEL_SUBREDDITS).toContain("ArizonaWhiskey");
+    expect(REDDIT_INTEL_SUBREDDITS).toContain("arizonabourbon");
+  });
+});
+
+describe("scrapeRedditIntel", () => {
+  it("is a no-op when Reddit returns no posts", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true, json: async () => ({ data: { children: [] } }),
+    });
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(state._redditSeen).toEqual({});
+  });
+
+  it("skips posts older than 2 hours", async () => {
+    const oldPost = {
+      data: {
+        id: "old1", title: "KoK at Costco", selftext: "allocated drop",
+        created_utc: (Date.now() / 1000) - 3 * 60 * 60, // 3 hours ago
+        author: "test", score: 10, num_comments: 5, permalink: "/r/test/old1",
+      },
+    };
+    mocks.fetch.mockResolvedValue({
+      ok: true, json: async () => ({ data: { children: [oldPost] } }),
+    });
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(state._redditSeen?.old1).toBeUndefined();
+  });
+
+  it("skips already-seen posts", async () => {
+    const post = {
+      data: {
+        id: "seen1", title: "KoK at Costco", selftext: "",
+        created_utc: Date.now() / 1000, // now
+        author: "test", score: 10, num_comments: 5, permalink: "/r/test/seen1",
+      },
+    };
+    mocks.fetch.mockResolvedValue({
+      ok: true, json: async () => ({ data: { children: [post] } }),
+    });
+    const state = { _redditSeen: { seen1: "2026-03-30T00:00:00Z" } };
+    await scrapeRedditIntel(state);
+    // Should not send any Discord alert for already-seen post
+  });
+
+  it("handles Reddit API errors gracefully", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.fetch.mockRejectedValue(new Error("Network error"));
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("fetch failed"));
+    warnSpy.mockRestore();
   });
 });
