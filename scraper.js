@@ -533,14 +533,16 @@ const CANARY_NAMES = new Set(TARGET_BOTTLES.filter((b) => b.canary).map((b) => b
 // entries after the drop is confirmed or passes. No automatic frequency change —
 // the notification lets you decide whether to adjust scan settings.
 const WATCH_LIST = [
-  // { bottle: "King of Kentucky", retailer: "costco", stores: ["427", "1058"], source: "Store confirmed, expected 3/23", date: "2026-03-20" },
+  // bottle is optional — omit for "Allocated Bourbon" (covers all bottles)
+  // { retailer: "costco", stores: ["427", "1058"], source: "Store confirmed, expected 3/23", date: "2026-03-20" },
+  // { bottle: "King of Kentucky", retailer: "costco", stores: ["427"], source: "Specific bottle rumor", date: "2026-03-20" },
 ];
 
 // ─── Watch List Processing ──────────────────────────────────────────────────
 // Sends one-time Discord notifications for new WATCH_LIST entries.
 
 function watchListKey(entry) {
-  return `${entry.bottle}:${entry.retailer}:${[...entry.stores].sort().join(",")}`;
+  return `${entry.bottle || "Allocated Bourbon"}:${entry.retailer}:${[...entry.stores].sort().join(",")}`;
 }
 
 const WATCH_LIST_RETAILER_NAMES = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens", samsclub: "Sam's Club" };
@@ -553,7 +555,7 @@ function buildWatchListEmbed(entry) {
     .join("\n");
   const storeList = storeNames || entry.stores.map((id) => `Store #${id}`).join(", ");
   return {
-    title: truncateTitle(`🔔 INTEL — ${entry.bottle} rumored at ${retailerName}`),
+    title: truncateTitle(`🔔 INTEL — ${entry.bottle || "Allocated Bourbon"} rumored at ${retailerName}`),
     description: truncateDescription(
       `${storeList}\n\n📋 **Source:** ${entry.source || "Unknown"}\n📅 **Date:** ${entry.date || "N/A"}\n\n_Adjust scan frequency if you want to increase monitoring._`
     ),
@@ -570,7 +572,7 @@ async function processWatchList(state) {
   for (const entry of WATCH_LIST) {
     const key = watchListKey(entry);
     if (state._watchList[key]) continue; // Already notified
-    console.log(`[watchlist] New intel: ${entry.bottle} at ${entry.retailer} stores ${entry.stores.join(", ")}`);
+    console.log(`[watchlist] New intel: ${entry.bottle || "Allocated Bourbon"} at ${entry.retailer} stores ${entry.stores.join(", ")}`);
     try {
       const embed = buildWatchListEmbed(entry);
       await sendUrgentAlert([embed]);
