@@ -3497,7 +3497,10 @@ async function scrapeSafewayStore(store) {
       };
       const safewayProxy = getRetailerProxyUrl("safeway");
       const res = await scraperFetchRetry(url, { headers: safewayHeaders, timeout: 15000, proxyUrl: safewayProxy || undefined });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}: ${errBody.slice(0, 200)}`);
+      }
       const data = await res.json();
       const products = data?.primaryProducts?.response?.docs || [];
       matchSafewayProducts(products);
