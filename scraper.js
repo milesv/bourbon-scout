@@ -632,9 +632,10 @@ async function scrapeRedditIntel(state) {
 
   for (const { sub, requireAZ } of allSubs) {
     try {
-      const res = await fetch(`https://www.reddit.com/r/${sub}/new.json?limit=25`, {
-        headers: { "User-Agent": FETCH_HEADERS["User-Agent"] }, // Use Chrome UA — Reddit blocks bot-like UAs with 403
-        signal: AbortSignal.timeout(10000),
+      // Use got-scraping (Chrome TLS fingerprint) — Reddit rejects node-fetch's TLS. No proxy needed.
+      const res = await scraperFetch(`https://www.reddit.com/r/${sub}/new.json?limit=25`, {
+        headers: { "User-Agent": FETCH_HEADERS["User-Agent"] },
+        timeout: 10000,
       });
       if (!res.ok) { console.warn(`[reddit] r/${sub} returned ${res.status}`); continue; }
       const data = await res.json();
