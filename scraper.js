@@ -633,7 +633,7 @@ async function scrapeRedditIntel(state) {
   for (const { sub, requireAZ } of allSubs) {
     try {
       const res = await fetch(`https://www.reddit.com/r/${sub}/new.json?limit=25`, {
-        headers: { "User-Agent": "bourbon-scout/1.0 (allocated bourbon tracker)" },
+        headers: { "User-Agent": FETCH_HEADERS["User-Agent"] }, // Use Chrome UA — Reddit blocks bot-like UAs with 403
         signal: AbortSignal.timeout(10000),
       });
       if (!res.ok) { console.warn(`[reddit] r/${sub} returned ${res.status}`); continue; }
