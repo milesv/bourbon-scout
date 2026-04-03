@@ -623,6 +623,7 @@ const REDDIT_INTEL_KEYWORDS = [
 async function scrapeRedditIntel(state) {
   if (!state._redditSeen) state._redditSeen = {};
   let newPosts = 0;
+  console.log(`[reddit] Checking ${REDDIT_INTEL_SUBREDDITS.length + REDDIT_NATIONAL_SUBREDDITS.length} subreddits...`);
 
   // Check both AZ-specific subs (all posts) and national subs (AZ-filtered)
   const allSubs = [
