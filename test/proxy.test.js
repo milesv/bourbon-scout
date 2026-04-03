@@ -223,19 +223,8 @@ describe("proxy support", () => {
     }
   });
 
-  it("scrapeSafewayStore passes proxyUrl on API fetch via got-scraping", async () => {
-    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, JSON.stringify({
-      primaryProducts: { response: { docs: [] } },
-    })));
-    await runWithFakeTimers(() => scrapeSafewayStore(TEST_STORE));
-    const safewayCalls = mocks.gotScraping.mock.calls.filter(
-      ([opts]) => opts?.url?.includes("safeway.com")
-    );
-    expect(safewayCalls.length).toBeGreaterThan(0);
-    for (const [opts] of safewayCalls) {
-      expect(opts.proxyUrl).toBeTruthy();
-    }
-  });
+  // Safeway is now browser-based — proxy is handled by launchRetailerBrowser,
+  // not by fetch proxyUrl. Browser proxy routing is tested in launchRetailerBrowser tests.
 
   it("Discord webhook calls do NOT include proxy agent", async () => {
     _resetPolling();

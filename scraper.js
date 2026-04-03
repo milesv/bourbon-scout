@@ -603,7 +603,10 @@ async function processWatchList(state) {
 // allocated bottles, store names, or drop-related keywords. Sends Discord @here
 // for relevant new posts. No proxy needed — Reddit's JSON API is public.
 
+// AZ-specific subs: all posts checked. National subs: only posts mentioning AZ terms.
 const REDDIT_INTEL_SUBREDDITS = ["ArizonaWhiskey", "arizonabourbon"];
+const REDDIT_NATIONAL_SUBREDDITS = ["bourbon", "whiskey", "Costco_alcohol"];
+const REDDIT_AZ_FILTER = ["arizona", "phoenix", "tempe", "scottsdale", "chandler", "gilbert", "mesa", "queen creek", "tucson", "fry's", "frys"];
 const REDDIT_INTEL_KEYWORDS = [
   // Retailer names
   "costco", "total wine", "totalwine", "fry's", "frys", "fry's", "walmart", "safeway", "walgreens", "sam's club", "samsclub",
@@ -621,7 +624,13 @@ async function scrapeRedditIntel(state) {
   if (!state._redditSeen) state._redditSeen = {};
   let newPosts = 0;
 
-  for (const sub of REDDIT_INTEL_SUBREDDITS) {
+  // Check both AZ-specific subs (all posts) and national subs (AZ-filtered)
+  const allSubs = [
+    ...REDDIT_INTEL_SUBREDDITS.map((s) => ({ sub: s, requireAZ: false })),
+    ...REDDIT_NATIONAL_SUBREDDITS.map((s) => ({ sub: s, requireAZ: true })),
+  ];
+
+  for (const { sub, requireAZ } of allSubs) {
     try {
       const res = await fetch(`https://www.reddit.com/r/${sub}/new.json?limit=25`, {
         headers: { "User-Agent": "bourbon-scout/1.0 (allocated bourbon tracker)" },
@@ -641,6 +650,10 @@ async function scrapeRedditIntel(state) {
         if (ageMs > 2 * 60 * 60 * 1000) continue; // Skip posts older than 2 hours
 
         const text = `${p.title} ${p.selftext || ""}`.toLowerCase();
+
+        // National subs require AZ-specific mention to avoid noise
+        if (requireAZ && !REDDIT_AZ_FILTER.some((az) => text.includes(az))) continue;
+
         const matchedKeywords = REDDIT_INTEL_KEYWORDS.filter((kw) => text.includes(kw));
         if (matchedKeywords.length === 0) continue; // Not relevant
 
@@ -3611,83 +3624,194 @@ async function scrapeKrogerStore(store) {
   return dedupFound([...knownFound, ...found]);
 }
 
-async function scrapeSafewayStore(store) {
-  /* v8 ignore next 3 -- env guard */
-  if (!SAFEWAY_API_KEY) {
-    console.warn("[safeway] Skipping — SAFEWAY_API_KEY not set");
-    return [];
-  }
-
-  // Use broad SEARCH_QUERIES (12) instead of per-bottle (40) to cut API calls ~70%
+// Match Safeway API response products against TARGET_BOTTLES.
+// Reused by both browser-based API-via-evaluate and any future fetch path.
+function matchSafewayProducts(products) {
   const found = [];
-  const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
-
-  function matchSafewayProducts(products) {
-    for (const product of products) {
-      const title = product.name || product.productTitle || "";
-      if (product.inStock !== true && product.inStock !== 1) continue;
-      for (const bottle of TARGET_BOTTLES) {
-        if (matchesBottle(title, bottle, "safeway")) {
-          const fulfillmentParts = [];
-          if (product.curbsideEligible) fulfillmentParts.push("Curbside");
-          if (product.deliveryEligible) fulfillmentParts.push("Delivery");
-          found.push({
-            name: bottle.name,
-            url: product.url ? `https://www.safeway.com${product.url}` : "",
-            price: product.price != null ? `$${Number(product.price).toFixed(2)}` : "",
-            sku: product.upc || product.pid || "",
-            size: parseSize(title),
-            fulfillment: fulfillmentParts.join(", "),
-          });
-        }
+  for (const product of products) {
+    const title = product.name || product.productTitle || "";
+    if (product.inStock !== true && product.inStock !== 1) continue;
+    for (const bottle of TARGET_BOTTLES) {
+      if (matchesBottle(title, bottle, "safeway")) {
+        const fulfillmentParts = [];
+        if (product.curbsideEligible) fulfillmentParts.push("Curbside");
+        if (product.deliveryEligible) fulfillmentParts.push("Delivery");
+        found.push({
+          name: bottle.name,
+          url: product.url ? `https://www.safeway.com${product.url}` : "",
+          price: product.price != null ? `$${Number(product.price).toFixed(2)}` : "",
+          sku: product.upc || product.pid || "",
+          size: parseSize(title),
+          fulfillment: fulfillmentParts.join(", "),
+        });
       }
     }
   }
+  return found;
+}
 
-  // Run all queries in parallel (API-key auth, no bot detection risk)
-  await Promise.all(shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES)).map(async (query, i) => {
-    await sleep(i * 50); // stagger starts
-    const url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
+// Browser-based Safeway scraper. Akamai WAF blocks all fetch-based approaches (API + got-scraping),
+// so we use a real browser to execute Akamai's JS sensor during pre-warm, then call the Safeway API
+// from within the browser context (inherits valid _abck cookies). Falls back to DOM extraction.
+async function scrapeSafewayViaBrowser(page, store) {
+  const found = [];
+  const t0 = Date.now();
+  const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
+
+  // Pre-warm: visit homepage to let Akamai sensor set _abck cookie
+  await page.goto("https://www.safeway.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  console.log(`[safeway:${store.storeId}] Homepage loaded (${elapsed()})`);
+  await sleep(4000 + Math.random() * 3000);
+  await solveHumanChallenge(page);
+  await humanizePage(page, { pace: "slow" });
+  console.log(`[safeway:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
+
+  const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
+  let consecutiveBlocks = 0;
+
+  for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
+    if (consecutiveBlocks >= 4) { trackHealth("safeway", "blocked"); continue; }
+
     try {
-      // Use got-scraping (Chrome TLS fingerprint) — Safeway's Azure APIM rejects
-      // node-fetch's TLS handshake with 403. Same pattern as other fetch scrapers.
-      const safewayHeaders = {
-        "Ocp-Apim-Subscription-Key": SAFEWAY_API_KEY,
-        Accept: "application/json",
-        "User-Agent": FETCH_HEADERS["User-Agent"],
-        "Origin": "https://www.safeway.com",
-        "Referer": "https://www.safeway.com/",
-      };
-      const safewayProxy = getRetailerProxyUrl("safeway");
-      const res = await scraperFetchRetry(url, { headers: safewayHeaders, timeout: 15000, proxyUrl: safewayProxy || undefined });
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status}: ${errBody.slice(0, 200)}`);
-      }
-      const data = await res.json();
-      const products = data?.primaryProducts?.response?.docs || [];
-      matchSafewayProducts(products);
-      trackHealth("safeway", "ok");
-      // Fetch page 2 if first page was full (may have more results).
-      // Isolated try/catch: page 2 failure shouldn't lose page 1 data or mark query as failed.
-      if (products.length === 50) {
+      // Primary: call Safeway API from browser context — inherits _abck cookies
+      const apiUrl = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
+      /* v8 ignore start -- browser-only API call */
+      const data = await page.evaluate(async ({ url, apiKey }) => {
         try {
-          const page2Url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
-          const res2 = await scraperFetchRetry(page2Url, { headers: safewayHeaders, timeout: 15000, proxyUrl: safewayProxy || undefined });
-          if (res2.ok) {
-            const data2 = await res2.json();
-            matchSafewayProducts(data2?.primaryProducts?.response?.docs || []);
-          }
-        } catch (p2Err) {
-          console.warn(`[safeway:${store.storeId}] Page 2 failed for "${query}": ${p2Err.message}`);
+          const res = await fetch(url, {
+            headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+          });
+          if (!res.ok) return null;
+          return await res.json();
+        } catch { return null; }
+      }, { url: apiUrl, apiKey: SAFEWAY_API_KEY });
+      /* v8 ignore stop */
+
+      if (data?.primaryProducts?.response?.docs) {
+        const products = data.primaryProducts.response.docs;
+        found.push(...matchSafewayProducts(products));
+        trackHealth("safeway", "ok");
+        consecutiveBlocks = 0;
+        console.log(`[safeway:${store.storeId}] API query "${query}": ${products.length} products (${elapsed()})`);
+
+        // Page 2 if first page was full
+        if (products.length === 50) {
+          try {
+            const page2Url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
+            /* v8 ignore start -- browser-only */
+            const data2 = await page.evaluate(async ({ url, apiKey }) => {
+              try {
+                const res = await fetch(url, { headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" } });
+                return res.ok ? await res.json() : null;
+              } catch { return null; }
+            }, { url: page2Url, apiKey: SAFEWAY_API_KEY });
+            /* v8 ignore stop */
+            if (data2?.primaryProducts?.response?.docs) {
+              found.push(...matchSafewayProducts(data2.primaryProducts.response.docs));
+            }
+          } catch { /* page 2 failure is non-critical */ }
         }
+      } else {
+        // API-via-browser failed — try DOM extraction as fallback
+        const searchUrl = `https://www.safeway.com/shop/search-results.html?q=${encodeURIComponent(query)}`;
+        await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+        await page.waitForSelector("[class*='product'], [data-testid*='product']", { timeout: 8000 }).catch(() => {});
+
+        if (await isBlockedPage(page)) {
+          const solved = await solveHumanChallenge(page);
+          if (!solved || (await isBlockedPage(page))) {
+            console.warn(`[safeway:${store.storeId}] Blocked for query "${query}"`);
+            trackHealth("safeway", "blocked");
+            consecutiveBlocks++;
+            continue;
+          }
+        }
+
+        /* v8 ignore start -- browser-only DOM callback */
+        const products = await page.$$eval(
+          "[class*='product-card'], [class*='productCard'], [data-testid*='product'], .product-item",
+          (cards) => cards.map((el) => ({
+            title: (el.querySelector("h2, h3, [class*='title'], [class*='name']") || {}).textContent?.trim() || "",
+            price: (el.querySelector("[class*='price']") || {}).textContent?.trim() || "",
+            url: (el.querySelector("a[href*='/shop/product/']") || {}).href || "",
+            outOfStock: (el.textContent || "").toLowerCase().includes("out of stock") ||
+                        (el.textContent || "").toLowerCase().includes("unavailable"),
+          }))
+        );
+        /* v8 ignore stop */
+
+        for (const p of products) {
+          if (p.outOfStock) continue;
+          for (const bottle of TARGET_BOTTLES) {
+            if (matchesBottle(p.title, bottle, "safeway")) {
+              found.push({
+                name: bottle.name,
+                url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.safeway.com${p.url}`) : "",
+                price: p.price || "",
+                sku: "",
+                size: parseSize(p.title),
+                fulfillment: "",
+              });
+            }
+          }
+        }
+        trackHealth("safeway", products.length > 0 ? "ok" : "fail");
+        consecutiveBlocks = 0;
       }
     } catch (err) {
-      console.error(`[safeway:${store.storeId}] Error searching "${query}": ${err.message}`);
+      console.error(`[safeway:${store.storeId}] Error: ${err.message}`);
       trackHealth("safeway", "fail");
+      consecutiveBlocks++;
     }
-  }));
+    await sleep(2500 + Math.random() * 3500);
+  }
   return dedupFound(found);
+}
+
+// Wrapper: launches browser, handles timeout/retry, caches cookies.
+// Modeled after scrapeWalgreensStore (line 3058).
+async function scrapeSafewayStore(store) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      console.log("[safeway] Retrying with fresh browser after blocks");
+      delete scraperHealth["safeway"];
+      if (retailerBrowserCache["safeway"]) {
+        await retailerBrowserCache["safeway"].context.close().catch(() => {});
+        delete retailerBrowserCache["safeway"];
+      }
+      await sleep(3000 + Math.random() * 2000);
+    }
+    console.log("[safeway] Using clean browser");
+    let page;
+    try {
+      ({ page } = await launchRetailerBrowser("safeway", { clean: true }));
+    } catch (err) {
+      console.error(`[safeway] Browser launch failed: ${err.message}`);
+      trackHealth("safeway", "fail");
+      return [];
+    }
+    try {
+      const scraperPromise = scrapeSafewayViaBrowser(page, store);
+      scraperPromise.catch(() => {});
+      const result = await withTimeout(scraperPromise, 180000, null);
+      if (result === null) {
+        console.warn("[safeway] Browser scraper timed out (180s)");
+        trackHealth("safeway", "fail");
+        if (attempt === 0) continue;
+        return [];
+      }
+      await cacheRetailerCookies("safeway");
+      const sfHealth = scraperHealth["safeway"];
+      if (sfHealth && sfHealth.blocked > 0 && sfHealth.blocked >= sfHealth.queries / 2 && attempt === 0) {
+        console.warn(`[safeway] ${sfHealth.blocked}/${sfHealth.queries} queries blocked — retrying`);
+        continue;
+      }
+      return result;
+    } finally {
+      await page.close().catch(() => {});
+    }
+  }
+  return [];
 }
 
 // ─── Retailer Registry ───────────────────────────────────────────────────────
@@ -3726,7 +3850,7 @@ async function poll() {
   const state = await loadState();
   pruneState(state, storeCache.retailers);
   await processWatchList(state);
-  await scrapeRedditIntel(state);
+  // Reddit intel runs on its own independent loop (see main()), not per-scan
   let storesScanned = 0;
   let totalNewFinds = 0;
   let totalStillInStock = 0;
@@ -3990,12 +4114,13 @@ export {
   matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
-  KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore, scrapeSafewayStore,
+  KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore,
+  matchSafewayProducts, scrapeSafewayViaBrowser, scrapeSafewayStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
-  REDDIT_INTEL_SUBREDDITS, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
+  REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
   validateEnv,
   poll,
 };
@@ -4130,6 +4255,26 @@ async function main() {
     }
 
     console.log(`Schedule: 24/7 — 30min default, 20min boost (Tue/Thu nights), 45min daytime (10 AM – 5 PM MT)\n`);
+
+    // Reddit intel runs on its own independent loop — lightweight (no browser, no proxy),
+    // checks every 5-10 min 24/7 regardless of active hours. Drops are time-critical.
+    const REDDIT_INTERVAL_MS = 5 * 60 * 1000; // 5 min base
+    function scheduleNextRedditCheck() {
+      const jitter = Math.random() * 5 * 60 * 1000; // 0-5 min jitter
+      /* v8 ignore next -- setTimeout scheduling */
+      setTimeout(async () => {
+        try {
+          const state = await loadState();
+          await scrapeRedditIntel(state);
+        } catch (err) {
+          console.error("[reddit] Check failed:", err.message);
+        }
+        scheduleNextRedditCheck();
+      }, REDDIT_INTERVAL_MS + jitter);
+    }
+    scheduleNextRedditCheck();
+    console.log("Reddit intel: monitoring r/ArizonaWhiskey + r/arizonabourbon + r/bourbon + r/whiskey + r/Costco_alcohol (every 5-10 min)");
+
     /* v8 ignore next -- fire-and-forget initial poll */
     poll()
       .catch((err) => console.error("[startup] Initial poll failed:", err))
