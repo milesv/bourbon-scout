@@ -4771,17 +4771,13 @@ describe("checkTotalWineKnownUrls", () => {
 // ─── SEED_PRODUCT_URLS ─────────────────────────────────────────────────────
 
 describe("SEED_PRODUCT_URLS", () => {
-  it("contains costco, walmart, and totalwine retailers", () => {
-    expect(SEED_PRODUCT_URLS.costco.length).toBeGreaterThan(0);
+  it("contains walmart and totalwine retailers", () => {
     expect(SEED_PRODUCT_URLS.walmart.length).toBeGreaterThan(0);
     expect(SEED_PRODUCT_URLS.totalwine.length).toBeGreaterThan(0);
   });
 
-  it("costco seeds have valid .product.{id}.html URLs", () => {
-    for (const seed of SEED_PRODUCT_URLS.costco) {
-      expect(seed.url).toMatch(/costco\.com\/\.product\.\d+\.html/);
-      expect(seed.name).toBeTruthy();
-    }
+  it("no costco seeds (warehouse-only, no product pages)", () => {
+    expect(SEED_PRODUCT_URLS.costco).toBeUndefined();
   });
 
   it("walmart seeds have valid walmart.com/ip URLs", () => {
@@ -4798,13 +4794,9 @@ describe("SEED_PRODUCT_URLS", () => {
     }
   });
 
-  it("costco seeds contain Pappy and BTAC bottles", () => {
-    const names = SEED_PRODUCT_URLS.costco.map(s => s.name);
-    expect(names).toContain("Pappy Van Winkle 15 Year");
-    expect(names).toContain("Pappy Van Winkle 23 Year");
-    expect(names).toContain("Eagle Rare 17 Year");
-    expect(names).toContain("Blanton's Original");
-  });
+  // Costco seed tests removed — Costco has no product pages for allocated bourbon
+  // (warehouse-only inventory, confirmed 2026-04-03). checkCostcoKnownUrls preserved
+  // but inactive (no seeds = immediate return []).
 
   it("seed bottle names match TARGET_BOTTLES", () => {
     const targetNames = new Set(TARGET_BOTTLES.map(b => b.name));
