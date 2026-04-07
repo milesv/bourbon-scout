@@ -356,6 +356,9 @@ const SEED_PRODUCT_URLS = {
     { name: "Weller C.Y.P.B.", url: "https://www.walmart.com/ip/Weller-C-Y-P-B-Kentucky-Straight-Bourbon-Whiskey-750ml-95-Proof/5044158521" },
     { name: "Jack Daniel's 10 Year", url: "https://www.walmart.com/ip/Jack-Daniel-s-10-Years-Old-Tennessee-Whiskey-700-ml-Bottle/2877322440" },
     { name: "Jack Daniel's 12 Year", url: "https://www.walmart.com/ip/Jack-Daniel-s-12-Years-Old-Tennessee-Whiskey-Batch-2-700-ml-Bottle/5395514583" },
+    { name: "Jack Daniel's 14 Year", url: "https://www.walmart.com/ip/Jack-Daniel-s-14-Years-Old-Tennessee-Whiskey-Batch-01-700-ml-Bottle/15318058743" },
+    { name: "Blanton's Straight from the Barrel", url: "https://www.walmart.com/ip/Blantons-Blanton-Sftb-Bbn-Us-6-750ml-125-4pf/1166685343" },
+    { name: "Rock Hill Farms", url: "https://www.walmart.com/ip/Rock-Hill-Farms-Single-Barrel-Kentucky-Straight-Bourbon-Whiskey-750ml-100-Proof/392415896" },
   ],
   totalwine: [
     { name: "Buffalo Trace", url: "https://www.totalwine.com/spirits/bourbon/small-batch-bourbon/buffalo-trace-kentucky-straight-bourbon-whiskey/p/102882750" },

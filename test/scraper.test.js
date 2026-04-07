@@ -4809,6 +4809,14 @@ describe("SEED_PRODUCT_URLS", () => {
     expect(names).toContain("Blanton's Original");
   });
 
+  it("walmart seeds contain key allocated bottles", () => {
+    const names = SEED_PRODUCT_URLS.walmart.map(s => s.name);
+    expect(names).toContain("Blanton's Straight from the Barrel");
+    expect(names).toContain("Rock Hill Farms");
+    expect(names).toContain("Jack Daniel's 14 Year");
+    expect(names).toContain("Pappy Van Winkle 23 Year");
+  });
+
   it("seed bottle names match TARGET_BOTTLES", () => {
     const targetNames = new Set(TARGET_BOTTLES.map(b => b.name));
     for (const [, seeds] of Object.entries(SEED_PRODUCT_URLS)) {
