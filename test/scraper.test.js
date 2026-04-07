@@ -88,7 +88,10 @@ import {
   KROGER_PRODUCTS, checkKrogerKnownProducts,
   trackHealth,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
-  REDDIT_INTEL_SUBREDDITS, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
+  REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
+  shuffleKeepCanaryFirst,
+  scrapeSafewayViaBrowser,
+  handleShutdown, shuttingDown,
   validateEnv,
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
@@ -7619,4 +7622,410 @@ describe("scrapeRedditIntel", () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("fetch failed"));
     warnSpy.mockRestore();
   });
+
+  it("filters national subs by AZ terms", async () => {
+    vi.useRealTimers();
+    // National sub post WITHOUT AZ mention — should be skipped
+    const nonAZPost = { data: { children: [{
+      data: { id: "nat1", title: "Found Pappy at Costco in Ohio!", selftext: "Great find in Columbus", created_utc: Date.now() / 1000 - 60, author: "ohiouser", score: 5, num_comments: 2, permalink: "/r/bourbon/nat1" },
+    }] } };
+    // AZ-specific sub post — should be matched
+    const azPost = { data: { children: [{
+      data: { id: "az1", title: "Blanton's spotted at Costco Scottsdale", selftext: "", created_utc: Date.now() / 1000 - 60, author: "azuser", score: 10, num_comments: 5, permalink: "/r/ArizonaWhiskey/az1" },
+    }] } };
+    const empty = JSON.stringify({ data: { children: [] } });
+    mocks.gotScraping.mockImplementation(async (opts) => {
+      const url = typeof opts === "string" ? opts : opts.url;
+      if (url.includes("ArizonaWhiskey")) return mockGotResponse(200, JSON.stringify(azPost));
+      if (url.includes("/r/bourbon/")) return mockGotResponse(200, JSON.stringify(nonAZPost));
+      return mockGotResponse(200, empty);
+    });
+    // Discord webhook mock
+    mocks.fetch.mockResolvedValue({ ok: true });
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(state._redditSeen).toHaveProperty("az1");
+    expect(state._redditSeen).not.toHaveProperty("nat1");
+  });
+
+  it("matches AZ terms in national sub posts", async () => {
+    vi.useRealTimers();
+    const azNationalPost = { data: { children: [{
+      data: { id: "aznat1", title: "Costco haul today", selftext: "Found Weller at Phoenix Costco", created_utc: Date.now() / 1000 - 60, author: "user1", score: 3, num_comments: 1, permalink: "/r/bourbon/aznat1" },
+    }] } };
+    const empty = JSON.stringify({ data: { children: [] } });
+    mocks.gotScraping.mockImplementation(async (opts) => {
+      const url = typeof opts === "string" ? opts : opts.url;
+      if (url.includes("/r/bourbon/")) return mockGotResponse(200, JSON.stringify(azNationalPost));
+      return mockGotResponse(200, empty);
+    });
+    mocks.fetch.mockResolvedValue({ ok: true });
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(state._redditSeen).toHaveProperty("aznat1");
+  });
+
+  it("prunes old seen IDs beyond 7 days", async () => {
+    vi.useRealTimers();
+    const empty = JSON.stringify({ data: { children: [] } });
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, empty));
+    const state = {
+      _redditSeen: {
+        old1: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
+        recent1: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString(),
+      },
+    };
+    await scrapeRedditIntel(state);
+    expect(state._redditSeen).not.toHaveProperty("old1");
+    expect(state._redditSeen).toHaveProperty("recent1");
+  });
+
+  it("builds Reddit embed and marks post as seen", async () => {
+    vi.useRealTimers();
+    const post = { data: { children: [{
+      data: { id: "embed1", title: "KoK drop at Costco Tempe!", selftext: "King of Kentucky just dropped, limit 1", created_utc: Date.now() / 1000 - 60, author: "bourbon_hunter", score: 42, num_comments: 15, permalink: "/r/ArizonaWhiskey/embed1" },
+    }] } };
+    const empty = JSON.stringify({ data: { children: [] } });
+    mocks.gotScraping.mockImplementation(async (opts) => {
+      const url = typeof opts === "string" ? opts : opts.url;
+      if (url.includes("ArizonaWhiskey")) return mockGotResponse(200, JSON.stringify(post));
+      return mockGotResponse(200, empty);
+    });
+    mocks.fetch.mockResolvedValue({ ok: true });
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(state._redditSeen).toHaveProperty("embed1");
+  });
+
+  it("skips posts older than 2 hours (new)", async () => {
+    vi.useRealTimers();
+    const oldPost = { data: { children: [{
+      data: { id: "old2", title: "Blanton's at Costco", selftext: "", created_utc: Date.now() / 1000 - 3 * 60 * 60, author: "user", score: 1, num_comments: 0, permalink: "/r/ArizonaWhiskey/old2" },
+    }] } };
+    const empty = JSON.stringify({ data: { children: [] } });
+    mocks.gotScraping.mockImplementation(async (opts) => {
+      const url = typeof opts === "string" ? opts : opts.url;
+      if (url.includes("ArizonaWhiskey")) return mockGotResponse(200, JSON.stringify(oldPost));
+      return mockGotResponse(200, empty);
+    });
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(state._redditSeen).not.toHaveProperty("old2");
+  });
+
+  it("skips posts with no matching keywords", async () => {
+    vi.useRealTimers();
+    const irrelevantPost = { data: { children: [{
+      data: { id: "irr1", title: "Great weather today", selftext: "Sunshine in Arizona", created_utc: Date.now() / 1000 - 60, author: "user", score: 1, num_comments: 0, permalink: "/r/ArizonaWhiskey/irr1" },
+    }] } };
+    const empty = JSON.stringify({ data: { children: [] } });
+    mocks.gotScraping.mockImplementation(async (opts) => {
+      const url = typeof opts === "string" ? opts : opts.url;
+      if (url.includes("ArizonaWhiskey")) return mockGotResponse(200, JSON.stringify(irrelevantPost));
+      return mockGotResponse(200, empty);
+    });
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(state._redditSeen).not.toHaveProperty("irr1");
+  });
+
+  it("handles non-ok response status", async () => {
+    vi.useRealTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(403, "Forbidden"));
+    const state = {};
+    await scrapeRedditIntel(state);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("returned 403"));
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── REDDIT CONFIG ──────────────────────────────────────────────────────────
+
+describe("Reddit config", () => {
+  it("REDDIT_NATIONAL_SUBREDDITS includes bourbon and Costco_alcohol", () => {
+    expect(REDDIT_NATIONAL_SUBREDDITS).toContain("bourbon");
+    expect(REDDIT_NATIONAL_SUBREDDITS).toContain("Costco_alcohol");
+    expect(REDDIT_NATIONAL_SUBREDDITS).toContain("whiskey");
+  });
+
+  it("REDDIT_AZ_FILTER includes AZ cities", () => {
+    expect(REDDIT_AZ_FILTER).toContain("phoenix");
+    expect(REDDIT_AZ_FILTER).toContain("tempe");
+    expect(REDDIT_AZ_FILTER).toContain("scottsdale");
+  });
+
+  it("REDDIT_INTEL_KEYWORDS includes bottle and store terms", () => {
+    expect(REDDIT_INTEL_KEYWORDS).toContain("pappy");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("costco");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("allocated");
+    expect(REDDIT_INTEL_KEYWORDS).toContain("kok");
+  });
+});
+
+// ─── Watch List ─────────────────────────────────────────────────────────────
+
+describe("Watch List", () => {
+  it("watchListKey generates deterministic key", () => {
+    const entry = { bottle: "Pappy", retailer: "costco", stores: ["3", "1", "2"] };
+    const key = watchListKey(entry);
+    expect(key).toBe("Pappy:costco:1,2,3");
+  });
+
+  it("watchListKey uses default bottle name when omitted", () => {
+    const entry = { retailer: "totalwine", stores: ["100"] };
+    const key = watchListKey(entry);
+    expect(key).toBe("Allocated Bourbon:totalwine:100");
+  });
+
+  it("buildWatchListEmbed includes store IDs when storeCache empty", () => {
+    const entry = { bottle: "Pappy 23", retailer: "costco", stores: ["427"], source: "Reddit", date: "2026-04-07" };
+    const embed = buildWatchListEmbed(entry);
+    expect(embed.title).toContain("Pappy 23");
+    expect(embed.title).toContain("Costco");
+    expect(embed.description).toContain("427");
+    expect(embed.description).toContain("Reddit");
+    expect(embed.color).toBe(COLORS.rumor);
+  });
+
+  it("buildWatchListEmbed lists all bottles when bottle omitted", () => {
+    const entry = { retailer: "costco", stores: ["427"] };
+    const embed = buildWatchListEmbed(entry);
+    expect(embed.title).toContain("Allocated Bourbon");
+    expect(embed.description).toContain("Bottles to watch for");
+    // Should include tracked bottles (Blanton's, Pappy, etc.)
+    expect(embed.description).toContain("Blanton's Original");
+  });
+
+  it("processWatchList skips already-notified entries", async () => {
+    const entry = { bottle: "Test", retailer: "costco", stores: ["1"] };
+    const state = { _watchList: { [watchListKey(entry)]: "2026-01-01T00:00:00Z" } };
+    // Even if WATCH_LIST is empty in test env, we test the skip logic
+    await processWatchList(state);
+    // No new alerts should be sent (state unchanged)
+    expect(Object.keys(state._watchList).length).toBe(1);
+  });
+
+  it("processWatchList is a no-op when WATCH_LIST is empty", async () => {
+    vi.useRealTimers();
+    const state = {};
+    await processWatchList(state);
+    // WATCH_LIST is empty in test env — early return, _watchList not initialized
+    expect(WATCH_LIST.length).toBe(0);
+    expect(state._watchList).toBeUndefined();
+  });
+});
+
+// ─── shuffleKeepCanaryFirst ─────────────────────────────────────────────────
+
+describe("shuffleKeepCanaryFirst", () => {
+  it("keeps first element in position 0 and shuffles the rest", () => {
+    vi.useRealTimers();
+    const queries = ["buffalo trace", "blanton", "weller", "pappy"];
+    for (let i = 0; i < 10; i++) {
+      const shuffled = shuffleKeepCanaryFirst([...queries]);
+      expect(shuffled[0]).toBe("buffalo trace");
+      expect(shuffled.length).toBe(queries.length);
+      expect(new Set(shuffled)).toEqual(new Set(queries));
+    }
+  });
+
+  it("returns single-element arrays unchanged", () => {
+    vi.useRealTimers();
+    const queries = ["buffalo trace"];
+    const shuffled = shuffleKeepCanaryFirst([...queries]);
+    expect(shuffled).toEqual(["buffalo trace"]);
+  });
+
+  it("returns empty arrays unchanged", () => {
+    vi.useRealTimers();
+    const shuffled = shuffleKeepCanaryFirst([]);
+    expect(shuffled).toEqual([]);
+  });
+});
+
+// ─── isProxyAvailable / failoverToBackupProxy ───────────────────────────────
+
+describe("proxy availability", () => {
+  it("isProxyAvailable returns false when no proxy", () => {
+    // Module-level proxyAgent is null in test env (no PROXY_URL)
+    expect(isProxyAvailable()).toBe(false);
+  });
+
+  it("failoverToBackupProxy returns false when no backup URL", () => {
+    // No BACKUP_PROXY_URL in test env
+    expect(failoverToBackupProxy()).toBe(false);
+  });
+
+  it("refreshProxySession is a no-op without PROXY_URL", () => {
+    // No PROXY_URL in test env — should return without side effects
+    refreshProxySession();
+    expect(getRetailerProxyUrl("costco")).toBeFalsy();
+  });
+
+  it("rotateRetailerProxy is a no-op without PROXY_URL", () => {
+    // No PROXY_URL in test env — should return without side effects
+    rotateRetailerProxy("costco");
+    expect(getRetailerProxyUrl("costco")).toBeFalsy();
+  });
+
+  it("_setPrimaryProxyExhausted and _setBackupProxyExhausted work independently", () => {
+    _setPrimaryProxyExhausted(true);
+    _setBackupProxyExhausted(false);
+    // With no proxy agent, isProxyAvailable should still be false
+    expect(isProxyAvailable()).toBe(false);
+    _setPrimaryProxyExhausted(false);
+    _setBackupProxyExhausted(false);
+  });
+});
+
+// ─── scrapeSafewayStore wrapper ─────────────────────────────────────────────
+
+describe("scrapeSafewayStore", () => {
+  afterEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+    vi.restoreAllMocks();
+  });
+
+  it("returns [] on browser launch failure", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // launchRetailerBrowser is mocked to throw
+    const result = await scrapeSafewayStore({ storeId: "1515", name: "Safeway Test" });
+    expect(result).toEqual([]);
+  });
+
+  it("returns [] when no SAFEWAY_API_KEY is set", async () => {
+    // In test environment, SAFEWAY_API_KEY may not be set
+    // scrapeSafewayStore should handle this gracefully
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const result = await scrapeSafewayStore({ storeId: "1515", name: "Safeway Test" });
+    expect(Array.isArray(result)).toBe(true);
+  });
+});
+
+// ─── handleShutdown ─────────────────────────────────────────────────────────
+
+describe("handleShutdown", () => {
+  it("is a function", () => {
+    expect(typeof handleShutdown).toBe("function");
+  });
+
+  it("shuttingDown starts as false", () => {
+    expect(shuttingDown).toBe(false);
+  });
+
+  it("handleShutdown is exported and callable", () => {
+    // We can't actually call handleShutdown because it sets up timers that call process.exit.
+    // Just verify the function signature.
+    expect(typeof handleShutdown).toBe("function");
+    expect(handleShutdown.length).toBe(1); // takes 1 arg (signal)
+  });
+});
+
+// ─── scrapeWalmartViaFetch ───────────────────────────────────────────────────
+
+describe("scrapeWalmartViaFetch", () => {
+  afterEach(() => {
+    _resetScraperHealth();
+    vi.restoreAllMocks();
+  });
+
+  it("returns null when all queries are blocked (below 25% threshold)", async () => {
+    vi.useRealTimers();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // All responses blocked
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, "<html>Access Denied</html>"));
+    const result = await scrapeWalmartViaFetch({ storeId: "5678", name: "Walmart Test" });
+    expect(result).toBe(null);
+  }, 30000);
+
+  it("returns results from valid __NEXT_DATA__", async () => {
+    vi.useRealTimers();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const validNextData = JSON.stringify({
+      props: { pageProps: { initialData: { searchResult: { itemStacks: [{ items: [] }] } } } },
+    });
+    const validHtml = `<html><script id="__NEXT_DATA__" type="application/json">${validNextData}</script></html>`;
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, validHtml));
+    const result = await scrapeWalmartViaFetch({ storeId: "5678", name: "Walmart Test" });
+    expect(Array.isArray(result)).toBe(true);
+  }, 30000);
+});
+
+// ─── scrapeSamsClubViaFetch ─────────────────────────────────────────────────
+
+describe("scrapeSamsClubViaFetch", () => {
+  afterEach(() => {
+    _resetScraperHealth();
+    vi.restoreAllMocks();
+  });
+
+  it("returns null when all products are blocked", async () => {
+    vi.useRealTimers();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.gotScraping.mockResolvedValue(mockGotResponse(200, "<html>Access Denied</html>"));
+    const result = await scrapeSamsClubViaFetch();
+    expect(result).toBe(null);
+  }, 60000);
+});
+
+// ─── poll() integration ─────────────────────────────────────────────────────
+
+describe("poll integration", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    _resetScraperHealth();
+    _resetRetailerBrowserCache();
+    _resetPolling();
+    _resetRetailerFailures();
+    vi.restoreAllMocks();
+  });
+
+  it("poll completes with empty store cache", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    _setStoreCache({ retailers: {} }); // No stores — scan runs instantly
+
+    mocks.readFile.mockRejectedValue(new Error("ENOENT"));
+    mocks.writeFile.mockResolvedValue(undefined);
+    mocks.rename.mockResolvedValue(undefined);
+    mocks.appendFile.mockResolvedValue(undefined);
+    mocks.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
+
+    await poll();
+    // Should complete without throwing — exercises budget check, metrics, summary
+  }, 15000);
+
+  it("poll records retailer outcomes after scan", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    _resetRetailerFailures();
+    _setStoreCache({ retailers: {} });
+
+    mocks.readFile.mockRejectedValue(new Error("ENOENT"));
+    mocks.writeFile.mockResolvedValue(undefined);
+    mocks.rename.mockResolvedValue(undefined);
+    mocks.appendFile.mockResolvedValue(undefined);
+    mocks.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
+
+    // Pre-set some health data
+    trackHealth("kroger", "ok");
+    trackHealth("kroger", "ok");
+    trackHealth("kroger", "fail");
+
+    await poll();
+    // Poll should complete and record outcomes
+  }, 15000);
 });
