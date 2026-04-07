@@ -146,7 +146,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-762 tests across 5 files using [Vitest](https://vitest.dev/) (90.1% line coverage, 80.4% branch):
+791 tests across 5 files using [Vitest](https://vitest.dev/) (95.8% line coverage, 83.9% branch):
 
 ```sh
 npm test                # Run all tests
@@ -155,8 +155,8 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 614 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling ($500), all 7 scrapers, Discord embeds (re-alert/OOS/health emoji/canary/trend), poll orchestration, error isolation, health tracking, scan metrics/trends, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage (Old Rip/Colonel/SFB), parseSize liter/litre, normalizeText unicode, truncateDescription OOS, dedupFound N/A, shuffle/withTimeout/runWithConcurrency edges, peak hour formatting, watch list (key generation/embed/processing), Reddit intel (keywords/subreddits/scraping/dedup) |
-| `test/proxy.test.js` | 36 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
+| `test/scraper.test.js` | 669 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling ($500), all 7 scrapers, Discord embeds (re-alert/OOS/health emoji/canary/trend), poll orchestration, error isolation, health tracking, scan metrics/trends, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage (Old Rip/Colonel/SFB), parseSize liter/litre, normalizeText unicode, truncateDescription OOS, dedupFound N/A, shuffle/withTimeout/runWithConcurrency edges, peak hour formatting, watch list (key generation/embed/processing), Reddit intel (keywords/subreddits/scraping/dedup), shuffleKeepCanaryFirst, proxy availability/failover, Safeway browser wrapper, handleShutdown, poll integration (store scanning/canary retry), Walmart/Sam's Club fetch paths |
+| `test/proxy.test.js` | 35 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |
 | `test/fallback-stores.test.js` | 9 | Static fallback store data validation, EXTRA_STORES structure and dedup |
