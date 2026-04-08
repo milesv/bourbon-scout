@@ -35,6 +35,7 @@ const {
   REALERT_EVERY_N_SCANS = "4",
   PROXY_URL,
   BACKUP_PROXY_URL,
+  SECONDARY_ZIPS,
 } = process.env;
 
 // Parse cron-style POLL_INTERVAL into milliseconds for setTimeout-based scheduling.
@@ -225,7 +226,9 @@ function failoverToBackupProxy() {
 }
 
 // Per-poll health metrics per retailer. Reset each poll().
-// Structure: { retailerKey: { queries: 0, succeeded: 0, failed: 0, blocked: 0 } }
+// Structure: { retailerKey: { queries: 0, succeeded: 0, failed: 0, blocked: 0,
+//   queryStats: { "query string": { ok: 0, blocked: 0, failed: 0 } },
+//   path: { fetch: 0, browser: 0 } } }
 let scraperHealth = {};
 
 // Proxy exhaustion tracking. When primary proxy returns 407 TRAFFIC_EXHAUSTED, we attempt
@@ -235,15 +238,28 @@ let primaryProxyExhausted = false;
 let backupProxyExhausted = false;
 
 function initHealth(key) {
-  if (!scraperHealth[key]) scraperHealth[key] = { queries: 0, succeeded: 0, failed: 0, blocked: 0 };
+  if (!scraperHealth[key]) scraperHealth[key] = { queries: 0, succeeded: 0, failed: 0, blocked: 0, queryStats: {}, path: { fetch: 0, browser: 0 }, stores: {} };
 }
 
-function trackHealth(key, outcome) {
+function trackHealth(key, outcome, { query, via, storeId } = {}) {
   initHealth(key);
   scraperHealth[key].queries++;
   if (outcome === "ok") scraperHealth[key].succeeded++;
   else if (outcome === "blocked") scraperHealth[key].blocked++;
   else scraperHealth[key].failed++;
+  // Per-query tracking (optional) — reveals which queries find bottles vs. waste budget
+  if (query) {
+    if (!scraperHealth[key].queryStats[query]) scraperHealth[key].queryStats[query] = { ok: 0, blocked: 0, failed: 0 };
+    scraperHealth[key].queryStats[query][outcome === "ok" ? "ok" : outcome === "blocked" ? "blocked" : "failed"]++;
+  }
+  // Fetch-vs-browser attribution (optional) — tracks which path produced the outcome
+  if (via === "fetch") scraperHealth[key].path.fetch++;
+  else if (via === "browser") scraperHealth[key].path.browser++;
+  // Per-store tracking (optional) — identifies persistently blocked stores
+  if (storeId) {
+    if (!scraperHealth[key].stores[storeId]) scraperHealth[key].stores[storeId] = { ok: 0, blocked: 0, failed: 0 };
+    scraperHealth[key].stores[storeId][outcome === "ok" ? "ok" : outcome === "blocked" ? "blocked" : "failed"]++;
+  }
 }
 
 const STATE_FILE = new URL("./state.json", import.meta.url);
@@ -1793,6 +1809,7 @@ const CATEGORY_URLS = {
   walmart: "https://www.walmart.com/browse/food/wine-beer-spirits/976759_1085633",
   walgreens: "https://www.walgreens.com/store/c/wine-beer-and-spirits/ID=360442-tier2general",
   samsclub: "https://www.samsclub.com/b/spirits/2020102",
+  safeway: "https://www.safeway.com/shop/aisles/beer-wine-spirits/spirits.3132.html",
 };
 
 async function navigateCategory(page, retailerKey) {
@@ -2105,8 +2122,9 @@ async function scrapeCostcoOnce(page) {
   await sleep(3000 + Math.random() * 2000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "fast" });
-  // Category navigation skipped — saves ~15s. Akamai cares about sensor telemetry from
-  // homepage (mouse/scroll events), not navigation depth. Direct search is fine.
+  // Category navigation adds browsing depth (homepage → category → search) which raises
+  // behavioral scores with Akamai. Costs ~4-6s but makes the session look more human.
+  await navigateCategory(page, "costco");
 
   const found = [];
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
@@ -2285,7 +2303,7 @@ function matchTotalWineInitialState(state) {
 
 // Try fetching Total Wine search HTML directly and parsing INITIAL_STATE (no browser needed).
 // Returns { name, url, price, sku, size, fulfillment }[] on success, null if blocked.
-async function scrapeTotalWineViaFetch(store) {
+async function scrapeTotalWineViaFetch(store, { cachedCookies = "" } = {}) {
   if (!isProxyAvailable()) return null; // skip if no working proxy
   const twProxy = getRetailerProxyUrl("totalwine");
   const found = [];
@@ -2294,18 +2312,22 @@ async function scrapeTotalWineViaFetch(store) {
 
   // Pre-warm: fetch homepage to get PerimeterX session cookies (_px3, _px2, _pxvid).
   // Without these cookies, search URLs immediately return a PerimeterX challenge page.
-  // Same pattern as Costco's successful fetch pre-warm.
-  let cookies = "";
+  // When cachedCookies are provided (from prior browser scrape), merge them with homepage
+  // Set-Cookie for the strongest possible cookie set.
+  let cookies = cachedCookies || "";
   try {
+    const homeHeaders = { ...FETCH_HEADERS };
+    if (cookies) homeHeaders["Cookie"] = cookies;
     const homeRes = await scraperFetchRetry("https://www.totalwine.com/", {
-      headers: FETCH_HEADERS,
+      headers: homeHeaders,
       timeout: 10000,
       proxyUrl: twProxy,
     });
     const rawSetCookie = homeRes.headers["set-cookie"];
     const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
-    cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
-  } catch { /* continue without cookies */ }
+    const homeCookies = setCookies.map((c) => c.split(";")[0]).join("; ");
+    cookies = cookies ? `${cookies}; ${homeCookies}` : homeCookies;
+  } catch { /* continue with cached cookies */ }
 
   // Batch queries (2 concurrent) — lower concurrency reduces PerimeterX burst detection.
   // With 4 stores potentially running fetch simultaneously, even 2 concurrent queries
@@ -2409,10 +2431,10 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
     await sleep(4000 + Math.random() * 3000); // PerimeterX needs longer JS execution time
     await solveHumanChallenge(page);
     await humanizePage(page, { pace: "slow" });
+    // Category navigation adds browsing depth for PerimeterX behavioral scoring.
+    // Warm contexts (subsequent stores) skip pre-warm entirely so this only runs once.
+    await navigateCategory(page, "totalwine");
     console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
-    // Skip category navigation on cold start — saves ~15-20s that's better spent on queries.
-    // PerimeterX cares about JS sensor telemetry from homepage, not navigation flow.
-    // Warm contexts (subsequent stores) already skip pre-warm entirely.
   } else {
     console.log(`[totalwine:${store.storeId}] Skipping pre-warm (context already warm)`);
   }
@@ -2578,9 +2600,24 @@ async function scrapeTotalWineStore(store) {
     return [];
   });
 
-  // Fetch-first disabled — PerimeterX blocks got-scraping even with proxy (requires JS sensor
-  // execution). The clean browser path works reliably so skip the fetch to save ~10s per store.
-  // The fetch function is retained for future use if PerimeterX relaxes fetch blocking.
+  // Fetch-first: try got-scraping with cached browser _px* cookies before launching browser.
+  // Previously disabled (PerimeterX blocks fetch without JS sensor), but now the browser→fetch
+  // cookie chain provides valid _px* cookies from prior browser scrapes. Falls back to browser
+  // if cookies are stale or PerimeterX rejects them.
+  const cachedTwCookies = getCachedCookies("totalwine");
+  if (cachedTwCookies && isProxyAvailable()) {
+    // Inject cached PerimeterX cookies into the fetch path's pre-warm
+    const fetchResult = await scrapeTotalWineViaFetch(store, { cachedCookies: cachedTwCookies }).catch((err) => {
+      console.warn(`[totalwine:${store.storeId}] Fetch path failed: ${err.message}`);
+      return null;
+    });
+    if (fetchResult !== null) {
+      console.log(`[totalwine:${store.storeId}] Used fast fetch mode (cached browser cookies)`);
+      return dedupFound([...knownFound, ...fetchResult]);
+    }
+    // Reset health from failed fetch before browser attempt
+    delete scraperHealth["totalwine"];
+  }
 
   // Per-store scrapers do NOT use fail-fast — each store tries browser independently.
   // A fresh page load with different queries may succeed even if a prior store was blocked.
@@ -2788,6 +2825,7 @@ async function scrapeWalmartViaBrowser(store, page) {
   await sleep(3000 + Math.random() * 3000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "medium" });
+  await navigateCategory(page, "walmart");
 
   const found = [];
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
@@ -3010,6 +3048,7 @@ async function scrapeWalgreensViaBrowser(page) {
     await page.mouse.wheel(0, -(300 + Math.random() * 200)).catch(() => {});
     await sleep(300 + Math.random() * 300);
   }
+  await navigateCategory(page, "walgreens");
   console.log(`[walgreens] Pre-warm done (${wgElapsed()}), starting queries...`);
 
   let wgConsecutiveBlocks = 0;
@@ -3325,6 +3364,7 @@ async function scrapeSamsClubViaBrowser(page) {
   await sleep(5000 + Math.random() * 3000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "slow" });
+  await navigateCategory(page, "samsclub");
 
   const found = [];
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
@@ -3677,6 +3717,83 @@ function matchSafewayProducts(products) {
   return found;
 }
 
+// Fetch-first Safeway scraper. Uses cached browser _abck cookies (from prior browser scrape) to call
+// the Safeway product search API directly via got-scraping, bypassing the browser entirely. Falls back
+// to null (triggering browser fallback) if cached cookies are stale or Akamai blocks the request.
+// The API is a simple GET with Ocp-Apim-Subscription-Key + storeid — no complex auth needed.
+/* v8 ignore start -- requires live Akamai _abck cookies from prior browser scrape */
+async function scrapeSafewayViaFetch(store) {
+  if (!SAFEWAY_API_KEY) return null;
+  // Cached browser cookies required — Akamai _abck won't work from scratch via fetch
+  const cachedCookies = getCachedCookies("safeway");
+  if (!cachedCookies) return null;
+
+  const found = [];
+  let validPages = 0;
+  let failures = 0;
+  const sfProxy = getRetailerProxyUrl("safeway");
+
+  const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
+  const queries = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES));
+
+  for (let i = 0; i < queries.length; i++) {
+    const query = queries[i];
+    if (failures > 3) break; // Too many failures — fall back to browser
+    if (i > 0) await sleep(1500 + Math.random() * 2000);
+    const apiUrl = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
+    try {
+      const headers = {
+        ...FETCH_HEADERS,
+        "Ocp-Apim-Subscription-Key": SAFEWAY_API_KEY,
+        Accept: "application/json",
+        Cookie: cachedCookies,
+      };
+      if (i > 0) {
+        headers["Sec-Fetch-Site"] = "same-origin";
+        headers["Referer"] = "https://www.safeway.com/";
+      }
+      const res = await scraperFetchRetry(apiUrl, {
+        headers,
+        timeout: 15000,
+        proxyUrl: sfProxy || undefined,
+      });
+      if (!res.ok) { failures++; continue; }
+      const data = await res.json();
+      if (isFetchBlocked(JSON.stringify(data).slice(0, 10000))) { failures++; continue; }
+      if (data?.primaryProducts?.response?.docs) {
+        found.push(...matchSafewayProducts(data.primaryProducts.response.docs));
+        validPages++;
+        trackHealth("safeway", "ok");
+
+        // Page 2 if first page was full
+        if (data.primaryProducts.response.docs.length === 50) {
+          try {
+            const page2Url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
+            const res2 = await scraperFetchRetry(page2Url, { headers, timeout: 15000, proxyUrl: sfProxy || undefined });
+            if (res2.ok) {
+              const data2 = await res2.json();
+              if (data2?.primaryProducts?.response?.docs) {
+                found.push(...matchSafewayProducts(data2.primaryProducts.response.docs));
+              }
+            }
+          } catch { /* page 2 failure is non-critical */ }
+        }
+      } else {
+        failures++;
+      }
+    } catch {
+      failures++;
+    }
+  }
+
+  // Require at least 25% of queries to succeed
+  const minValid = Math.max(1, Math.ceil(queries.length / 4));
+  if (validPages < minValid) return null;
+  console.log(`[safeway:${store.storeId}] Used fast fetch mode (cached browser cookies)`);
+  return dedupFound(found);
+}
+/* v8 ignore stop */
+
 // Browser-based Safeway scraper. Akamai WAF blocks all fetch-based approaches (API + got-scraping),
 // so we use a real browser to execute Akamai's JS sensor during pre-warm, then call the Safeway API
 // from within the browser context (inherits valid _abck cookies). Falls back to DOM extraction.
@@ -3691,6 +3808,7 @@ async function scrapeSafewayViaBrowser(page, store) {
   await sleep(4000 + Math.random() * 3000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "slow" });
+  await navigateCategory(page, "safeway");
   console.log(`[safeway:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
 
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
@@ -3795,9 +3913,19 @@ async function scrapeSafewayViaBrowser(page, store) {
   return dedupFound(found);
 }
 
-// Wrapper: launches browser, handles timeout/retry, caches cookies.
-// Modeled after scrapeWalgreensStore (line 3058).
+// Wrapper: tries fetch-first with cached cookies, then launches browser, handles timeout/retry.
 async function scrapeSafewayStore(store) {
+  // Fetch-first: use cached browser _abck cookies to call Safeway API directly.
+  // Skips browser entirely when cookies are fresh (~15-20s faster per store).
+  const fetchResult = await scrapeSafewayViaFetch(store).catch((err) => {
+    console.warn(`[safeway:${store.storeId}] Fetch path failed: ${err.message}`);
+    return null;
+  });
+  if (fetchResult !== null) return fetchResult;
+
+  // Reset health from failed fetch before browser attempt
+  delete scraperHealth["safeway"];
+
   for (let attempt = 0; attempt < 2; attempt++) {
     /* v8 ignore start -- browser retry loop internals (launch failure tested separately) */
     if (attempt > 0) {
@@ -4101,6 +4229,8 @@ async function poll() {
       queries: h.queries, ok: h.succeeded, blocked: h.blocked, failed: h.failed,
       canary: !!canaryResults[retailer.key],
       found: scanFinds[retailer.key] ? [...scanFinds[retailer.key]] : [],
+      path: h.path || { fetch: 0, browser: 0 },
+      queryStats: h.queryStats || {},
     };
   }
   const metricsEntry = {
@@ -4147,7 +4277,7 @@ export {
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore,
-  matchSafewayProducts, scrapeSafewayViaBrowser, scrapeSafewayStore,
+  matchSafewayProducts, scrapeSafewayViaFetch, scrapeSafewayViaBrowser, scrapeSafewayStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
@@ -4207,6 +4337,37 @@ async function main() {
       krogerClientId: KROGER_CLIENT_ID,
       krogerClientSecret: KROGER_CLIENT_SECRET,
     });
+
+    // Secondary zip codes: discover stores in additional areas and merge (dedup by storeId).
+    // Useful for monitoring stores near work, family, or rumored drop locations.
+    if (SECONDARY_ZIPS) {
+      const secondaryZips = SECONDARY_ZIPS.split(",").map((z) => z.trim()).filter(Boolean);
+      for (const zip of secondaryZips) {
+        console.log(`[discover] Secondary zip: ${zip}`);
+        try {
+          const extra = await discoverStores({
+            zipCode: zip,
+            radiusMiles: parseInt(SEARCH_RADIUS_MILES, 10),
+            maxStores: parseInt(MAX_STORES_PER_RETAILER, 10),
+            krogerClientId: KROGER_CLIENT_ID,
+            krogerClientSecret: KROGER_CLIENT_SECRET,
+          });
+          // Merge stores, dedup by storeId
+          for (const [key, stores] of Object.entries(extra.retailers)) {
+            if (!storeCache.retailers[key]) storeCache.retailers[key] = [];
+            const existingIds = new Set(storeCache.retailers[key].map((s) => s.storeId));
+            for (const store of stores) {
+              if (!existingIds.has(store.storeId)) {
+                storeCache.retailers[key].push(store);
+                existingIds.add(store.storeId);
+              }
+            }
+          }
+        } catch (err) {
+          console.warn(`[discover] Secondary zip ${zip} failed: ${err.message}`);
+        }
+      }
+    }
 
     // Prune old metrics entries once at startup (prevents unbounded file growth)
     await pruneMetrics(30);

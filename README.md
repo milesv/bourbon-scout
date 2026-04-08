@@ -13,17 +13,17 @@ Some bottles are retailer-restricted (e.g., Michter's 10 Year and Penelope only 
 | Retailer | Method | Data Source |
 |----------|--------|-------------|
 | Costco | Fetch-first (got-scraping), clean browser fallback | MUI `data-testid` attributes |
-| Total Wine | Clean browser (headed on Mac) | `window.INITIAL_STATE` JSON |
+| Total Wine | Fetch-first (got-scraping + cached cookies), clean browser fallback | `window.INITIAL_STATE` JSON |
 | Walmart | Fetch-first (got-scraping), clean browser fallback | `__NEXT_DATA__` JSON |
 | Kroger | REST API | Structured JSON |
-| Safeway | REST API | Structured JSON |
+| Safeway | Fetch-first (got-scraping + cached cookies), REST API fallback | Structured JSON |
 | Walgreens | Clean browser (headed on Mac) | Server-rendered HTML (CSS selectors) |
 | Sam's Club | Fetch-first (got-scraping), clean browser fallback | `__NEXT_DATA__` JSON (per-product) |
 
 ## How It Works
 
 1. **Store Discovery** — On startup, auto-discovers nearby stores for each retailer based on your zip code and search radius. Results are cached for 7 days. Falls back to static store data if browser-based locators fail (e.g., on CI).
-2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 15 broad search queries that cover all 44 bottles. Each retailer gets a dedicated residential IP via per-retailer sticky proxy sessions. If a proxy IP gets blocked mid-scan, it automatically rotates to a fresh IP after 2 consecutive failures. Retailers are staggered 10-30s apart. All 5 browser scrapers use "clean" Chrome — plain `chromium.launch()` without stealth plugin or rebrowser-patches (these CDP modifications are actually fingerprinted by anti-bot systems). On Mac, browsers run headed and minimized via CDP `Browser.setWindowBounds`. 4 of 5 scrapers try `got-scraping` fetch-first (Chrome TLS fingerprint impersonation via JA3/JA4 spoofing) before falling back to browser; Total Wine goes straight to browser (PerimeterX requires JS sensor execution). Persistent browser profiles per retailer (HTTP cache, service workers, IndexedDB persist on disk). Browser scrapers follow a human-like flow: homepage → category page → search queries. Includes a PerimeterX "Press & Hold" challenge solver with retry, micro-movements during hold, and button render wait. Known bottle URLs from previous finds are checked directly before searching. Includes a canary bottle (Buffalo Trace) as a scraper health check. Retailers that fail 3 consecutive scans are automatically backed off for 30 minutes.
+2. **Inventory Scanning** — Scans all stores concurrently (limit 8) using 15 broad search queries that cover all 44 bottles. Each retailer gets a dedicated residential IP via per-retailer sticky proxy sessions. If a proxy IP gets blocked mid-scan, it automatically rotates to a fresh IP after 2 consecutive failures. Retailers are staggered 10-30s apart. All 5 browser scrapers use "clean" Chrome — plain `chromium.launch()` without stealth plugin or rebrowser-patches (these CDP modifications are actually fingerprinted by anti-bot systems). On Mac, browsers run headed and minimized via CDP `Browser.setWindowBounds`. All 5 browser scrapers try `got-scraping` fetch-first (Chrome TLS fingerprint impersonation via JA3/JA4 spoofing) before falling back to browser. Total Wine and Safeway fetch paths use cached browser cookies to bypass anti-bot checks that would otherwise block cold requests. Persistent browser profiles per retailer (HTTP cache, service workers, IndexedDB persist on disk). Browser scrapers follow a human-like flow: homepage → humanization (scroll/hover) → spirits category page → search queries. Includes a PerimeterX "Press & Hold" challenge solver with retry, micro-movements during hold, and button render wait. Known bottle URLs from previous finds are checked directly before searching. Includes a canary bottle (Buffalo Trace) as a scraper health check. Retailers that fail 3 consecutive scans are automatically backed off for 30 minutes.
 3. **State Tracking** — Tracks stock changes between scans: new finds, still in stock, and gone out of stock. Persists `firstSeen` timestamps and scan counts per bottle per store.
 4. **Discord Alerts** — Sends color-coded embeds based on stock changes: green `@here` for new finds, orange for OOS losses, blue re-alerts for bottles still in stock, and a purple summary after every scan. Summary includes per-scraper health metrics with canary indicators and a 24h trend (per-retailer success rate, canary hit rate, bottles found). Includes SKU/item numbers, store numbers, fulfillment info, and Google Maps links.
 5. **Scan Metrics** — Appends one JSON line per scan to `metrics.jsonl` with per-retailer health stats, canary hits, bottles found, and duration. Enables historical trend analysis: retailer reliability over time, drop patterns, proxy ROI.
@@ -75,6 +75,7 @@ SAFEWAY_API_KEY=
 | `PROXY_URL` | No | Residential proxy URL (e.g. `http://user:pass@gw.dataimpulse.com:823`). Each retailer gets a dedicated IP via per-retailer sticky sessions. DataImpulse ($1/GB) recommended. |
 | `BACKUP_PROXY_URL` | No | Backup proxy URL (e.g. IPRoyal). Used by retailers listed in `BACKUP_PROXY_RETAILERS` when primary proxy IPs are burned. |
 | `BACKUP_PROXY_RETAILERS` | No | Comma-separated retailer keys to route through backup proxy (e.g. `costco,totalwine`). |
+| `SECONDARY_ZIPS` | No | Additional zip codes for store discovery (e.g. `85054,85260`). Stores merged with primary, deduped by ID. |
 
 Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, all scrapers fall back to browser-only mode. With `PROXY_URL` set, each retailer gets its own sticky session IP and `got-scraping` fetch-first paths use Chrome TLS fingerprint impersonation for faster, lighter scraping. All browser fallbacks use clean Chrome (no stealth plugin — it's counterproductive) with `headless: false` on Mac. Queries use priority-based rotation — high-value bottles (BTAC, Pappy, Taylor, Michter's) are checked every scan while lower-priority queries alternate, with human-like pacing to reduce bot detection signals. Retailers that fail 3+ consecutive scans are automatically backed off for 30 minutes.
 
@@ -146,7 +147,7 @@ This captures screenshots, full HTML, and selector lists from each retailer's st
 
 ## Tests
 
-791 tests across 5 files using [Vitest](https://vitest.dev/) (95.8% line coverage, 83.9% branch):
+794 tests across 5 files using [Vitest](https://vitest.dev/) (95.4% line coverage, 83.6% branch):
 
 ```sh
 npm test                # Run all tests
@@ -155,7 +156,7 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 669 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling ($500), all 7 scrapers, Discord embeds (re-alert/OOS/health emoji/canary/trend), poll orchestration, error isolation, health tracking, scan metrics/trends, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage (Old Rip/Colonel/SFB), parseSize liter/litre, normalizeText unicode, truncateDescription OOS, dedupFound N/A, shuffle/withTimeout/runWithConcurrency edges, peak hour formatting, watch list (key generation/embed/processing), Reddit intel (keywords/subreddits/scraping/dedup), shuffleKeepCanaryFirst, proxy availability/failover, Safeway browser wrapper, handleShutdown, poll integration (store scanning/canary retry), Walmart/Sam's Club fetch paths |
+| `test/scraper.test.js` | 672 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling ($500), all 7 scrapers, Discord embeds (re-alert/OOS/health emoji/canary/trend), poll orchestration, error isolation, health tracking (incl. per-query/per-store/fetch-vs-browser attribution), scan metrics/trends, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage (Old Rip/Colonel/SFB), parseSize liter/litre, normalizeText unicode, truncateDescription OOS, dedupFound N/A, shuffle/withTimeout/runWithConcurrency edges, peak hour formatting, watch list (key generation/embed/processing), Reddit intel (keywords/subreddits/scraping/dedup), shuffleKeepCanaryFirst, proxy availability/failover, Safeway browser wrapper, handleShutdown, poll integration (store scanning/canary retry), Walmart/Sam's Club fetch paths, navigateCategory |
 | `test/proxy.test.js` | 35 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
 | `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |

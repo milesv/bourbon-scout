@@ -382,7 +382,10 @@ describe("trackHealth", () => {
     trackHealth("kroger", "ok");
     trackHealth("kroger", "ok");
     const h = _getScraperHealth();
-    expect(h.kroger).toEqual({ queries: 2, succeeded: 2, failed: 0, blocked: 0 });
+    expect(h.kroger.queries).toBe(2);
+    expect(h.kroger.succeeded).toBe(2);
+    expect(h.kroger.failed).toBe(0);
+    expect(h.kroger.blocked).toBe(0);
   });
 
   it("tracks failed outcomes", () => {
@@ -396,7 +399,10 @@ describe("trackHealth", () => {
     trackHealth("costco", "blocked");
     trackHealth("costco", "ok");
     const h = _getScraperHealth();
-    expect(h.costco).toEqual({ queries: 2, succeeded: 1, failed: 0, blocked: 1 });
+    expect(h.costco.queries).toBe(2);
+    expect(h.costco.succeeded).toBe(1);
+    expect(h.costco.blocked).toBe(1);
+    expect(h.costco.failed).toBe(0);
   });
 
   it("isolates retailers", () => {
@@ -412,6 +418,32 @@ describe("trackHealth", () => {
     trackHealth("kroger", "ok");
     _resetScraperHealth();
     expect(_getScraperHealth()).toEqual({});
+  });
+
+  it("tracks per-query stats when query option provided", () => {
+    trackHealth("walmart", "ok", { query: "weller bourbon" });
+    trackHealth("walmart", "blocked", { query: "weller bourbon" });
+    trackHealth("walmart", "ok", { query: "blantons bourbon" });
+    const h = _getScraperHealth();
+    expect(h.walmart.queryStats["weller bourbon"]).toEqual({ ok: 1, blocked: 1, failed: 0 });
+    expect(h.walmart.queryStats["blantons bourbon"]).toEqual({ ok: 1, blocked: 0, failed: 0 });
+  });
+
+  it("tracks fetch-vs-browser attribution when via option provided", () => {
+    trackHealth("costco", "ok", { via: "fetch" });
+    trackHealth("costco", "ok", { via: "fetch" });
+    trackHealth("costco", "ok", { via: "browser" });
+    const h = _getScraperHealth();
+    expect(h.costco.path).toEqual({ fetch: 2, browser: 1 });
+  });
+
+  it("tracks per-store health when storeId option provided", () => {
+    trackHealth("walmart", "ok", { storeId: "1234" });
+    trackHealth("walmart", "blocked", { storeId: "1234" });
+    trackHealth("walmart", "ok", { storeId: "5678" });
+    const h = _getScraperHealth();
+    expect(h.walmart.stores["1234"]).toEqual({ ok: 1, blocked: 1, failed: 0 });
+    expect(h.walmart.stores["5678"]).toEqual({ ok: 1, blocked: 0, failed: 0 });
   });
 });
 
@@ -1990,9 +2022,9 @@ describe("scrapeCostcoOnce", () => {
       { title: "Weller Special Reserve Bourbon 750ml", url: "https://costco.com/weller.product.html", price: "$29.99" },
     ]);
     const found = await runWithFakeTimers(() => scrapeCostcoOnce(mockPage));
-    // +1 for homepage pre-warm (category navigation removed to save ~15s); query rotation means only a subset runs per scan
+    // +2 for homepage pre-warm + category navigation; query rotation means only a subset runs per scan
     const expectedQueries = getQueriesForScan(SEARCH_QUERIES).length;
-    expect(mockPage.goto).toHaveBeenCalledTimes(expectedQueries + 1);
+    expect(mockPage.goto).toHaveBeenCalledTimes(expectedQueries + 2);
     expect(found.find((f) => f.name === "Weller Special Reserve")).toBeTruthy();
   });
 
