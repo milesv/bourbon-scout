@@ -28,9 +28,16 @@ const {
   ZIP_CODE = "85283",
   SEARCH_RADIUS_MILES = "15",
   MAX_STORES_PER_RETAILER = "5",
+  KROGER_MAX_STORES,
+  KROGER_RADIUS_MILES,
   KROGER_CLIENT_ID,
   KROGER_CLIENT_SECRET,
   SAFEWAY_API_KEY,
+  ALBERTSONS_API_KEY,
+  // Kroger HTML verification: visits product pages and parses "Item Unavailable"
+  // text to confirm/refute B+C tier classifications. Default ON. Set to "false" to
+  // disable verification entirely (saves ~60-120s per scan, accepts more false positives).
+  KROGER_HTML_VERIFY = "true",
   POLL_INTERVAL = "*/15 * * * *",
   REALERT_EVERY_N_SCANS = "4",
   PROXY_URL,
@@ -50,10 +57,10 @@ function parsePollIntervalMs(cronExpr) {
 }
 
 // ─── Schedule-aware scanning ─────────────────────────────────────────────────
-// 24/7 scanning: 30 min default (5 PM – 10 AM MT), 45 min daytime (10 AM – 5 PM),
-// 20 min boost on Tue/Thu nights. Arizona = MST year-round (UTC-7, no DST).
-const ACTIVE_START = 17; // 5 PM MT
-const ACTIVE_END = 10;   // 10 AM MT
+// Active scanning: 30 min default (4 AM – 10 PM MT), 20 min boost on Tue/Thu nights.
+// Sleeps 10 PM – 4 AM MT. Arizona = MST year-round (UTC-7, no DST).
+const ACTIVE_START = 4;  // 4 AM MT
+const ACTIVE_END = 22;   // 10 PM MT
 
 function getMTTime() {
   const now = new Date();
@@ -68,14 +75,16 @@ function getMTTime() {
 }
 
 function isActiveHour(hour) {
-  return hour >= ACTIVE_START || hour < ACTIVE_END;
+  return hour >= ACTIVE_START && hour < ACTIVE_END;
 }
 
 function isBoostPeriod(hour, day) {
-  return (day === "Tue" && hour >= ACTIVE_START) ||
-         (day === "Wed" && hour < ACTIVE_END) ||
-         (day === "Thu" && hour >= ACTIVE_START) ||
-         (day === "Fri" && hour < ACTIVE_END);
+  // Boost = 20-min intervals on Tue/Thu evenings into Wed/Fri mornings.
+  // Hardcoded to 5 PM – 10 AM window (prime drop checking hours).
+  return (day === "Tue" && hour >= 17) ||
+         (day === "Wed" && hour < 10) ||
+         (day === "Thu" && hour >= 17) ||
+         (day === "Fri" && hour < 10);
 }
 
 // Residential proxy agent for fetch-based scrapers (Walmart fetch path, Kroger, Safeway).
@@ -114,8 +123,8 @@ const retailerProxyUrls = {}; // retailerKey → full proxy URL (for browser pro
 function refreshProxySession() {
   if (!PROXY_URL) return;
   // Assign each retailer its own sticky port (= its own residential IP)
-  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
-  const basePort = 10000 + Math.floor(Math.random() * 9000); // leave room for 7 retailers
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub"];
+  const basePort = 10000 + Math.floor(Math.random() * 9000); // leave room for 8 retailers
   const backupBasePort = 10000 + Math.floor(Math.random() * 9000);
   for (let i = 0; i < retailers.length; i++) {
     const key = retailers[i];
@@ -203,7 +212,7 @@ function failoverToBackupProxy() {
   if (!BACKUP_PROXY_URL) return false;
   /* v8 ignore start -- requires BACKUP_PROXY_URL at module load (tested in proxy.test.js env) */
   console.log("[proxy] Failing over ALL retailers to backup proxy");
-  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub"];
   const basePort = 10000 + Math.floor(Math.random() * 9000);
   for (let i = 0; i < retailers.length; i++) {
     try {
@@ -305,6 +314,26 @@ function recordRetailerOutcome(key, success) {
   }
 }
 
+// ─── Store Priority ──────────────────────────────────────────────────────────
+// Some retailers have a clear "tier" of stores that carry allocated bourbon more
+// often. Reordering tasks so those stores run first (a) surfaces finds in Discord
+// sooner, (b) protects them from poll time-budget cutoffs, and (c) groups logs
+// with the highest-signal stores at the top.
+//
+// Fry's: Marketplace locations (vs. regular Fry's Food And Drug) have larger
+// spirits sections and receive most allocated drops in the Phoenix metro.
+function prioritizeStores(retailerKey, stores) {
+  if (retailerKey !== "kroger" || !Array.isArray(stores) || stores.length <= 1) {
+    return stores;
+  }
+  const isMarketplace = (s) => /marketplace/i.test(s.name || "");
+  // Stable sort: Marketplace stores first, original order within each group preserved.
+  return [
+    ...stores.filter(isMarketplace),
+    ...stores.filter((s) => !isMarketplace(s)),
+  ];
+}
+
 // ─── Known Product URL Tracking ──────────────────────────────────────────────
 // Bottles previously found in state.json have product URLs. Checking these directly
 // is less suspicious than searching (it's just visiting a product page) and catches
@@ -372,6 +401,7 @@ const SEED_PRODUCT_URLS = {
     { name: "Weller C.Y.P.B.", url: "https://www.walmart.com/ip/Weller-C-Y-P-B-Kentucky-Straight-Bourbon-Whiskey-750ml-95-Proof/5044158521" },
     { name: "Jack Daniel's 10 Year", url: "https://www.walmart.com/ip/Jack-Daniel-s-10-Years-Old-Tennessee-Whiskey-700-ml-Bottle/2877322440" },
     { name: "Jack Daniel's 12 Year", url: "https://www.walmart.com/ip/Jack-Daniel-s-12-Years-Old-Tennessee-Whiskey-Batch-2-700-ml-Bottle/5395514583" },
+    { name: "Jack Daniel's 12 Year", url: "https://www.walmart.com/ip/Jack-Daniel-s-12-Years-Old-Tennessee-Whiskey-Batch-03-700-ml-Bottle/15346310084" },
     { name: "Jack Daniel's 14 Year", url: "https://www.walmart.com/ip/Jack-Daniel-s-14-Years-Old-Tennessee-Whiskey-Batch-01-700-ml-Bottle/15318058743" },
     { name: "Blanton's Straight from the Barrel", url: "https://www.walmart.com/ip/Blantons-Blanton-Sftb-Bbn-Us-6-750ml-125-4pf/1166685343" },
     { name: "Rock Hill Farms", url: "https://www.walmart.com/ip/Rock-Hill-Farms-Single-Barrel-Kentucky-Straight-Bourbon-Whiskey-750ml-100-Proof/392415896" },
@@ -510,6 +540,8 @@ const SEARCH_QUERIES = [
   "michters bourbon",           // Michter's 10 Year Single Barrel (Costco + Total Wine + Walmart only)
   "penelope bourbon",           // Penelope Founder's Reserve + Estate Collection (Costco + Total Wine + Walmart only)
   "jack daniels aged",           // Jack Daniel's 10/12/14 Year Tennessee Whiskey
+  "heaven hill bourbon",         // Heaven Hill 90th Anniversary
+  "heaven hill heritage",        // Heaven Hill Heritage Collection 22 Year
   "buffalo trace",              // Canary bottle — always-available health check
 ];
 
@@ -557,6 +589,8 @@ const TARGET_BOTTLES = [
   { name: "Jack Daniel's 10 Year",       searchTerms: ["jack daniel's 10 year", "jack daniels 10 year", "jack daniel's 10yr", "jack daniels 10yr", "jack daniel's aged 10"] },
   { name: "Jack Daniel's 12 Year",       searchTerms: ["jack daniel's 12 year", "jack daniels 12 year", "jack daniel's 12yr", "jack daniels 12yr", "jack daniel's aged 12"] },
   { name: "Jack Daniel's 14 Year",       searchTerms: ["jack daniel's 14 year", "jack daniels 14 year", "jack daniel's 14yr", "jack daniels 14yr", "jack daniel's aged 14"] },
+  { name: "Heaven Hill 90th Anniversary", searchTerms: ["heaven hill 90th", "heaven hill 90", "heaven hill anniversary"] },
+  { name: "Heaven Hill Heritage Collection 22 Year", searchTerms: ["heaven hill heritage 22", "heaven hill 22 year", "heaven hill 22yr", "heaven hill heritage collection 22", "heritage collection 22"] },
   // Canary — always-available bottle used as a scraper health check
   { name: "Buffalo Trace", searchTerms: ["buffalo trace"], canary: true },
 ];
@@ -581,7 +615,7 @@ function watchListKey(entry) {
   return `${entry.bottle || "Allocated Bourbon"}:${entry.retailer}:${[...entry.stores].sort().join(",")}`;
 }
 
-const WATCH_LIST_RETAILER_NAMES = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens", samsclub: "Sam's Club" };
+const WATCH_LIST_RETAILER_NAMES = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club" };
 
 function buildWatchListEmbed(entry) {
   const retailerName = WATCH_LIST_RETAILER_NAMES[entry.retailer] || entry.retailer;
@@ -647,7 +681,7 @@ const REDDIT_NATIONAL_SUBREDDITS = ["bourbon", "whiskey", "Costco_alcohol"];
 const REDDIT_AZ_FILTER = ["arizona", "phoenix", "tempe", "scottsdale", "chandler", "gilbert", "mesa", "queen creek", "tucson", "fry's", "frys"];
 const REDDIT_INTEL_KEYWORDS = [
   // Retailer names
-  "costco", "total wine", "totalwine", "fry's", "frys", "fry's", "walmart", "safeway", "walgreens", "sam's club", "samsclub",
+  "costco", "total wine", "totalwine", "fry's", "frys", "fry's", "walmart", "safeway", "albertsons", "walgreens", "sam's club", "samsclub",
   // Store locations
   "scottsdale", "paradise valley", "tempe", "chandler", "gilbert", "mesa", "queen creek",
   // High-value bottles (short forms used in community posts)
@@ -991,7 +1025,8 @@ async function sendUrgentAlert(embeds) {
 // ─── Embed Colors ────────────────────────────────────────────────────────────
 
 const COLORS = {
-  newFind:  0x2ecc71,  // green — new bottle spotted
+  newFind:  0x2ecc71,  // green — new confirmed find (drive over)
+  lead:     0xf1c40f,  // yellow — newly spotted but signal weak (call first)
   stillIn:  0x3498db,  // blue — still in stock re-alert
   goneOOS:  0xe67e22,  // orange — went out of stock
   summary:  0x9b59b6,  // purple — scan summary
@@ -1002,12 +1037,12 @@ const COLORS = {
 
 const SKU_LABELS = {
   costco: "Item #", totalwine: "Item #", walmart: "Item #",
-  kroger: "SKU", safeway: "UPC", samsclub: "Item #",
+  kroger: "SKU", safeway: "UPC", albertsons: "UPC", samsclub: "Item #",
 };
 
 const STORE_TYPE_LABELS = {
   costco: "Warehouse", totalwine: "Store", walmart: "Store",
-  kroger: "Store", safeway: "Store", samsclub: "Club",
+  kroger: "Store", safeway: "Store", albertsons: "Store", samsclub: "Club",
 };
 
 function parseCity(address) {
@@ -1071,6 +1106,21 @@ function formatBottleLine(b, skuLabel, prefix = "🟢") {
   if (b.size) details.push(`📐 ${b.size}`);
   if (details.length) line += `\n   ${details.join("  ")}`;
   if (b.fulfillment) line += `\n   🚚 ${b.fulfillment}`;
+  // Aisle / facings / freshness — present for Kroger finds. Helps user triage at a glance.
+  const ctx = [];
+  if (b.aisle) ctx.push(`🗺️ ${b.aisle}`);
+  if (b.facings) ctx.push(`🔢 ${b.facings} facing${b.facings === 1 ? "" : "s"}`);
+  if (ctx.length) line += `\n   ${ctx.join("  ")}`;
+  // Stale data warning — Kroger sometimes reports inStore:true with months-old price data,
+  // which is a strong signal the slot is empty even though the planogram is set.
+  if (b.dataAgeDays != null && b.dataAgeDays > 60) {
+    line += `\n   ⚠️ Inventory data is ${b.dataAgeDays} days old — call to confirm`;
+  }
+  // HTML verified: the find was double-checked against the live product page widget.
+  // Trust this MORE than data freshness — overrides stale data warning concern.
+  if (b.htmlVerified) {
+    line += `\n   ✅ Verified against frysfood.com product page`;
+  }
   return line;
 }
 
@@ -1106,11 +1156,17 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   const allNames = TARGET_BOTTLES.filter((b) => !CANARY_NAMES.has(b.name)).map((b) => b.name);
   const embeds = [];
 
-  // New finds embed (green, urgent)
-  if (changes.newFinds.length > 0) {
-    const inStockNames = [...changes.newFinds, ...changes.stillInStock].map((b) => b.name);
+  // Split new finds into "confirmed" (strong signal) and "lead" (weak signal) tiers.
+  // Only the Kroger scraper currently sets `confidence` — anything without it defaults
+  // to "confirmed" so existing retailers keep their current behavior.
+  const confirmedFinds = changes.newFinds.filter((b) => b.confidence !== "lead");
+  const leadFinds = changes.newFinds.filter((b) => b.confidence === "lead");
+  const inStockNames = [...changes.newFinds, ...changes.stillInStock].map((b) => b.name);
+
+  // Confirmed embed (green, urgent — @here ping)
+  if (confirmedFinds.length > 0) {
     let desc = `${info.storeLine}\n${info.addressLine}\n\n🆕 **NEWLY SPOTTED**\n`;
-    desc += changes.newFinds.map((b) => formatBottleLine(b, info.skuLabel, "🟢")).join("\n\n");
+    desc += confirmedFinds.map((b) => formatBottleLine(b, info.skuLabel, "🟢")).join("\n\n");
 
     if (changes.stillInStock.length > 0) {
       desc += `\n\n✅ **STILL IN STOCK (${changes.stillInStock.length})**\n`;
@@ -1128,6 +1184,21 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
       color: COLORS.newFind,
       footer: { text: `Bourbon Scout 🥃 │ ${retailerName}` },
       timestamp: new Date().toISOString(),
+      _urgent: true,
+    });
+  }
+
+  // Lead embed (yellow, quiet — no @here, just a heads-up)
+  if (leadFinds.length > 0) {
+    let desc = `${info.storeLine}\n${info.addressLine}\n\n🔍 **POTENTIAL LEAD** — store has a planogram slot for these bottles, but inventory signal is weak. Call ahead before driving.\n\n`;
+    desc += leadFinds.map((b) => formatBottleLine(b, info.skuLabel, "🟡")).join("\n\n");
+    embeds.push({
+      title: truncateTitle(`🔍 LEAD — ${info.title}`),
+      description: truncateDescription(desc),
+      color: COLORS.lead,
+      footer: { text: `Bourbon Scout 🥃 │ ${retailerName} · low-confidence signal` },
+      timestamp: new Date().toISOString(),
+      _urgent: false,
     });
   }
 
@@ -1178,8 +1249,8 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   return embeds;
 }
 
-const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "walgreens", "samsclub"];
-const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", walgreens: "Walgreens", samsclub: "Sam's Club" };
+const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub"];
+const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club" };
 
 function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null, peakHours = null }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
@@ -1810,6 +1881,7 @@ const CATEGORY_URLS = {
   walgreens: "https://www.walgreens.com/store/c/wine-beer-and-spirits/ID=360442-tier2general",
   samsclub: "https://www.samsclub.com/b/spirits/2020102",
   safeway: "https://www.safeway.com/shop/aisles/beer-wine-spirits/spirits.3132.html",
+  albertsons: "https://www.albertsons.com/shop/aisles/beer-wine-spirits/spirits.3132.html",
 };
 
 async function navigateCategory(page, retailerKey) {
@@ -2194,33 +2266,153 @@ async function scrapeCostcoOnce(page) {
   return dedupFound(found);
 }
 
-// Check known Costco product URLs (seeds + previous finds). Costco product pages use the
-// same data-testid tile structure as search results, so we parse with cheerio.
-// Supplements keyword search — direct page visits are less suspicious than searching.
+// Parse a Costco product detail page (not search tiles). Product pages use og:title,
+// price meta tags, and fulfillment data-testids — different from search's ProductTile_ grid.
+function matchCostcoProductPage($, seedName, seedUrl) {
+  const ogTitle = $('meta[property="og:title"]').attr("content") || "";
+  const h1 = $("h1").first().text().trim();
+  const title = ogTitle || h1;
+  if (!title) return null;
+  const itemMatch = seedUrl.match(/\.product\.(\d+)\.html/);
+  const sku = itemMatch ? itemMatch[1] : "";
+  const metaPrice = $('meta[property="product:price:amount"]').attr("content") || "";
+  const testidPrice = $('[data-testid^="Text_Price"]').first().text().trim();
+  const price = testidPrice || (metaPrice ? `$${metaPrice}` : "");
+  for (const bottle of TARGET_BOTTLES) {
+    if (matchesBottle(title, bottle, "costco")) {
+      return { name: bottle.name, url: seedUrl, price, sku, size: parseSize(title), fulfillment: "" };
+    }
+  }
+  return null;
+}
+
+// Check known Costco product URLs via fetch with cookie-enhanced requests.
+// Sends cached Akamai _abck cookies from previous browser scrapes + homepage pre-warm
+// cookies to bypass Akamai Bot Manager on product page requests.
 async function checkCostcoKnownUrls() {
   const known = knownProducts.costco || [];
   if (known.length === 0) return [];
   const costcoProxy = getRetailerProxyUrl("costco");
+  if (!costcoProxy && !IS_MAC) return []; // Need proxy or residential IP
+  console.log(`[costco] Checking ${known.length} known product URLs via fetch`);
+
+  // Pre-warm: fetch homepage to get session cookies (same pattern as scrapeCostcoViaFetch)
+  let cookies = "";
+  try {
+    const homeRes = await scraperFetchRetry("https://www.costco.com/", {
+      headers: FETCH_HEADERS, timeout: 10000, proxyUrl: costcoProxy,
+    });
+    const rawSetCookie = homeRes.headers["set-cookie"];
+    const setCookies = Array.isArray(rawSetCookie) ? rawSetCookie : rawSetCookie ? [rawSetCookie] : [];
+    cookies = setCookies.map((c) => c.split(";")[0]).join("; ");
+  } catch { /* continue without homepage cookies */ }
+  // Merge browser-quality Akamai _abck cookies from previous browser scrape
+  const cachedCostco = getCachedCookies("costco");
+  if (cachedCostco) cookies = cookies ? `${cookies}; ${cachedCostco}` : cachedCostco;
+
   const found = [];
+  let checked = 0, notOk = 0, blocked = 0;
   for (const { name, url } of known) {
     if (!url || !url.includes("costco.com/")) continue;
+    checked++;
     try {
-      const res = await scraperFetchRetry(url, { headers: { ...FETCH_HEADERS }, timeout: 15000, proxyUrl: costcoProxy });
-      if (!res.ok) continue;
+      const headers = { ...FETCH_HEADERS };
+      if (cookies) headers["Cookie"] = cookies;
+      const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: costcoProxy });
+      if (!res.ok) { notOk++; continue; }
       const html = await res.text();
-      if (isCostcoBlocked(html)) continue;
+      if (isCostcoBlocked(html)) { blocked++; continue; }
+      // Try search tile format first (some product pages may include tiles),
+      // then fall back to product page format (og:title, price meta)
       const $ = cheerio.load(html);
-      const matched = matchCostcoTiles($);
-      if (matched.length > 0) {
-        found.push(...matched);
-        console.log(`[costco] Known URL check: ${name} still in stock`);
+      const tileMatched = matchCostcoTiles($);
+      if (tileMatched.length > 0) {
+        found.push(...tileMatched);
+        console.log(`[costco] Known URL check: ${name} found via tiles`);
+      } else {
+        const product = matchCostcoProductPage($, name, url);
+        if (product) {
+          found.push(product);
+          console.log(`[costco] Known URL check: ${product.name} found (item ${product.sku})`);
+        }
       }
     } catch (err) {
       console.warn(`[costco] Known URL check failed for ${name}: ${err.message}`);
     }
     await sleep(500 + Math.random() * 500);
   }
+  console.log(`[costco] Known URL fetch: ${found.length} found, ${checked} checked, ${notOk} non-ok, ${blocked} blocked`);
   return found;
+}
+
+// Browser fallback for known Costco product URLs. Called when both fetch known URLs
+// and browser search fail — navigates directly to product pages which may pass Akamai
+// where search is blocked (product pages are less bot-targeted than search).
+async function checkCostcoKnownUrlsViaBrowser() {
+  const known = knownProducts.costco || [];
+  if (known.length === 0) return [];
+  let page;
+  try {
+    ({ page } = await launchRetailerBrowser("costco", { clean: true }));
+  } catch (err) {
+    console.warn(`[costco] Browser launch for known URLs failed: ${err.message}`);
+    return [];
+  }
+  /* v8 ignore start -- browser-only: requires real Playwright browser */
+  try {
+    console.log(`[costco] Checking ${known.length} known product URLs via browser`);
+    const found = [];
+    let blocked = 0;
+    const startTime = Date.now();
+    const TIME_BUDGET = 120000; // 2 minutes
+    for (const { name, url } of known) {
+      if (Date.now() - startTime > TIME_BUDGET) {
+        console.log("[costco] Browser known URLs: time budget exceeded, stopping");
+        break;
+      }
+      if (!url || !url.includes("costco.com/")) continue;
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+        await sleep(1000 + Math.random() * 1000);
+        if (await isBlockedPage(page)) {
+          blocked++;
+          if (blocked >= 3) {
+            console.log("[costco] Browser known URLs: 3+ blocked, aborting");
+            break;
+          }
+          continue;
+        }
+        const productData = await page.evaluate(() => {
+          const ogTitle = document.querySelector('meta[property="og:title"]')?.content || "";
+          const h1 = document.querySelector("h1")?.textContent?.trim() || "";
+          const title = ogTitle || h1;
+          const priceEl = document.querySelector('[data-testid^="Text_Price"]');
+          const priceMeta = document.querySelector('meta[property="product:price:amount"]');
+          const price = priceEl?.textContent?.trim() || (priceMeta ? `$${priceMeta.content}` : "");
+          return { title, price };
+        });
+        if (!productData.title) continue;
+        const itemMatch = url.match(/\.product\.(\d+)\.html/);
+        const sku = itemMatch ? itemMatch[1] : "";
+        for (const bottle of TARGET_BOTTLES) {
+          if (matchesBottle(productData.title, bottle, "costco")) {
+            found.push({ name: bottle.name, url, price: productData.price, sku, size: parseSize(productData.title), fulfillment: "" });
+            console.log(`[costco] Browser known URL: ${bottle.name} found (item ${sku})`);
+            break;
+          }
+        }
+      } catch (err) {
+        if (err.message.includes("closed") || err.message.includes("crashed")) break;
+      }
+      await sleep(2000 + Math.random() * 2000);
+    }
+    if (found.length > 0) await cacheRetailerCookies("costco");
+    console.log(`[costco] Browser known URLs: ${found.length} found, ${blocked} blocked`);
+    return found;
+  } finally {
+    await page.close().catch(() => {});
+  }
+  /* v8 ignore stop */
 }
 
 // Wrapper: try got-scraping fetch-first (Chrome TLS fingerprint), fall back to browser.
@@ -2254,10 +2446,18 @@ async function scrapeCostcoStore() {
   try {
     const scraperPromise = scrapeCostcoOnce(page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, null);
+    const result = await withTimeout(scraperPromise, 300000, null);
     if (result === null) {
-      console.warn("[costco] Browser scraper timed out (180s)");
+      console.warn("[costco] Browser scraper timed out (300s)");
       trackHealth("costco", "fail");
+      await page.close().catch(() => {});
+      // Last resort: try product pages directly via browser.
+      // Product pages may pass Akamai where search is blocked (less bot-targeted).
+      // Akamai sensors ran during the search attempt, improving cookie quality.
+      if (knownFound.length === 0) {
+        const browserKnown = await checkCostcoKnownUrlsViaBrowser().catch(() => []);
+        return dedupFound(browserKnown);
+      }
       return dedupFound(knownFound);
     }
     await cacheRetailerCookies("costco");
@@ -2271,29 +2471,62 @@ async function scrapeCostcoStore() {
 
 // Extract matched bottles from Total Wine INITIAL_STATE JSON.
 // Shared by both fetch and browser paths.
+// Total Wine won't ship allocated bourbon, so shipping eligibility is a noisy
+// national catalog flag — not evidence of per-store stock. Treat options containing
+// "ship" (case-insensitive across type OR name) as untrusted for allocation hunting.
+function isTotalWineShippingOption(o) {
+  const label = `${o.type || ""} ${o.name || ""}`.toLowerCase();
+  return label.includes("ship");
+}
+
 function matchTotalWineInitialState(state) {
   const found = [];
   const products = state?.search?.results?.products;
   if (!Array.isArray(products)) return found;
 
   for (const p of products) {
-    // Primary: physical stock or eligible shopping options. Use transactional only
-    // as fallback when both stockLevel and shoppingOptions data are absent.
+    // Trust only per-store signals: stockLevel (comes back store-filtered via storeId
+    // URL param) or non-shipping shopping options (pickup/in-store/delivery).
+    // transactional is a national flag — only use as last-resort when nothing else present.
     const hasStockData = p.stockLevel != null || p.shoppingOptions != null;
+    const hasLocalOption = p.shoppingOptions?.some(
+      (o) => o.eligible && !isTotalWineShippingOption(o)
+    );
     const inStock = (p.stockLevel?.[0]?.stock > 0) ||
-                    p.shoppingOptions?.some((o) => o.eligible) ||
+                    hasLocalOption ||
                     (!hasStockData && p.transactional === true);
     if (!inStock) continue;
 
     for (const bottle of TARGET_BOTTLES) {
       if (matchesBottle(p.name || "", bottle, "totalwine")) {
+        // Diagnostic: record which signal fired so finds can be audited by signal strength.
+        // stockLevel (per-store ground truth) > local option (pickup/in-store) > transactional (national fallback).
+        let viaSignal;
+        if (p.stockLevel?.[0]?.stock > 0) {
+          viaSignal = `stockLevel:${p.stockLevel[0].stock}`;
+        } else if (hasLocalOption) {
+          const localOpt = p.shoppingOptions.find(
+            (o) => o.eligible && !isTotalWineShippingOption(o)
+          );
+          viaSignal = `option:${localOpt?.name || localOpt?.type || "?"}`;
+        } else {
+          viaSignal = "transactional";
+        }
+        console.log(`[totalwine] matched "${bottle.name}" via ${viaSignal}`);
+
         found.push({
           name: bottle.name,
           url: p.productUrl ? (p.productUrl.startsWith("http") ? p.productUrl : `https://www.totalwine.com${p.productUrl}`) : "",
           price: p.price?.[0]?.price ? `$${p.price[0].price}` : "",
           sku: (p.productUrl?.match(/\/p\/(\d+)/) || [])[1] || "",
           size: parseSize(p.name || ""),
-          fulfillment: (p.shoppingOptions || []).filter((o) => o.eligible).map((o) => o.name || o.type || "").filter(Boolean).join(", "),
+          // Exclude shipping from the displayed fulfillment label too — otherwise
+          // users see "Ship" and (correctly) distrust the find.
+          fulfillment: (p.shoppingOptions || [])
+            .filter((o) => o.eligible && !isTotalWineShippingOption(o))
+            .map((o) => o.name || o.type || "")
+            .filter(Boolean)
+            .join(", "),
         });
       }
     }
@@ -2636,9 +2869,9 @@ async function scrapeTotalWineStore(store) {
   try {
     const scraperPromise = scrapeTotalWineViaBrowser(store, page, { skipPreWarm });
     scraperPromise.catch(() => {});
-    const result = await withTimeout(scraperPromise, 180000, null);
+    const result = await withTimeout(scraperPromise, 300000, null);
     if (result === null) {
-      console.warn(`[totalwine:${store.storeId}] Browser timed out (180s)`);
+      console.warn(`[totalwine:${store.storeId}] Browser timed out (300s)`);
       trackHealth("totalwine", "fail");
       return dedupFound(knownFound);
     }
@@ -2974,9 +3207,9 @@ async function scrapeWalmartStore(store) {
   try {
     const scraperPromise = scrapeWalmartViaBrowser(store, page);
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-    const result = await withTimeout(scraperPromise, 180000, null);
+    const result = await withTimeout(scraperPromise, 300000, null);
     if (result === null) {
-      console.warn(`[walmart:${store.storeId}] Browser scraper timed out (180s)`);
+      console.warn(`[walmart:${store.storeId}] Browser scraper timed out (300s)`);
       trackHealth("walmart", "fail");
       return dedupFound(knownFound);
     }
@@ -3157,9 +3390,9 @@ async function scrapeWalgreensStore() {
     try {
       const scraperPromise = scrapeWalgreensViaBrowser(page);
       scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
-      const result = await withTimeout(scraperPromise, 180000, null);
+      const result = await withTimeout(scraperPromise, 300000, null);
       if (result === null) {
-        console.warn("[walgreens] Browser scraper timed out (180s)");
+        console.warn("[walgreens] Browser scraper timed out (300s)");
         trackHealth("walgreens", "fail");
         if (attempt === 0) {
           console.warn("[walgreens] Timeout on first attempt — retrying with fresh browser");
@@ -3460,9 +3693,9 @@ async function scrapeSamsClubStore() {
     try {
       const scraperPromise = scrapeSamsClubViaBrowser(page);
       scraperPromise.catch(() => {});
-      const result = await withTimeout(scraperPromise, 180000, null);
+      const result = await withTimeout(scraperPromise, 300000, null);
       if (result === null) {
-        console.warn("[samsclub] Browser scraper timed out (180s)");
+        console.warn("[samsclub] Browser scraper timed out (300s)");
         trackHealth("samsclub", "fail");
         if (attempt === 0) {
           console.warn("[samsclub] Timeout on first attempt — retrying with fresh browser");
@@ -3551,6 +3784,41 @@ const KROGER_PRODUCTS = {
 
 // Direct product lookup via Kroger API — bypasses search, immune to search suppression.
 // Returns found[] for a specific store. Runs before search queries for fastest detection.
+// Classify a Kroger find by signal strength. Kroger's `inStore: true` is misleading
+// alone — it can mean "store has a planogram slot reserved" rather than "bottle is
+// physically on the shelf right now". Use facings + price freshness to distinguish:
+//
+//   confirmed: facings >= 3  OR  effectiveDate within 14 days
+//     → real stock, drive over
+//   lead:      single allocated slot, stale data
+//     → store gets allocated this bottle but slot may be empty; call first
+//
+// Caller routes confirmed → @here urgent alert, lead → quiet alert.
+function classifyKrogerFind(product, item) {
+  const aisle = product?.aisleLocations?.[0];
+  const facings = aisle?.numberOfFacings ? parseInt(aisle.numberOfFacings) : 0;
+  const effDate = item?.price?.effectiveDate?.value;
+  const ageDays = effDate ? Math.floor((Date.now() - new Date(effDate).getTime()) / 86400000) : null;
+  const isConfirmed = facings >= 3 || (ageDays !== null && ageDays <= 14);
+  return {
+    confidence: isConfirmed ? "confirmed" : "lead",
+    aisle: aisle ? `${aisle.description} ${aisle.number}, Shelf ${aisle.shelfNumber}` : null,
+    facings: facings || null,
+    dataAgeDays: ageDays,
+  };
+}
+
+// Build a Kroger product URL from the API's `productPageURI` (slug-based, e.g.
+// `/p/george-t-stagg-15-year-bourbon/0008800402784?cid=...`) — the productId-only
+// fallback URL `/p/{productId}` 404s for some products. Strip the cid analytics param.
+function buildKrogerProductUrl(product, productId) {
+  const uri = product?.productPageURI;
+  if (uri && uri.startsWith("/p/")) {
+    return `https://www.kroger.com${uri.split("?")[0]}`;
+  }
+  return productId ? `https://www.kroger.com/p/${productId}` : "";
+}
+
 async function checkKrogerKnownProducts(store, token) {
   const found = [];
   const entries = Object.entries(KROGER_PRODUCTS);
@@ -3570,28 +3838,179 @@ async function checkKrogerKnownProducts(store, token) {
       const data = await res.json();
       const product = data.data;
       if (!product) return;
-      // Check in-store availability (same logic as search path)
+      // Kroger removed `inventory.stockLevel` from spirits responses in 2026 — trust
+      // `fulfillment.inStore: true` as the in-stock signal. Still reject if stockLevel
+      // is present and explicitly OOS (defensive guard for products that retain it).
       const isKrogerItemInStock = (item) =>
         item.fulfillment?.inStore === true &&
-        item.inventory?.stockLevel != null &&
-        !String(item.inventory.stockLevel).toLowerCase().includes("out_of_stock");
+        (item.inventory?.stockLevel == null ||
+         !String(item.inventory.stockLevel).toLowerCase().includes("out_of_stock"));
       const inStock = product.items?.some(isKrogerItemInStock);
       if (!inStock) return;
       const inStoreItem = product.items?.find(isKrogerItemInStock) || product.items?.[0];
       const price = inStoreItem?.price?.promo ?? inStoreItem?.price?.regular;
+      const cls = classifyKrogerFind(product, inStoreItem);
       found.push({
         name: bottleName,
-        url: `https://www.kroger.com/p/${productId}`,
+        url: buildKrogerProductUrl(product, productId),
         price: price != null ? `$${price.toFixed(2)}` : "",
         sku: productId,
         size: inStoreItem?.size || "",
         fulfillment: inStoreItem?.fulfillment?.inStore ? "In-store" : "",
+        confidence: cls.confidence,
+        aisle: cls.aisle,
+        facings: cls.facings,
+        dataAgeDays: cls.dataAgeDays,
       });
       console.log(`[kroger:${store.storeId}] Direct lookup: ${bottleName} in stock!`);
     } catch { /* individual product lookup failure — continue */ }
   }));
   return found;
 }
+
+// HTML verification for Kroger candidates. Visits the actual product page on
+// frysfood.com and parses the "Item Availability" widget. The widget reflects
+// the user's preferred store, which we set per-store via /atlas/v1/modality/preferences.
+//
+// Returns the candidates array with `confidence` adjusted based on what the
+// website says. Three outcomes per candidate:
+//   confirmed: page says sellable          → upgrade confidence to "confirmed"
+//   refuted:   page says "Item Unavailable" → drop from results (silent)
+//   unverified: Akamai blocked, timeout, or page never loaded → keep B+C tier as-is
+//
+// All errors are graceful — verification failure NEVER drops the underlying B+C
+// classification. Worst case is unchanged behavior. Best case is filtered noise.
+//
+// Time budget: 90s total per store. If exceeded, remaining candidates are unverified.
+/* v8 ignore start -- requires live Akamai bypass + Fry's session, can't unit-test the page interaction */
+async function verifyKrogerCandidatesViaWebsite(store, candidates) {
+  if (!candidates || candidates.length === 0) return candidates;
+  if (KROGER_HTML_VERIFY !== "true") return candidates;
+
+  const verified = [];
+  const start = Date.now();
+  const TIME_BUDGET_MS = 90000;
+
+  let page;
+  try {
+    ({ page } = await launchRetailerBrowser("kroger", { clean: true }));
+  } catch (err) {
+    console.warn(`[kroger:${store.storeId}] HTML verify: browser launch failed, keeping B+C tier (${err.message})`);
+    return candidates;
+  }
+
+  try {
+    // Pre-warm: earn Akamai _abck cookie. Skip if cache is still warm from a prior store.
+    const skipPreWarm = !!getCachedCookies("kroger");
+    if (!skipPreWarm) {
+      try {
+        await page.goto("https://www.frysfood.com/", { waitUntil: "domcontentloaded", timeout: 25000 });
+        await sleep(4000 + Math.random() * 2000);
+        await humanizePage(page);
+      } catch (err) {
+        console.warn(`[kroger:${store.storeId}] HTML verify: pre-warm failed, keeping B+C tier (${err.message})`);
+        return candidates;
+      }
+    }
+
+    // Set the user's preferred store to this one. Fry's modality/preferences POST
+    // requires a full destination object with address + lat/lng, available via the
+    // store locator endpoint. If this step fails, all candidates remain unverified.
+    let storeContextSet = false;
+    try {
+      const storeData = await page.evaluate(async (storeId) => {
+        const res = await fetch(`/atlas/v1/stores/v2/locator?filter.locationIds=${storeId}&projections=full`, {
+          headers: { "x-kroger-channel": "WEB", accept: "application/json" },
+        });
+        return { status: res.status, body: res.ok ? await res.json() : await res.text() };
+      }, store.storeId);
+      // DEBUG: log locator outcome to diagnose why store context isn't setting
+      if (storeData.status !== 200) {
+        console.warn(`[kroger:${store.storeId}] DEBUG locator failed status=${storeData.status} body=${String(storeData.body).slice(0, 200)}`);
+      }
+      const sd = storeData?.body?.data?.stores?.[0];
+      if (sd?.locale?.address) {
+        const setResult = await page.evaluate(async ({ locId, addr, loc }) => {
+          const res = await fetch("/atlas/v1/modality/preferences?filter.restrictLafToFc=false", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-kroger-channel": "WEB" },
+            body: JSON.stringify({
+              modalityPreferences: {
+                capabilities: { DELIVERY: true, IN_STORE: true, PICKUP: true, SHIP: true },
+                modalities: [{
+                  modalityType: "PICKUP",
+                  destination: { locationId: locId, address: addr, location: loc },
+                  fulfillment: [locId],
+                  fallbackFulfillment: locId,
+                  isCrossBanner: false,
+                  isTrustedSource: false,
+                  source: "DEFAULT_MODALITY_ADDRESS",
+                }],
+              },
+            }),
+          });
+          const body = await res.text();
+          return { status: res.status, body: body.slice(0, 400) };
+        }, { locId: store.storeId, addr: sd.locale.address, loc: sd.locale.location });
+        storeContextSet = setResult.status === 200;
+        // DEBUG: log preferences POST outcome — if non-200, body tells us what's wrong
+        if (!storeContextSet) {
+          console.warn(`[kroger:${store.storeId}] DEBUG modality POST failed status=${setResult.status} body=${setResult.body}`);
+        }
+      } else {
+        console.warn(`[kroger:${store.storeId}] DEBUG locator returned no address — sd.locale.address missing. storeData keys: ${Object.keys(storeData?.body?.data?.stores?.[0] || {}).join(",")}`);
+      }
+    } catch (err) {
+      console.warn(`[kroger:${store.storeId}] HTML verify: setting store context failed (${err.message})`);
+    }
+
+    if (!storeContextSet) {
+      console.warn(`[kroger:${store.storeId}] HTML verify: could not set store context, keeping B+C tier`);
+      return candidates;
+    }
+
+    // For each candidate, navigate to its product page and parse the Item Availability widget
+    for (const c of candidates) {
+      if (Date.now() - start > TIME_BUDGET_MS) {
+        console.warn(`[kroger:${store.storeId}] HTML verify: time budget exceeded, ${candidates.length - verified.length} unverified`);
+        // Push remaining as unverified (keep B+C classification)
+        for (let i = verified.length; i < candidates.length; i++) verified.push(candidates[i]);
+        break;
+      }
+      if (!c.url) { verified.push(c); continue; }
+      try {
+        await page.goto(c.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+        await sleep(2500 + Math.random() * 1500);
+        const bodyText = await page.evaluate(() => document.body.innerText || "");
+        // Bot wall — graceful fallback
+        if (/access denied|robot|verify you are human/i.test(bodyText.slice(0, 2000))) {
+          console.warn(`[kroger:${store.storeId}] HTML verify: bot wall on ${c.name}, keeping B+C`);
+          verified.push(c);
+          continue;
+        }
+        // The Item Availability widget shows "Item Unavailable" when nothing is sellable
+        // at the user's preferred store. If we see it, refute the candidate (silent drop).
+        const isUnavailable = /Item Unavailable/i.test(bodyText);
+        if (isUnavailable) {
+          console.log(`[kroger:${store.storeId}] HTML verify REFUTED: ${c.name} (page says Item Unavailable)`);
+          // Silent drop — do NOT push to verified
+        } else {
+          console.log(`[kroger:${store.storeId}] HTML verify CONFIRMED: ${c.name}`);
+          verified.push({ ...c, confidence: "confirmed", htmlVerified: true });
+        }
+      } catch (err) {
+        console.warn(`[kroger:${store.storeId}] HTML verify: page error for ${c.name} — keeping B+C (${err.message})`);
+        verified.push(c);  // graceful: keep B+C tier
+      }
+    }
+
+    await cacheRetailerCookies("kroger");
+    return verified;
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+/* v8 ignore stop */
 
 async function scrapeKrogerStore(store) {
   /* v8 ignore next 3 -- env guard */
@@ -3618,12 +4037,14 @@ async function scrapeKrogerStore(store) {
   function matchKrogerProducts(products) {
     for (const product of products) {
       const title = product.description || "";
-      // Require a positive inventory signal — null/missing inventory is not "in stock".
-      // Case-insensitive OOS check catches "TEMPORARILY_OUT_OF_STOCK", "OUT_OF_STOCK", etc.
+      // Trust `fulfillment.inStore: true` as the in-stock signal — Kroger removed
+      // `inventory.stockLevel` from spirits responses in 2026, so requiring it caused
+      // 100% false negatives at all Fry's stores. Still reject when stockLevel is
+      // present and explicitly OOS for products that retain the field.
       const isKrogerItemInStock = (i) =>
         i.fulfillment?.inStore === true &&
-        i.inventory?.stockLevel != null &&
-        !String(i.inventory.stockLevel).toLowerCase().includes("out_of_stock");
+        (i.inventory?.stockLevel == null ||
+         !String(i.inventory.stockLevel).toLowerCase().includes("out_of_stock"));
       const inStock = product.items?.some(isKrogerItemInStock);
       if (!inStock) continue;
       for (const bottle of TARGET_BOTTLES) {
@@ -3635,13 +4056,18 @@ async function scrapeKrogerStore(store) {
           const fulfillmentParts = [];
           if (inStoreItem?.fulfillment?.inStore) fulfillmentParts.push("In-store");
           if (inStoreItem?.fulfillment?.shipToHome) fulfillmentParts.push("Ship to home");
+          const cls = classifyKrogerFind(product, inStoreItem);
           found.push({
             name: bottle.name,
-            url: product.productId ? `https://www.kroger.com/p/${product.productId}` : "",
+            url: buildKrogerProductUrl(product, product.productId),
             price: price != null ? `$${price.toFixed(2)}` : "",
             sku: product.productId || "",
             size: inStoreItem?.size || "",
             fulfillment: fulfillmentParts.join(", "),
+            confidence: cls.confidence,
+            aisle: cls.aisle,
+            facings: cls.facings,
+            dataAgeDays: cls.dataAgeDays,
           });
         }
       }
@@ -3688,7 +4114,27 @@ async function scrapeKrogerStore(store) {
       trackHealth("kroger", "fail");
     }
   }));
-  return dedupFound([...knownFound, ...found]);
+  const candidates = dedupFound([...knownFound, ...found]);
+  // Layered verification: B+C tier already classified each find as 'confirmed' or 'lead'.
+  // Now optionally upgrade/refute via HTML scrape. Verification is best-effort — any
+  // failure silently falls back to the B+C tier classification (graceful by design).
+  if (candidates.length > 0 && KROGER_HTML_VERIFY === "true") {
+    /* v8 ignore start -- requires live page interaction; covered by integration testing */
+    const release = await acquireRetailerLock("kroger");
+    try {
+      const verifyPromise = verifyKrogerCandidatesViaWebsite(store, candidates);
+      // Time budget = 120s per store: 90s of work + 30s buffer for browser launch overhead
+      const verified = await withTimeout(verifyPromise, 120000, candidates);
+      return verified;
+    } catch (err) {
+      console.warn(`[kroger:${store.storeId}] HTML verify wrapper failed, keeping B+C: ${err.message}`);
+      return candidates;
+    } finally {
+      release();
+    }
+    /* v8 ignore stop */
+  }
+  return candidates;
 }
 
 // Match Safeway API response products against TARGET_BOTTLES.
@@ -3950,10 +4396,10 @@ async function scrapeSafewayStore(store) {
     try {
       const scraperPromise = scrapeSafewayViaBrowser(page, store);
       scraperPromise.catch(() => {});
-      const result = await withTimeout(scraperPromise, 180000, null);
+      const result = await withTimeout(scraperPromise, 300000, null);
       /* v8 ignore start -- browser timeout/retry paths require real browser + sleep */
       if (result === null) {
-        console.warn("[safeway] Browser scraper timed out (180s)");
+        console.warn("[safeway] Browser scraper timed out (300s)");
         trackHealth("safeway", "fail");
         if (attempt === 0) continue;
         return [];
@@ -3974,6 +4420,299 @@ async function scrapeSafewayStore(store) {
   return [];
 }
 
+// ─── Albertsons Scraper ─────────────────────────────────────────────────────
+// Same parent company as Safeway — identical API endpoint structure (/abs/pub/xapi),
+// same Azure APIM auth, same response shape. Different bot protection (Incapsula vs Akamai).
+// Falls back to SAFEWAY_API_KEY if ALBERTSONS_API_KEY not set.
+
+const ALBERTSONS_KEY = ALBERTSONS_API_KEY || SAFEWAY_API_KEY;
+
+// Match Albertsons API response products against TARGET_BOTTLES.
+// Same response shape as Safeway (same parent company backend).
+function matchAlbertsonsProducts(products) {
+  const found = [];
+  for (const product of products) {
+    const title = product.name || product.productTitle || "";
+    if (product.inStock !== true && product.inStock !== 1) continue;
+    for (const bottle of TARGET_BOTTLES) {
+      if (matchesBottle(title, bottle, "albertsons")) {
+        const fulfillmentParts = [];
+        if (product.curbsideEligible) fulfillmentParts.push("Curbside");
+        if (product.deliveryEligible) fulfillmentParts.push("Delivery");
+        found.push({
+          name: bottle.name,
+          url: product.url ? `https://www.albertsons.com${product.url}` : "",
+          price: product.price != null ? `$${Number(product.price).toFixed(2)}` : "",
+          sku: product.upc || product.pid || "",
+          size: parseSize(title),
+          fulfillment: fulfillmentParts.join(", "),
+        });
+      }
+    }
+  }
+  return found;
+}
+
+// Fetch-first Albertsons scraper. Uses cached browser Incapsula cookies to call
+// the Albertsons product search API directly. Same API as Safeway, different domain.
+/* v8 ignore start -- requires live Incapsula cookies from prior browser scrape */
+async function scrapeAlbertsonsViaFetch(store) {
+  if (!ALBERTSONS_KEY) return null;
+  const cachedCookies = getCachedCookies("albertsons");
+  if (!cachedCookies) return null;
+
+  const found = [];
+  let validPages = 0;
+  let failures = 0;
+  const abProxy = getRetailerProxyUrl("albertsons");
+
+  const baseUrl = "https://www.albertsons.com/abs/pub/xapi/pgmsearch/v1/search/products";
+  const queries = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES));
+
+  for (let i = 0; i < queries.length; i++) {
+    const query = queries[i];
+    if (failures > 3) break;
+    if (i > 0) await sleep(1500 + Math.random() * 2000);
+    const apiUrl = `${baseUrl}?request-id=0&url=https://www.albertsons.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
+    try {
+      const headers = {
+        ...FETCH_HEADERS,
+        "Ocp-Apim-Subscription-Key": ALBERTSONS_KEY,
+        Accept: "application/json",
+        Cookie: cachedCookies,
+      };
+      if (i > 0) {
+        headers["Sec-Fetch-Site"] = "same-origin";
+        headers["Referer"] = "https://www.albertsons.com/";
+      }
+      const res = await scraperFetchRetry(apiUrl, {
+        headers,
+        timeout: 15000,
+        proxyUrl: abProxy || undefined,
+      });
+      if (!res.ok) { failures++; continue; }
+      const data = await res.json();
+      if (isFetchBlocked(JSON.stringify(data).slice(0, 10000))) { failures++; continue; }
+      if (data?.primaryProducts?.response?.docs) {
+        found.push(...matchAlbertsonsProducts(data.primaryProducts.response.docs));
+        validPages++;
+        trackHealth("albertsons", "ok");
+
+        if (data.primaryProducts.response.docs.length === 50) {
+          try {
+            const page2Url = `${baseUrl}?request-id=0&url=https://www.albertsons.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
+            const res2 = await scraperFetchRetry(page2Url, { headers, timeout: 15000, proxyUrl: abProxy || undefined });
+            if (res2.ok) {
+              const data2 = await res2.json();
+              if (data2?.primaryProducts?.response?.docs) {
+                found.push(...matchAlbertsonsProducts(data2.primaryProducts.response.docs));
+              }
+            }
+          } catch { /* page 2 failure is non-critical */ }
+        }
+      } else {
+        failures++;
+      }
+    } catch {
+      failures++;
+    }
+  }
+
+  const minValid = Math.max(1, Math.ceil(queries.length / 4));
+  if (validPages < minValid) return null;
+  console.log(`[albertsons:${store.storeId}] Used fast fetch mode (cached browser cookies)`);
+  return dedupFound(found);
+}
+/* v8 ignore stop */
+
+// Browser-based Albertsons scraper. Incapsula WAF blocks cold fetch requests,
+// so we use a real browser to earn Incapsula cookies, then call the API from
+// within the browser context. Same API as Safeway, different domain + WAF.
+async function scrapeAlbertsonsViaBrowser(page, store) {
+  const found = [];
+  const t0 = Date.now();
+  const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
+
+  await page.goto("https://www.albertsons.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  console.log(`[albertsons:${store.storeId}] Homepage loaded (${elapsed()})`);
+  await sleep(4000 + Math.random() * 3000);
+  await solveHumanChallenge(page);
+  await humanizePage(page, { pace: "slow" });
+  await navigateCategory(page, "albertsons");
+  console.log(`[albertsons:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
+
+  const baseUrl = "https://www.albertsons.com/abs/pub/xapi/pgmsearch/v1/search/products";
+  let consecutiveBlocks = 0;
+
+  for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
+    if (consecutiveBlocks >= 4) { trackHealth("albertsons", "blocked"); continue; }
+
+    try {
+      const apiUrl = `${baseUrl}?request-id=0&url=https://www.albertsons.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
+      /* v8 ignore start -- browser-only API call */
+      const data = await page.evaluate(async ({ url, apiKey }) => {
+        try {
+          const res = await fetch(url, {
+            headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+          });
+          if (!res.ok) return null;
+          return await res.json();
+        } catch { return null; }
+      }, { url: apiUrl, apiKey: ALBERTSONS_KEY });
+      /* v8 ignore stop */
+
+      if (data?.primaryProducts?.response?.docs) {
+        const products = data.primaryProducts.response.docs;
+        found.push(...matchAlbertsonsProducts(products));
+        trackHealth("albertsons", "ok");
+        consecutiveBlocks = 0;
+        console.log(`[albertsons:${store.storeId}] API query "${query}": ${products.length} products (${elapsed()})`);
+
+        if (products.length === 50) {
+          try {
+            const page2Url = `${baseUrl}?request-id=0&url=https://www.albertsons.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
+            /* v8 ignore start -- browser-only */
+            const data2 = await page.evaluate(async ({ url, apiKey }) => {
+              try {
+                const res = await fetch(url, { headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" } });
+                return res.ok ? await res.json() : null;
+              } catch { return null; }
+            }, { url: page2Url, apiKey: ALBERTSONS_KEY });
+            /* v8 ignore stop */
+            if (data2?.primaryProducts?.response?.docs) {
+              found.push(...matchAlbertsonsProducts(data2.primaryProducts.response.docs));
+            }
+          } catch { /* page 2 failure is non-critical */ }
+        }
+      } else {
+        /* v8 ignore start -- browser-only DOM fallback */
+        const searchUrl = `https://www.albertsons.com/shop/search-results.html?q=${encodeURIComponent(query)}`;
+        await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+        await page.waitForSelector("[class*='product'], [data-testid*='product']", { timeout: 8000 }).catch(() => {});
+
+        if (await isBlockedPage(page)) {
+          const solved = await solveHumanChallenge(page);
+          if (!solved || (await isBlockedPage(page))) {
+            console.warn(`[albertsons:${store.storeId}] Blocked for query "${query}"`);
+            trackHealth("albertsons", "blocked");
+            consecutiveBlocks++;
+            continue;
+          }
+        }
+
+        const products = await page.$$eval(
+          "[class*='product-card'], [class*='productCard'], [data-testid*='product'], .product-item",
+          (cards) => cards.map((el) => ({
+            title: (el.querySelector("h2, h3, [class*='title'], [class*='name']") || {}).textContent?.trim() || "",
+            price: (el.querySelector("[class*='price']") || {}).textContent?.trim() || "",
+            url: (el.querySelector("a[href*='/shop/product/']") || {}).href || "",
+            outOfStock: (el.textContent || "").toLowerCase().includes("out of stock") ||
+                        (el.textContent || "").toLowerCase().includes("unavailable"),
+          }))
+        );
+
+        for (const p of products) {
+          if (p.outOfStock) continue;
+          for (const bottle of TARGET_BOTTLES) {
+            if (matchesBottle(p.title, bottle, "albertsons")) {
+              found.push({
+                name: bottle.name,
+                url: p.url ? (p.url.startsWith("http") ? p.url : `https://www.albertsons.com${p.url}`) : "",
+                price: p.price || "",
+                sku: "",
+                size: parseSize(p.title),
+                fulfillment: "",
+              });
+            }
+          }
+        }
+        trackHealth("albertsons", products.length > 0 ? "ok" : "fail");
+        consecutiveBlocks = 0;
+        /* v8 ignore stop */
+      }
+    } catch (err) {
+      console.error(`[albertsons:${store.storeId}] Error: ${err.message}`);
+      trackHealth("albertsons", "fail");
+      consecutiveBlocks++;
+    }
+    await sleep(2500 + Math.random() * 3500);
+  }
+  return dedupFound(found);
+}
+
+// Wrapper: tries fetch-first with cached cookies, then launches browser, handles timeout/retry.
+// Uses acquireRetailerLock to serialize concurrent stores through the shared browser context —
+// without this, one store's retry logic closes the context while others are mid-scrape,
+// causing "Target page, context or browser has been closed" errors across all stores.
+async function scrapeAlbertsonsStore(store) {
+  const fetchResult = await scrapeAlbertsonsViaFetch(store).catch((err) => {
+    console.warn(`[albertsons:${store.storeId}] Fetch path failed: ${err.message}`);
+    return null;
+  });
+  if (fetchResult !== null) return fetchResult;
+
+  delete scraperHealth["albertsons"];
+
+  const skipPreWarm = !!retailerBrowserCache["albertsons"];
+  console.log(`[albertsons:${store.storeId}] Queuing browser${skipPreWarm ? " (warm)" : ""}`);
+  const releaseLock = await acquireRetailerLock("albertsons");
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      /* v8 ignore start -- browser retry loop internals */
+      if (attempt > 0) {
+        console.log("[albertsons] Retrying with fresh browser after blocks");
+        delete scraperHealth["albertsons"];
+        if (retailerBrowserCache["albertsons"]) {
+          await retailerBrowserCache["albertsons"].context.close().catch(() => {});
+          delete retailerBrowserCache["albertsons"];
+        }
+        await sleep(3000 + Math.random() * 2000);
+      }
+      /* v8 ignore stop */
+      console.log("[albertsons] Using clean browser");
+      let page;
+      try {
+        ({ page } = await launchRetailerBrowser("albertsons", { clean: true }));
+      } catch (err) {
+        console.error(`[albertsons] Browser launch failed: ${err.message}`);
+        trackHealth("albertsons", "fail");
+        return [];
+      }
+      try {
+        const scraperPromise = scrapeAlbertsonsViaBrowser(page, store);
+        scraperPromise.catch(() => {});
+        // 300s timeout — modern WAFs (Akamai/PerimeterX/Incapsula) keep the page chatty
+        // so pre-warm alone takes 130-180s. Need headroom for queries after pre-warm.
+        // All browser scrapers use 300s for the same reason; bumped from 180s in 2026-04
+        // after metrics showed canary detection at 0% for Costco/Safeway/Sam's Club due
+        // to pre-warm consuming the entire budget before any queries could run.
+        const result = await withTimeout(scraperPromise, 300000, null);
+        /* v8 ignore start -- browser timeout/retry paths */
+        if (result === null) {
+          console.warn("[albertsons] Browser scraper timed out (300s)");
+          trackHealth("albertsons", "fail");
+          if (attempt === 0) continue;
+          return [];
+        }
+        await cacheRetailerCookies("albertsons");
+        const abHealth = scraperHealth["albertsons"];
+        if (abHealth && abHealth.blocked > 0 && abHealth.blocked >= abHealth.queries / 2 && attempt === 0) {
+          console.warn(`[albertsons] ${abHealth.blocked}/${abHealth.queries} queries blocked — retrying`);
+          continue;
+        }
+        /* v8 ignore stop */
+        return result;
+      } finally {
+        await page.close().catch(() => {});
+      }
+    }
+    /* v8 ignore next -- unreachable after 2 attempts */
+    return [];
+  } finally {
+    releaseLock();
+  }
+}
+
 // ─── Retailer Registry ───────────────────────────────────────────────────────
 // scrapeOnce: results are identical across stores (no store-specific URL/cookie).
 //   Scrape once and broadcast results to all stores.
@@ -3985,8 +4724,9 @@ const RETAILERS = [
   { key: "totalwine", name: "Total Wine", scrapeOnce: false, needsPage: false, scraper: scrapeTotalWineStore },
   { key: "walmart",   name: "Walmart",    scrapeOnce: false, needsPage: false, scraper: scrapeWalmartStore },
   { key: "kroger",    name: "Kroger",     scrapeOnce: false, needsPage: false, scraper: scrapeKrogerStore },
-  { key: "safeway",   name: "Safeway",    scrapeOnce: false, needsPage: false, scraper: scrapeSafewayStore },
-  { key: "walgreens", name: "Walgreens",  scrapeOnce: true,  needsPage: false, scraper: scrapeWalgreensStore },
+  { key: "safeway",     name: "Safeway",     scrapeOnce: false, needsPage: false, scraper: scrapeSafewayStore },
+  { key: "albertsons",  name: "Albertsons",  scrapeOnce: false, needsPage: false, scraper: scrapeAlbertsonsStore },
+  { key: "walgreens",   name: "Walgreens",   scrapeOnce: true,  needsPage: false, scraper: scrapeWalgreensStore },
   { key: "samsclub", name: "Sam's Club",  scrapeOnce: true,  needsPage: false, scraper: scrapeSamsClubStore },
   // BevMo omitted — no AZ locations
 ];
@@ -4064,15 +4804,27 @@ async function poll() {
 
     const embeds = buildStoreEmbeds(retailer.key, retailer.name, store, changes);
 
-    if (changes.newFinds.length > 0) {
-      console.log(`[${retailer.key}:${store.storeId}] 🟢 New: ${changes.newFinds.map((b) => b.name).join(", ")}`);
-      try { await sendUrgentAlert(embeds); }
-      catch (err) { discordFailures++; console.error(`[discord] Alert failed for ${retailer.name} ${store.name}: ${err.message}`); }
-    } else if (embeds.length > 0) {
-      console.log(`[${retailer.key}:${store.storeId}] ${changes.goneOOS.length > 0 ? "🔴 OOS" : "🔵 Re-alert"}`);
-      try { await sendDiscordAlert(embeds); }
-      catch (err) { discordFailures++; console.error(`[discord] Alert failed for ${retailer.name} ${store.name}: ${err.message}`); }
-    } else {
+    // Split embeds by tier — `_urgent: true` (confirmed finds) get @here ping,
+    // `_urgent: false` (leads) and tier-less embeds (OOS / re-alerts) go via quiet alert.
+    const urgentEmbeds = embeds.filter((e) => e._urgent === true).map((e) => { const { _urgent, ...rest } = e; return rest; });
+    const quietEmbeds = embeds.filter((e) => e._urgent !== true).map((e) => { const { _urgent, ...rest } = e; return rest; });
+
+    if (urgentEmbeds.length > 0) {
+      const confirmedNames = changes.newFinds.filter((b) => b.confidence !== "lead").map((b) => b.name);
+      console.log(`[${retailer.key}:${store.storeId}] 🟢 New: ${confirmedNames.join(", ")}`);
+      try { await sendUrgentAlert(urgentEmbeds); }
+      catch (err) { discordFailures++; console.error(`[discord] Urgent alert failed for ${retailer.name} ${store.name}: ${err.message}`); }
+    }
+    if (quietEmbeds.length > 0) {
+      const leadNames = changes.newFinds.filter((b) => b.confidence === "lead").map((b) => b.name);
+      const tag = leadNames.length > 0 ? `🟡 Lead: ${leadNames.join(", ")}`
+                : changes.goneOOS.length > 0 ? "🔴 OOS"
+                : "🔵 Re-alert";
+      console.log(`[${retailer.key}:${store.storeId}] ${tag}`);
+      try { await sendDiscordAlert(quietEmbeds); }
+      catch (err) { discordFailures++; console.error(`[discord] Quiet alert failed for ${retailer.name} ${store.name}: ${err.message}`); }
+    }
+    if (urgentEmbeds.length === 0 && quietEmbeds.length === 0) {
       nothingCount++;
       console.log(`[${retailer.key}:${store.storeId}] Nothing new`);
     }
@@ -4080,7 +4832,7 @@ async function poll() {
 
   const tasks = [];
   for (const [ri, retailer] of RETAILERS.entries()) {
-    const stores = storeCache.retailers[retailer.key] || [];
+    const stores = prioritizeStores(retailer.key, storeCache.retailers[retailer.key] || []);
     if (stores.length === 0) continue;
 
     // Adaptive skipping: back off from retailers with repeated failures
@@ -4271,13 +5023,14 @@ export {
   IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
   PRIORITY_QUERIES, getQueriesForScan, shuffleKeepCanaryFirst, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
-  shouldSkipRetailer, recordRetailerOutcome, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
+  shouldSkipRetailer, recordRetailerOutcome, prioritizeStores, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkCostcoKnownUrlsViaBrowser, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   FETCH_BLOCKED_PATTERNS, isFetchBlocked, isCostcoBlocked,
-  matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
+  matchCostcoProductPage, matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
-  KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore,
+  KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore, classifyKrogerFind, buildKrogerProductUrl, verifyKrogerCandidatesViaWebsite,
   matchSafewayProducts, scrapeSafewayViaFetch, scrapeSafewayViaBrowser, scrapeSafewayStore,
+  matchAlbertsonsProducts, scrapeAlbertsonsViaFetch, scrapeAlbertsonsViaBrowser, scrapeAlbertsonsStore, ALBERTSONS_KEY,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth,
@@ -4318,6 +5071,7 @@ function validateEnv() {
   if (!process.env.ZIP_CODE && !ZIP_CODE) warnings.push("ZIP_CODE not set — store discovery will fail");
   if (!process.env.KROGER_CLIENT_ID || !process.env.KROGER_CLIENT_SECRET) warnings.push("Kroger API credentials missing — Kroger scraper will be skipped");
   if (!process.env.SAFEWAY_API_KEY) warnings.push("SAFEWAY_API_KEY not set — Safeway scraper will be skipped");
+  if (!process.env.ALBERTSONS_API_KEY && !process.env.SAFEWAY_API_KEY) warnings.push("ALBERTSONS_API_KEY not set (no SAFEWAY_API_KEY fallback) — Albertsons scraper will be skipped");
   if (!process.env.PROXY_URL && !IS_MAC) warnings.push("No PROXY_URL on non-Mac platform — fetch paths may be blocked on datacenter IPs");
   return warnings;
 }
@@ -4336,6 +5090,8 @@ async function main() {
       maxStores: parseInt(MAX_STORES_PER_RETAILER, 10),
       krogerClientId: KROGER_CLIENT_ID,
       krogerClientSecret: KROGER_CLIENT_SECRET,
+      krogerMaxStores: KROGER_MAX_STORES ? parseInt(KROGER_MAX_STORES, 10) : undefined,
+      krogerRadiusMiles: KROGER_RADIUS_MILES ? parseInt(KROGER_RADIUS_MILES, 10) : undefined,
     });
 
     // Secondary zip codes: discover stores in additional areas and merge (dedup by storeId).
@@ -4351,6 +5107,8 @@ async function main() {
             maxStores: parseInt(MAX_STORES_PER_RETAILER, 10),
             krogerClientId: KROGER_CLIENT_ID,
             krogerClientSecret: KROGER_CLIENT_SECRET,
+            krogerMaxStores: KROGER_MAX_STORES ? parseInt(KROGER_MAX_STORES, 10) : undefined,
+            krogerRadiusMiles: KROGER_RADIUS_MILES ? parseInt(KROGER_RADIUS_MILES, 10) : undefined,
           });
           // Merge stores, dedup by storeId
           for (const [key, stores] of Object.entries(extra.retailers)) {
@@ -4392,30 +5150,21 @@ async function main() {
     const JITTER_MS = 3 * 60 * 1000; // ±3 min
     const BOOST_INTERVAL_MS = 20 * 60 * 1000; // 20 min
     const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 min
-    const DAYTIME_INTERVAL_MS = 45 * 60 * 1000; // 45 min — slower pace during business hours
 
     // Cache peak hours data — refreshed once per scheduling decision, not per poll
     function getNextPollDelayMs() {
       const { hour, day } = getMTTime();
       if (!isActiveHour(hour)) {
-        // Temporary daytime scanning for KoK drop (expires Mon Mar 31 2026 MT).
-        // After expiry, reverts to sleeping until 5 PM.
-        const DAYTIME_SCAN_UNTIL = new Date("2026-03-31T00:00:00-07:00"); // Mon midnight MT
-        if (Date.now() < DAYTIME_SCAN_UNTIL.getTime()) {
-          const jitter = (Math.random() - 0.5) * 2 * JITTER_MS;
-          const delayMs = Math.max(60000, DAYTIME_INTERVAL_MS + jitter);
-          console.log(`[scheduler] daytime interval (${day} ${hour}:xx MT) — next poll in ${Math.round(delayMs / 1000)}s`);
-          return delayMs;
-        }
-        // Normal behavior: sleep until 5 PM MT
+        // Sleep until ACTIVE_START (4 AM MT). If it's 10 PM–midnight, sleep wraps past midnight.
         const now = new Date();
         const mtHourStr = new Intl.DateTimeFormat("en-US", {
           timeZone: "America/Phoenix", hour: "numeric", minute: "numeric", hour12: false,
         }).format(now);
         const [h, m] = mtHourStr.split(":").map(Number);
-        const minsUntil5PM = (ACTIVE_START - h) * 60 - m;
-        const sleepMs = Math.max(60000, minsUntil5PM * 60 * 1000);
-        console.log(`[scheduler] Outside active hours (${h}:${String(m).padStart(2, "0")} MT ${day}) — sleeping ${Math.round(sleepMs / 60000)}min until 5 PM`);
+        let minsUntilStart = (ACTIVE_START - h) * 60 - m;
+        if (minsUntilStart <= 0) minsUntilStart += 24 * 60; // Wrap past midnight
+        const sleepMs = Math.max(60000, minsUntilStart * 60 * 1000);
+        console.log(`[scheduler] Outside active hours (${h}:${String(m).padStart(2, "0")} MT ${day}) — sleeping ${Math.round(sleepMs / 60000)}min until ${ACTIVE_START} AM`);
         return sleepMs;
       }
       // Dynamic boost: use peak hours from metrics when available (≥100 scans),
@@ -4448,7 +5197,7 @@ async function main() {
       }, nextMs);
     }
 
-    console.log(`Schedule: 24/7 — 30min default, 20min boost (Tue/Thu nights), 45min daytime (10 AM – 5 PM MT)\n`);
+    console.log(`Schedule: 4 AM – 10 PM MT — 30min default, 20min boost (Tue/Thu nights), sleeps 10 PM – 4 AM\n`);
 
     // Reddit intel runs on its own independent loop — lightweight (no browser, no proxy),
     // checks every 5-10 min 24/7 regardless of active hours. Drops are time-critical.

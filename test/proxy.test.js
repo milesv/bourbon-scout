@@ -234,7 +234,7 @@ describe("proxy support", () => {
     mocks.fetch.mockResolvedValue({ ok: true });
     setupMockBrowser();
     _setStoreCache({
-      retailers: { costco: [TEST_STORE], totalwine: [], walmart: [], kroger: [], safeway: [] },
+      retailers: { costco: [TEST_STORE], totalwine: [], walmart: [], kroger: [], safeway: [], albertsons: [] },
     });
     vi.spyOn(console, "log").mockImplementation(() => {});
     await runWithFakeTimers(async () => {
@@ -260,7 +260,7 @@ describe("proxy support", () => {
     setupMockBrowser();
     _resetPolling();
     mocks.discoverStores.mockResolvedValueOnce({
-      retailers: { costco: [], totalwine: [], walmart: [], kroger: [], safeway: [] },
+      retailers: { costco: [], totalwine: [], walmart: [], kroger: [], safeway: [], albertsons: [] },
     });
     await runWithFakeTimers(() => main());
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("[proxy]"));

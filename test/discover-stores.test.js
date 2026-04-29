@@ -24,7 +24,7 @@ vi.mock("node:fs/promises", () => ({
 import {
   loadCache, saveCache, isCacheValid, cleanStoreEntries,
   locateCostco, locateTotalWine, locateWalmart,
-  locateKroger, locateSafeway, locateWalgreens, locateSamsClub, locateBevMo,
+  locateKroger, locateSafeway, locateAlbertsons, locateWalgreens, locateSamsClub, locateBevMo,
   discoverStores,
 } from "../lib/discover-stores.js";
 
@@ -610,6 +610,69 @@ describe("locateSafeway", () => {
     ]);
     const stores = await locateSafeway(mockPage, "85283", COORDS, 15, 2);
     expect(stores).toHaveLength(2);
+  });
+});
+
+// ─── Albertsons Locator ──────────────────────────────────────────────────────
+
+describe("locateAlbertsons", () => {
+  it("parses stores from evaluate results", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { name: "Albertsons Baseline Rd", address: "1951 W Baseline Rd", id: "3067", distance: "3.2", href: "" },
+    ]);
+    const stores = await locateAlbertsons(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toHaveLength(1);
+    expect(stores[0].name).toContain("Albertsons");
+    expect(stores[0].distanceMiles).toBeCloseTo(3.2);
+  });
+
+  it("filters stores beyond radius", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { name: "Close", address: "A", id: "1", distance: "3.0", href: "" },
+      { name: "Far", address: "B", id: "2", distance: "20.0", href: "" },
+    ]);
+    const stores = await locateAlbertsons(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toHaveLength(1);
+  });
+
+  it("handles page errors", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const mockPage = createMockPage();
+    mockPage.goto.mockRejectedValueOnce(new Error("Timeout"));
+    const stores = await locateAlbertsons(mockPage, "85283", COORDS, 15, 5);
+    expect(stores).toEqual([]);
+    consoleSpy.mockRestore();
+  });
+
+  it("generates fallback storeId with ab- prefix", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { name: "Albertsons No ID", address: "Addr", id: "", distance: "", href: "" },
+    ]);
+    const stores = await locateAlbertsons(mockPage, "85283", COORDS, 15, 5);
+    expect(stores[0].storeId).toBe("ab-0");
+  });
+
+  it("respects maxStores limit", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { name: "Store A", address: "A", id: "1", distance: "1", href: "" },
+      { name: "Store B", address: "B", id: "2", distance: "2", href: "" },
+      { name: "Store C", address: "C", id: "3", distance: "3", href: "" },
+    ]);
+    const stores = await locateAlbertsons(mockPage, "85283", COORDS, 15, 2);
+    expect(stores).toHaveLength(2);
+  });
+
+  it("prefixes Albertsons to names that don't start with it", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValueOnce([
+      { name: "Baseline Store", address: "A", id: "1", distance: "1", href: "" },
+    ]);
+    const stores = await locateAlbertsons(mockPage, "85283", COORDS, 15, 5);
+    expect(stores[0].name).toBe("Albertsons Baseline Store");
   });
 });
 
