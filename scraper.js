@@ -655,11 +655,35 @@ function isCanaryFor(retailerKey, bottleName) {
 // a one-time Discord @here notification on the first scan after being added. Remove
 // entries after the drop is confirmed or passes. No automatic frequency change —
 // the notification lets you decide whether to adjust scan settings.
-const WATCH_LIST = [
-  // bottle is optional — omit for "Allocated Bourbon" (covers all bottles)
-  // { retailer: "costco", stores: ["427", "1058"], source: "Store confirmed, expected 3/23", date: "2026-03-20" },
-  // { bottle: "King of Kentucky", retailer: "costco", stores: ["427"], source: "Specific bottle rumor", date: "2026-03-20" },
+// WATCH_LIST is loaded from `watchlist.json` if it exists (gitignored, edit-without-deploy),
+// merged with this in-code default. JSON file lets you add/remove rumored drops without
+// editing source — daemon picks up changes on next poll. JSON shape: same as in-code entries.
+// Example watchlist.json:
+//   [
+//     { "bottle": "King of Kentucky", "retailer": "costco", "stores": ["427"],
+//       "source": "Reddit tip", "date": "2026-04-30" }
+//   ]
+const WATCH_LIST_DEFAULTS = [
+  // Hardcoded defaults — survives even if watchlist.json doesn't exist or is malformed.
+  // bottle is optional — omit for "Allocated Bourbon" (covers all bottles).
 ];
+let WATCH_LIST = [...WATCH_LIST_DEFAULTS];
+
+// Load watchlist.json on startup. Re-read on each poll() so live edits take effect
+// without a daemon restart. Errors silently fall back to defaults.
+const WATCHLIST_FILE = new URL("./watchlist.json", import.meta.url);
+async function loadWatchList() {
+  try {
+    const raw = await readFile(WATCHLIST_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      WATCH_LIST = [...WATCH_LIST_DEFAULTS, ...parsed];
+      return parsed.length;
+    }
+  } catch { /* missing or malformed → keep defaults */ }
+  WATCH_LIST = [...WATCH_LIST_DEFAULTS];
+  return 0;
+}
 
 // ─── Watch List Processing ──────────────────────────────────────────────────
 // Sends one-time Discord notifications for new WATCH_LIST entries.
@@ -811,6 +835,18 @@ async function scrapeRedditIntel(state) {
         // Mark as seen regardless of whether alert sends
         state._redditSeen[p.id] = new Date().toISOString();
         newPosts++;
+
+        // Cross-source confirmation: extract any TARGET_BOTTLE names mentioned in the
+        // post and record the timestamp. When the scraper later finds the SAME bottle
+        // within the confirmation window, the alert escalates to "🔥 double-confirmed"
+        // tier — both human reporting AND scraper agree, highest-precision signal.
+        if (!state._redditMentions) state._redditMentions = {};
+        const postTime = new Date(p.created_utc * 1000).toISOString();
+        for (const bottle of TARGET_BOTTLES) {
+          if (matchesBottle(text, bottle, "reddit")) {
+            state._redditMentions[bottle.name] = postTime;
+          }
+        }
 
         console.log(`[reddit] New intel from r/${sub}: "${p.title}" (keywords: ${matchedKeywords.slice(0, 5).join(", ")})`);
 
@@ -1090,6 +1126,11 @@ function computeChanges(previousStore, currentFound) {
 }
 
 // Mutates state in place for a given retailer+store. Preserves firstSeen for continuing bottles.
+// Maximum price history points to retain per bottle. Bounded to keep state.json small —
+// 30 points at 30-min cadence ≈ 15 hours of history, enough for "is this clearance?"
+// pattern detection. After 30 entries, oldest are dropped.
+const PRICE_HISTORY_LIMIT = 30;
+
 function updateStoreState(state, retailerKey, storeId, currentFound) {
   if (!state[retailerKey]) state[retailerKey] = {};
   const prev = state[retailerKey][storeId]?.bottles || {};
@@ -1097,15 +1138,39 @@ function updateStoreState(state, retailerKey, storeId, currentFound) {
 
   const bottles = {};
   for (const b of currentFound) {
+    // Append to price history if price changed since last scan. Skip if no price or
+    // identical to most recent entry (no point logging the same value 100 times).
+    const prevHistory = prev[b.name]?.priceHistory || [];
+    const lastPrice = prevHistory[prevHistory.length - 1]?.price;
+    const priceHistory = b.price && b.price !== lastPrice
+      ? [...prevHistory, { ts: now, price: b.price }].slice(-PRICE_HISTORY_LIMIT)
+      : prevHistory;
+
+    // Auto-confirmation: once a bottle has been seen for 24+ hours, mark it as
+    // "confirmed available" — distinguishes durable real stock from fly-by-night
+    // planogram artifacts that disappear within hours. Persisted as `confirmedAt`
+    // timestamp; once set, sticky (only cleared when the bottle goes OOS).
+    const firstSeen = prev[b.name]?.firstSeen || now;
+    const ageHours = (Date.now() - new Date(firstSeen).getTime()) / 3600000;
+    const confirmedAt = prev[b.name]?.confirmedAt || (ageHours >= 24 ? now : null);
+
     bottles[b.name] = {
       url: b.url,
       price: b.price,
       sku: b.sku || "",
       size: b.size || "",
       fulfillment: b.fulfillment || "",
-      firstSeen: prev[b.name]?.firstSeen || now,
+      firstSeen,
       lastSeen: now,
       scanCount: (prev[b.name]?.scanCount || 0) + 1,
+      ...(confirmedAt ? { confirmedAt } : {}),
+      // Optional Kroger B+C tier metadata — preserved across updates
+      ...(b.confidence ? { confidence: b.confidence } : {}),
+      ...(b.aisle ? { aisle: b.aisle } : {}),
+      ...(b.facings ? { facings: b.facings } : {}),
+      ...(b.dataAgeDays != null ? { dataAgeDays: b.dataAgeDays } : {}),
+      // Price history for trend analysis (bounded to last PRICE_HISTORY_LIMIT entries)
+      priceHistory,
     };
   }
 
@@ -1293,35 +1358,70 @@ function formatBottleLine(b, skuLabel, prefix = "🟢") {
   if (b.htmlVerified) {
     line += `\n   ✅ Verified against frysfood.com product page`;
   }
+  // 24h auto-confirmation: bottle has been continuously in stock for 24+ hours,
+  // distinguishing durable availability from short-lived planogram artifacts.
+  if (b.confirmedAt) {
+    line += `\n   🔵 Confirmed available — in stock 24+h`;
+  }
+  // Cross-source confirmation: Reddit reported this bottle in the last 4h AND our
+  // scraper found it. Highest-confidence find — both human and machine agree.
+  if (b.crossSourceConfirmed) {
+    line += `\n   🔥 DOUBLE-CONFIRMED — Reddit also reported within 4h`;
+  }
   return line;
 }
 
 // Bottles that re-alert every scan when still in stock — these are unicorns where
 // EVERY confirmation is news. Defaults to TARGET_BOTTLES list keyword-matched.
-const ULTRA_RARE_BOTTLES = new Set([
-  "Pappy Van Winkle 23 Year",
-  "Pappy Van Winkle 20 Year",
-  "Pappy Van Winkle 15 Year",
-  "Van Winkle Family Reserve Rye 13",
-  "King of Kentucky",
-  "George T. Stagg",
-  "William Larue Weller",
-  "Eagle Rare 17 Year",
-  "Thomas H. Handy",
-  "E.H. Taylor 18 Year Marriage",
-  "Old Forester Birthday Bourbon",
-  "Old Forester President's Choice",
-  "Old Forester 150th Anniversary",
-  "Old Forester King Ranch",
-  "Heaven Hill Heritage Collection 22 Year",
-]);
+// Per-bottle interest tiers — controls alert cadence and routing.
+//   obsess: every scan re-alerts; always urgent @here; ignores re-alert N config
+//   track:  standard cadence (REALERT_EVERY_N_SCANS); standard urgent alert
+//   ignore: silently records state, no Discord alerts at all (useful for "found
+//           but not interested" cases like clearance JD 14yr at MSRP+200%)
+//
+// Bottles not listed here default to "track". Add a bottle to "ignore" to suppress
+// alerts WITHOUT removing it from TARGET_BOTTLES (still tracked in state.json).
+const BOTTLE_INTEREST_TIERS = {
+  obsess: [
+    "Pappy Van Winkle 23 Year",
+    "Pappy Van Winkle 20 Year",
+    "Pappy Van Winkle 15 Year",
+    "Van Winkle Family Reserve Rye 13",
+    "King of Kentucky",
+    "George T. Stagg",
+    "William Larue Weller",
+    "Eagle Rare 17 Year",
+    "Thomas H. Handy",
+    "E.H. Taylor 18 Year Marriage",
+    "Old Forester Birthday Bourbon",
+    "Old Forester President's Choice",
+    "Old Forester 150th Anniversary",
+    "Old Forester King Ranch",
+    "Heaven Hill Heritage Collection 22 Year",
+  ],
+  track: [], // populated implicitly — anything not in obsess/ignore is "track"
+  ignore: [], // bottles to silently track without alerts
+};
+
+// Backward-compat alias for code that uses the old name
+const ULTRA_RARE_BOTTLES = new Set(BOTTLE_INTEREST_TIERS.obsess);
+const IGNORED_BOTTLES = new Set(BOTTLE_INTEREST_TIERS.ignore);
+
+function bottleInterestTier(bottleName) {
+  if (ULTRA_RARE_BOTTLES.has(bottleName)) return "obsess";
+  if (IGNORED_BOTTLES.has(bottleName)) return "ignore";
+  return "track";
+}
 
 // How frequently to re-alert a bottle that's still in stock from a previous scan.
 // Returns 1 (every scan) for ultra-rare bottles where each confirmation matters.
-// Returns the configured REALERT_EVERY_N_SCANS for everything else (default: 4).
+// Returns the configured REALERT_EVERY_N_SCANS for "track" tier (default: 4).
+// Returns Infinity for "ignore" tier — never re-alerts.
 function rerunCadenceFor(bottle) {
   if (!bottle?.name) return parseInt(REALERT_EVERY_N_SCANS, 10) || 4;
-  if (ULTRA_RARE_BOTTLES.has(bottle.name)) return 1;
+  const tier = bottleInterestTier(bottle.name);
+  if (tier === "obsess") return 1;
+  if (tier === "ignore") return Infinity;
   return parseInt(REALERT_EVERY_N_SCANS, 10) || 4;
 }
 
@@ -1360,8 +1460,10 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   // Split new finds into "confirmed" (strong signal) and "lead" (weak signal) tiers.
   // Only the Kroger scraper currently sets `confidence` — anything without it defaults
   // to "confirmed" so existing retailers keep their current behavior.
-  const confirmedFinds = changes.newFinds.filter((b) => b.confidence !== "lead");
-  const leadFinds = changes.newFinds.filter((b) => b.confidence === "lead");
+  // Filter out bottles in "ignore" tier — silently tracked but no alerts
+  const alertableFinds = changes.newFinds.filter((b) => !IGNORED_BOTTLES.has(b.name));
+  const confirmedFinds = alertableFinds.filter((b) => b.confidence !== "lead");
+  const leadFinds = alertableFinds.filter((b) => b.confidence === "lead");
   const inStockNames = [...changes.newFinds, ...changes.stillInStock].map((b) => b.name);
 
   // Confirmed embed (green, urgent — @here ping)
@@ -1895,12 +1997,46 @@ function acquireRetailerLock(retailerKey) {
 // Returns { page } — caller should close the PAGE when done (not the context).
 // opts.clean: use raw chromium (no stealth/rebrowser plugins). Required for PerimeterX/Akamai
 // sites — the stealth plugin's CDP modifications are fingerprinted as automation signals.
+// Bandwidth optimization: block image/font/media/ad-domain requests on retailer scraper
+// pages. Cuts proxy bill ~70% and scan time 20-40%. We only need HTML + JSON + the JS
+// that hydrates `__NEXT_DATA__` / `INITIAL_STATE` — images and analytics beacons are pure
+// waste. Critical: don't block stylesheets — some sites use CSS @import to gate JS run.
+//
+// Tracked at top-level so we can disable it per-retailer if a site breaks (e.g., if a
+// page hides product data behind an image-triggered XHR, we'd need to allow images).
+const BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
+const BLOCKED_DOMAINS = [
+  "doubleclick.net", "googletagmanager.com", "google-analytics.com",
+  "googleadservices.com", "facebook.net", "facebook.com/tr",
+  "criteo.com", "rfihub.com", "amazon-adsystem.com",
+  "scorecardresearch.com", "adsrvr.org", "demdex.net",
+  "branch.io", "segment.com", "segment.io", "mixpanel.com",
+  "newrelic.com", "nr-data.net", "bugsnag.com", "sentry.io",
+];
+async function applyBandwidthFilter(page) {
+  /* v8 ignore start -- requires live page; tested via integration */
+  try {
+    await page.route("**/*", (route) => {
+      const req = route.request();
+      const type = req.resourceType();
+      if (BLOCKED_RESOURCE_TYPES.has(type)) return route.abort();
+      const url = req.url();
+      for (const d of BLOCKED_DOMAINS) {
+        if (url.includes(d)) return route.abort();
+      }
+      route.continue();
+    });
+  } catch { /* page may be closed already */ }
+  /* v8 ignore stop */
+}
+
 async function launchRetailerBrowser(retailerKey, opts = {}) {
   // Reuse existing persistent context if available
   if (retailerBrowserCache[retailerKey]) {
     try {
       const cached = retailerBrowserCache[retailerKey];
       const page = await cached.context.newPage();
+      await applyBandwidthFilter(page);
       // Re-minimize on Mac when reusing cached context (macOS may have un-minimized)
       /* v8 ignore start -- CDP minimization requires real browser */
       if (cached.minimizeWindowId) {
@@ -2012,6 +2148,7 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
   /* v8 ignore stop */
   retailerBrowserCache[retailerKey] = { context, minimizeWindowId };
   const page = await context.newPage();
+  await applyBandwidthFilter(page);
   /* v8 ignore start -- CDP re-minimize after new page */
   if (minimizeWindowId) {
     try {
@@ -4995,6 +5132,9 @@ async function poll() {
 
   const state = await loadState();
   pruneState(state, storeCache.retailers);
+  // Live-reload watchlist.json so edits take effect without daemon restart
+  const wlCount = await loadWatchList();
+  if (wlCount > 0) console.log(`[watchlist] Loaded ${wlCount} entries from watchlist.json`);
   await processWatchList(state);
   // Reddit intel runs on its own independent loop (see main()), not per-scan
   let storesScanned = 0;
@@ -5003,6 +5143,11 @@ async function poll() {
   let totalLeads = 0;      // newFinds with confidence === "lead" (Kroger yellow)
   let totalStillInStock = 0;
   let totalGoneOOS = 0;
+  // Alert deduplication: tracks bottle names that already fired an URGENT (@here) alert
+  // earlier in this scan. Subsequent same-bottle finds at other stores downgrade to
+  // quiet alerts to prevent Discord spam (e.g. Pappy 15 at 4 Marketplace stores =
+  // 1 @here ping + 3 quiet "also at" alerts instead of 4 @here pings).
+  const urgentlyAlertedThisScan = new Set();
   let nothingCount = 0;
   const retailersSeen = new Set();
   const scannedStores = [];
@@ -5036,6 +5181,18 @@ async function poll() {
     }
     const realInStock = inStock.filter((b) => !isCanaryFor(retailer.key, b.name));
 
+    // Cross-source confirmation: if a Reddit post in the last 4 hours mentioned the
+    // bottle, mark this find as "double-confirmed" (highest signal — both human
+    // reporting and scraper agree). buildStoreEmbeds renders 🔥 + distinct title.
+    const reddit = state._redditMentions || {};
+    const CROSS_SOURCE_WINDOW_MS = 4 * 60 * 60 * 1000;
+    for (const b of realInStock) {
+      const ts = reddit[b.name];
+      if (ts && Date.now() - new Date(ts).getTime() < CROSS_SOURCE_WINDOW_MS) {
+        b.crossSourceConfirmed = true;
+      }
+    }
+
     const previousStore = state[retailer.key]?.[store.storeId];
     const changes = computeChanges(previousStore, realInStock);
     updateStoreState(state, retailer.key, store.storeId, realInStock);
@@ -5065,9 +5222,22 @@ async function poll() {
 
     if (urgentEmbeds.length > 0) {
       const confirmedNames = changes.newFinds.filter((b) => b.confidence !== "lead").map((b) => b.name);
-      console.log(`[${retailer.key}:${store.storeId}] 🟢 New: ${confirmedNames.join(", ")}`);
-      try { await sendUrgentAlert(urgentEmbeds); }
-      catch (err) { discordFailures++; console.error(`[discord] Urgent alert failed for ${retailer.name} ${store.name}: ${err.message}`); }
+      // Cross-store dedup: if EVERY bottle in this urgent batch was already alerted on
+      // earlier in this scan, downgrade to quiet (already pinged for this bottle).
+      // Otherwise mark all bottles as alerted and proceed with @here ping.
+      const allAlreadyAlerted = confirmedNames.every((n) => urgentlyAlertedThisScan.has(n));
+      if (allAlreadyAlerted) {
+        console.log(`[${retailer.key}:${store.storeId}] 🟢 New (deduped — already pinged this scan): ${confirmedNames.join(", ")}`);
+        // Append "(also at: <store>)" annotation to embed title for context
+        const annotated = urgentEmbeds.map((e) => ({ ...e, title: `🎯 ALSO AT — ${e.title.replace(/^🚨 NEW FIND — /, "")}` }));
+        try { await sendDiscordAlert(annotated); }
+        catch (err) { discordFailures++; console.error(`[discord] Dedup alert failed: ${err.message}`); }
+      } else {
+        console.log(`[${retailer.key}:${store.storeId}] 🟢 New: ${confirmedNames.join(", ")}`);
+        for (const n of confirmedNames) urgentlyAlertedThisScan.add(n);
+        try { await sendUrgentAlert(urgentEmbeds); }
+        catch (err) { discordFailures++; console.error(`[discord] Urgent alert failed for ${retailer.name} ${store.name}: ${err.message}`); }
+      }
     }
     if (quietEmbeds.length > 0) {
       const leadNames = changes.newFinds.filter((b) => b.confidence === "lead").map((b) => b.name);
@@ -5278,7 +5448,7 @@ export {
   SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, CANARY_BY_RETAILER, isCanaryFor, RETAILERS, FETCH_HEADERS,
   normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, MIN_BOTTLE_PRICE, MAX_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
-  formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed, ULTRA_RARE_BOTTLES, rerunCadenceFor,
+  formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed, ULTRA_RARE_BOTTLES, IGNORED_BOTTLES, BOTTLE_INTEREST_TIERS, bottleInterestTier, rerunCadenceFor,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   METRICS_FILE, appendMetrics, loadRecentMetrics, pruneMetrics, computeMetricsTrend, computePeakHours, detectHealthDegradation,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,

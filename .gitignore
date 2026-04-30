@@ -6,6 +6,7 @@ metrics.jsonl
 debug/
 browser-profiles/
 browser-state.json
+watchlist.json
 coverage/
 preview-embeds.html
 .claude/

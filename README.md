@@ -166,6 +166,9 @@ Three diagnostic scripts in `scripts/` for ongoing health checks:
 | `node scripts/probe-waf.js [retailer]` | Weekly, or after a health-degradation alert | Probes each retailer's homepage and reports detected WAF cookies (Akamai `_abck`, Incapsula `incap_ses_*`, PerimeterX `_px*`). Surfaces WAF migrations BEFORE they cause weeks of silent failures. |
 | `node scripts/analyze-drops.js [--days=14] [--retailer=kroger]` | Monthly | Mines `metrics.jsonl` for day-of-week × hour drop patterns. Top hit slots, per-retailer canary timeline, bottle first-appearance log. Used to validate boost-schedule tuning. |
 | `node scripts/audit-state.js [--fix] [--days=30]` | Quarterly | Audits `state.json` for stale entries, broken URLs, missing prices, orphaned stores, expired Reddit-spawned watch list entries. Read-only by default; `--fix` prunes stale watchlist entries. |
+| `node scripts/seasonal-patterns.js [--bottle=X]` | Quarterly / before drop seasons | Bottle × month heatmap from `metrics.jsonl`. Identifies BTAC/Pappy/EHT seasonal patterns from your own scan history; predicts likely drops in current and next month. |
+| `node scripts/find.js <query>` | Anytime | CLI search of current `state.json`. e.g. `node scripts/find.js stagg --hot` → all confirmed/double-confirmed Stagg findings across all retailers, grouped by bottle. |
+| `node scripts/map.js` | Anytime | Renders current finds on a Leaflet map (self-contained HTML). Tier-colored markers (red=double-confirmed, blue=24h-confirmed, green=found, yellow=lead). Open `map.html` in browser. |
 
 The daemon also fires automatic Discord pings:
 - **🟢 New find** — confirmed bottle in stock with strong signal (drive over)
