@@ -89,7 +89,7 @@ import {
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   KROGER_PRODUCTS, checkKrogerKnownProducts, verifyKrogerCandidatesViaWebsite,
-  trackHealth,
+  trackHealth, HEALTH_REASONS,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
   shuffleKeepCanaryFirst,
@@ -447,6 +447,46 @@ describe("trackHealth", () => {
     const h = _getScraperHealth();
     expect(h.walmart.stores["1234"]).toEqual({ ok: 1, blocked: 1, failed: 0 });
     expect(h.walmart.stores["5678"]).toEqual({ ok: 1, blocked: 0, failed: 0 });
+  });
+
+  // Granular failure-mode reasons surface root cause in metrics — without this,
+  // every "blocked" looks identical and audits require manual probing.
+  it("tracks granular failure reasons (waf/proxy/soft_block/contract_drift)", () => {
+    trackHealth("safeway", "blocked", { reason: "waf" });
+    trackHealth("safeway", "blocked", { reason: "waf" });
+    trackHealth("samsclub", "blocked", { reason: "contract_drift" });
+    trackHealth("costco", "blocked", { reason: "soft_block" });
+    trackHealth("walmart", "fail", { reason: "proxy" });
+    trackHealth("walmart", "fail", { reason: "timeout" });
+    const h = _getScraperHealth();
+    expect(h.safeway.reasons.waf).toBe(2);
+    expect(h.samsclub.reasons.contract_drift).toBe(1);
+    expect(h.costco.reasons.soft_block).toBe(1);
+    expect(h.walmart.reasons.proxy).toBe(1);
+    expect(h.walmart.reasons.timeout).toBe(1);
+  });
+
+  it("ignores reason for ok outcomes (only failures get reason annotation)", () => {
+    trackHealth("kroger", "ok", { reason: "waf" });  // makes no sense, should be ignored
+    const h = _getScraperHealth();
+    expect(h.kroger.reasons.waf).toBe(0);
+  });
+
+  it("ignores unknown reason values (defends against typos)", () => {
+    trackHealth("kroger", "blocked", { reason: "bogus_reason" });
+    const h = _getScraperHealth();
+    // All standard reasons should be 0; the bogus one shouldn't be added either
+    expect(h.kroger.reasons).not.toHaveProperty("bogus_reason");
+    expect(h.kroger.reasons.waf).toBe(0);
+  });
+
+  it("HEALTH_REASONS Set lists the recognized reason names", () => {
+    expect(HEALTH_REASONS.has("waf")).toBe(true);
+    expect(HEALTH_REASONS.has("proxy")).toBe(true);
+    expect(HEALTH_REASONS.has("soft_block")).toBe(true);
+    expect(HEALTH_REASONS.has("contract_drift")).toBe(true);
+    expect(HEALTH_REASONS.has("timeout")).toBe(true);
+    expect(HEALTH_REASONS.has("network")).toBe(true);
   });
 });
 

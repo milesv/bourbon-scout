@@ -247,10 +247,29 @@ let primaryProxyExhausted = false;
 let backupProxyExhausted = false;
 
 function initHealth(key) {
-  if (!scraperHealth[key]) scraperHealth[key] = { queries: 0, succeeded: 0, failed: 0, blocked: 0, queryStats: {}, path: { fetch: 0, browser: 0 }, stores: {} };
+  if (!scraperHealth[key]) {
+    scraperHealth[key] = {
+      queries: 0, succeeded: 0, failed: 0, blocked: 0,
+      queryStats: {}, path: { fetch: 0, browser: 0 }, stores: {},
+      // Granular failure-mode counters — surfaces *why* a scraper isn't producing data.
+      // Without these, every "blocked" looks identical in metrics, hiding root causes
+      // like contract drift (page schema changed) vs. soft blocks (Akamai degraded
+      // response) vs. proxy auth (DataImpulse 407). Used by audit reports.
+      reasons: { waf: 0, proxy: 0, soft_block: 0, contract_drift: 0, timeout: 0, network: 0 },
+    };
+  }
 }
 
-function trackHealth(key, outcome, { query, via, storeId } = {}) {
+// Recognized failure-mode reasons:
+//   "waf"            — anti-bot WAF returned a hard challenge/block (Akamai 403, PerimeterX captcha, Incapsula iframe)
+//   "proxy"          — proxy connection issue (407 TRAFFIC_EXHAUSTED, ERR_PROXY_AUTH_UNSUPPORTED, ERR_INTERNET_DISCONNECTED)
+//   "soft_block"     — page returned 200 but with no products and no recognized "no results" container (degraded response)
+//   "contract_drift" — required field/structure missing from response (e.g., __NEXT_DATA__ absent, expected JSON shape changed)
+//   "timeout"        — query exceeded its time budget without resolving
+//   "network"        — generic network or unexpected error not fitting above
+const HEALTH_REASONS = new Set(["waf", "proxy", "soft_block", "contract_drift", "timeout", "network"]);
+
+function trackHealth(key, outcome, { query, via, storeId, reason } = {}) {
   initHealth(key);
   scraperHealth[key].queries++;
   if (outcome === "ok") scraperHealth[key].succeeded++;
@@ -268,6 +287,10 @@ function trackHealth(key, outcome, { query, via, storeId } = {}) {
   if (storeId) {
     if (!scraperHealth[key].stores[storeId]) scraperHealth[key].stores[storeId] = { ok: 0, blocked: 0, failed: 0 };
     scraperHealth[key].stores[storeId][outcome === "ok" ? "ok" : outcome === "blocked" ? "blocked" : "failed"]++;
+  }
+  // Failure-mode reason (optional, only for non-ok outcomes) — granular root cause
+  if (reason && outcome !== "ok" && HEALTH_REASONS.has(reason)) {
+    scraperHealth[key].reasons[reason]++;
   }
 }
 
@@ -2213,18 +2236,25 @@ async function scrapeCostcoOnce(page) {
         }
         if (!tilesLoaded) {
           console.warn(`[costco] Bot detection page for query "${query}" — skipping`);
-          trackHealth("costco", "blocked");
+          trackHealth("costco", "blocked", { reason: "waf" });
           continue;
         }
       }
       if (!tilesLoaded) {
         // No tiles and not blocked — could be a degraded page or JS failed to hydrate.
-        const hasContent = await page.$('main, [data-testid="search-results"], [data-testid="no-results"]').then(el => !!el).catch(() => false);
+        // The 2026 Costco redesign dropped `[data-testid="search-results"]` as a content
+        // anchor. New page reliably has `LinkList` testids (sidebar facets) and
+        // `MarkdownRenderer` (info banners) even on no-results pages — anchor on those
+        // plus `main h1/h2` for robustness as the design evolves. `main` alone matches
+        // most pages so it's the final safety net.
+        const hasContent = await page.$(
+          'main, [data-testid="search-results"], [data-testid="no-results"], [data-testid^="LinkList"], [data-testid="MarkdownRenderer"]'
+        ).then(el => !!el).catch(() => false);
         if (hasContent) {
-          trackHealth("costco", "ok"); // Genuine empty result
+          trackHealth("costco", "ok"); // Genuine empty result on a healthy page
         } else {
-          console.warn(`[costco] No tiles and no content for query "${query}" — marking degraded`);
-          trackHealth("costco", "blocked");
+          console.warn(`[costco] No tiles and no results container — possible soft block`);
+          trackHealth("costco", "blocked", { reason: "soft_block" });
         }
         continue;
       }
@@ -2706,7 +2736,7 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
         }
         if (!solved || (await isBlockedPage(page))) {
           console.warn(`[totalwine:${store.storeId}] Bot detection page for query "${query}" — skipping`);
-          trackHealth("totalwine", "blocked");
+          trackHealth("totalwine", "blocked", { reason: "waf" });
           continue;
         }
       }
@@ -3075,7 +3105,7 @@ async function scrapeWalmartViaBrowser(store, page) {
         }
         if (!solved || await isBlockedPage(page)) {
           console.warn(`[walmart:${store.storeId}] Bot detection page for query "${query}" — skipping`);
-          trackHealth("walmart", "blocked");
+          trackHealth("walmart", "blocked", { reason: "waf" });
           continue;
         }
       }
@@ -3300,7 +3330,7 @@ async function scrapeWalgreensViaBrowser(page) {
         }
         if (!solved || (await isBlockedPage(page))) {
           console.warn(`[walgreens] Bot detection page for query "${query}" — skipping`);
-          trackHealth("walgreens", "blocked");
+          trackHealth("walgreens", "blocked", { reason: "waf" });
           wgConsecutiveBlocks++;
           continue;
         }
@@ -3622,7 +3652,7 @@ async function scrapeSamsClubViaBrowser(page) {
         }
         if (!solved || (await isBlockedPage(page))) {
           console.warn(`[samsclub] Bot detection on product ${productId} — skipping`);
-          trackHealth("samsclub", "blocked");
+          trackHealth("samsclub", "blocked", { reason: "waf" });
           continue;
         }
       }
@@ -3644,7 +3674,7 @@ async function scrapeSamsClubViaBrowser(page) {
       } else {
         // __NEXT_DATA__ missing but page wasn't flagged as blocked — degraded response
         console.warn(`[samsclub] No __NEXT_DATA__ for product ${productId} — marking degraded`);
-        trackHealth("samsclub", "blocked");
+        trackHealth("samsclub", "blocked", { reason: "contract_drift" });
       }
     } catch (err) {
       console.error(`[samsclub] Error checking ${bottleName}: ${err.message}`);
@@ -4248,13 +4278,19 @@ async function scrapeSafewayViaBrowser(page, store) {
   const t0 = Date.now();
   const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 
-  // Pre-warm: visit homepage to let Akamai sensor set _abck cookie
-  await page.goto("https://www.safeway.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  // Pre-warm: visit homepage to let WAF sensor (Akamai _abck OR Incapsula incap_ses_*)
+  // execute. Use domcontentloaded — Safeway moved to Incapsula in 2026 and the page
+  // never reaches networkidle (sensor keeps beaconing). 20s on networkidle was eating
+  // the entire 300s budget before queries could run.
+  await page.goto("https://www.safeway.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
   console.log(`[safeway:${store.storeId}] Homepage loaded (${elapsed()})`);
-  await sleep(4000 + Math.random() * 3000);
+  // Dwell to let WAF sensor JS run (both Akamai and Incapsula need ~5-8s for cookie issuance)
+  await sleep(6000 + Math.random() * 3000);
+  // solveHumanChallenge handles PerimeterX "Press & Hold" — no-op for Akamai/Incapsula
+  // (they use invisible JS challenges or full CAPTCHA we can't solve programmatically)
   await solveHumanChallenge(page);
-  await humanizePage(page, { pace: "slow" });
-  await navigateCategory(page, "safeway");
+  await humanizePage(page, { pace: "medium" });
+  // Skip navigateCategory — it adds another ~30-60s and isn't required for the API path
   console.log(`[safeway:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
 
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
@@ -4313,7 +4349,7 @@ async function scrapeSafewayViaBrowser(page, store) {
           const solved = await solveHumanChallenge(page);
           if (!solved || (await isBlockedPage(page))) {
             console.warn(`[safeway:${store.storeId}] Blocked for query "${query}"`);
-            trackHealth("safeway", "blocked");
+            trackHealth("safeway", "blocked", { reason: "waf" });
             consecutiveBlocks++;
             continue;
           }
@@ -4594,7 +4630,7 @@ async function scrapeAlbertsonsViaBrowser(page, store) {
           const solved = await solveHumanChallenge(page);
           if (!solved || (await isBlockedPage(page))) {
             console.warn(`[albertsons:${store.storeId}] Blocked for query "${query}"`);
-            trackHealth("albertsons", "blocked");
+            trackHealth("albertsons", "blocked", { reason: "waf" });
             consecutiveBlocks++;
             continue;
           }
@@ -5033,7 +5069,7 @@ export {
   matchAlbertsonsProducts, scrapeAlbertsonsViaFetch, scrapeAlbertsonsViaBrowser, scrapeAlbertsonsStore, ALBERTSONS_KEY,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
-  trackHealth,
+  trackHealth, HEALTH_REASONS,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
   validateEnv,
