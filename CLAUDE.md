@@ -1,6 +1,6 @@
 # Bourbon Scout
 
-Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 8 retailers for 46 bottles (45 rare/allocated + 1 canary health check) near a zip code, sends per-store Discord alerts with @here pings when bottles are found, plus a quiet summary with per-scraper health metrics after each scan.
+Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 9 retailers for 46 bottles (45 rare/allocated + 1 canary health check) near a zip code, sends per-store Discord alerts with @here pings when bottles are found, plus a quiet summary with per-scraper health metrics after each scan.
 
 ## Architecture
 
@@ -139,6 +139,7 @@ All config is in `.env`:
 | Albertsons | Playwright (browser-only) | JSON via in-page `fetch()` | Incapsula (Imperva) | Same parent company as Safeway, same `/abs/pub/xapi/pgmsearch/v1/search/products` endpoint, same Azure APIM auth, same Incapsula WAF (`incap_ses_*`/`visid_incap_*` cookies). Multi-store `acquireRetailerLock("albertsons")` mutex prevents concurrent stores from tearing down each other's shared browser context. 300s timeout. `ALBERTSONS_API_KEY` falls back to `SAFEWAY_API_KEY` (same key works on both banners). |
 | Walgreens | Playwright (browser-only) | Server-rendered HTML (CSS selectors) | Akamai Bot Manager | Scrape-once. Clean browser (`{ clean: true }`). `USER_LOC` cookie (base64 JSON with lat/lng/zip) sets store context. No embedded JSON — extracts `.card__product` DOM elements with fallback `[class*='card__product']` + `[data-testid*='product']` selectors. Filters by multiple OOS text patterns ("Not sold at your store", "out of stock", "unavailable"). `zipToCoords` failure returns `[]` immediately instead of wasting a 180s timeout slot. |
 | Sam's Club | Fetch-first / Playwright | `__NEXT_DATA__` JSON (per-product) | PerimeterX | Scrape-once. Falls back to clean browser (`{ clean: true }`). Per-product-URL approach — search excludes spirits. `SAMSCLUB_PRODUCTS` maps 14 bottle names to product IDs (Blanton's, Weller SR, EHT SB, Stagg Jr, George T. Stagg, Eagle Rare 17, Thomas H. Handy, Elmer T. Lee, Pappy 10/12/15/20/23, Buffalo Trace canary). Checks `availabilityStatusV2.value` on each product page. Same Next.js stack as Walmart (same parent company). |
+| ExtraMile | REST API (got-scraping) | JSON | None (public api_key) | Single-store Chevron at 7000 W Chandler Blvd, AZ 85226. Built on **CityHive** multi-tenant e-commerce platform. No WAF detected — clean fetch path with `got-scraping`. Public `api_key` exposed in browser, hardcoded in scraper as `EXTRAMILE_API_KEY`. Merchant ID `EXTRAMILE_MERCHANT_ID` is also hardcoded. POSTs to `/api/v1/merchants/{id}/browse_categories/render.json` with `category_params.input_value` set to the search query. Stock signal: `merchants[0].offer_types` non-empty (typically `["delivery", "pick_up"]`). Fallback `is_buyable: true` for schema variants. Polite 1-2s spacing between queries (small backend). |
 
 BevMo is omitted from the poll loop — no Arizona locations exist.
 
@@ -148,7 +149,7 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-1663 tests across 5 files using Vitest (94.4% line coverage, 83.8% branch):
+1672 tests across 5 files using Vitest (94.4% line coverage, 83.8% branch):
 
 | File | Tests | Focus |
 |------|-------|-------|
@@ -218,6 +219,7 @@ When a retailer's store locator stops finding stores (selectors broke):
 - **Cross-source confirmation tier** — `state._redditMentions` records Reddit-mentioned bottle timestamps during `scrapeRedditIntel`. In `recordResult`, any newFind with a Reddit mention in the last 4 hours gets `crossSourceConfirmed: true` → 🔥 "DOUBLE-CONFIRMED" badge in `formatBottleLine`. Highest-confidence find: human reporting + scraper agree.
 - **Alert dedup across stores** — `urgentlyAlertedThisScan` Set tracks bottle names already pinged with @here in the current poll. Subsequent same-bottle finds at other stores downgrade to quiet alerts with "🎯 ALSO AT —" titles. Reduces Discord noise when one bottle drops at multiple Marketplace stores simultaneously.
 - **Bandwidth filter on browser scrapers** — `applyBandwidthFilter(page)` blocks `image`/`font`/`media` resource types and 17 ad/analytics domains via `page.route()`. Cuts proxy bandwidth ~70% and scan time 20-40%. Critical: stylesheets are NOT blocked (some sites gate JS execution on CSS load).
+- **ExtraMile (CityHive) is the cleanest scrape target in the system** — single store, no WAF, public API key, plain JSON response. No browser, no proxy concerns, no cookie chain. The opposite of Costco/Safeway in every dimension. The `matchExtraMileProducts` matcher checks `merchants[0].offer_types` (non-empty array = in-stock); falls back to `is_buyable: true` for future schema variants.
 - **Walmart rejection-reason diagnostic** — When `matchWalmartNextData` finds a name match but rejects the item (sellerName, availability, fulfillment), logs the specific filter that fired. Walmart has produced 0 non-canary finds across 290+ scans; this surfaces whether matches exist but get filtered (vs. no allocated stock at our stores).
 - **Reddit → watch list bridge** — `inferRetailerFromText(text, keywords)` extracts the most-mentioned retailer from a Reddit post body, used in `scrapeRedditIntel` to auto-create a `_watchList` entry for each match. Records the intelligence; doesn't auto-create proactive scans (the Reddit alert IS the user-facing signal). Pre-marked as already-notified so the existing `processWatchList` doesn't fire twice.
 - **Two-tier summary embed** — `buildSummaryEmbed` accepts `totalConfirmed` + `totalLeads` and shows them split when present. The `poll()` aggregator splits `changes.newFinds` by `confidence` to compute the tier counts. Lets a quick glance at the summary differentiate "5 confirmed (drive over)" from "5 leads (call first)".

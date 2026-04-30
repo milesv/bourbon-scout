@@ -123,7 +123,7 @@ const retailerProxyUrls = {}; // retailerKey → full proxy URL (for browser pro
 function refreshProxySession() {
   if (!PROXY_URL) return;
   // Assign each retailer its own sticky port (= its own residential IP)
-  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub"];
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile"];
   const basePort = 10000 + Math.floor(Math.random() * 9000); // leave room for 8 retailers
   const backupBasePort = 10000 + Math.floor(Math.random() * 9000);
   for (let i = 0; i < retailers.length; i++) {
@@ -212,7 +212,7 @@ function failoverToBackupProxy() {
   if (!BACKUP_PROXY_URL) return false;
   /* v8 ignore start -- requires BACKUP_PROXY_URL at module load (tested in proxy.test.js env) */
   console.log("[proxy] Failing over ALL retailers to backup proxy");
-  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub"];
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile"];
   const basePort = 10000 + Math.floor(Math.random() * 9000);
   for (let i = 0; i < retailers.length; i++) {
     try {
@@ -692,7 +692,7 @@ function watchListKey(entry) {
   return `${entry.bottle || "Allocated Bourbon"}:${entry.retailer}:${[...entry.stores].sort().join(",")}`;
 }
 
-const WATCH_LIST_RETAILER_NAMES = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club" };
+const WATCH_LIST_RETAILER_NAMES = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club", extramile: "ExtraMile" };
 
 function buildWatchListEmbed(entry) {
   const retailerName = WATCH_LIST_RETAILER_NAMES[entry.retailer] || entry.retailer;
@@ -1274,12 +1274,12 @@ const COLORS = {
 
 const SKU_LABELS = {
   costco: "Item #", totalwine: "Item #", walmart: "Item #",
-  kroger: "SKU", safeway: "UPC", albertsons: "UPC", samsclub: "Item #",
+  kroger: "SKU", safeway: "UPC", albertsons: "UPC", samsclub: "Item #", extramile: "Item #",
 };
 
 const STORE_TYPE_LABELS = {
   costco: "Warehouse", totalwine: "Store", walmart: "Store",
-  kroger: "Store", safeway: "Store", albertsons: "Store", samsclub: "Club",
+  kroger: "Store", safeway: "Store", albertsons: "Store", samsclub: "Club", extramile: "Store",
 };
 
 function parseCity(address) {
@@ -1556,8 +1556,8 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   return embeds;
 }
 
-const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub"];
-const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club" };
+const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile"];
+const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club", extramile: "ExtraMile" };
 
 function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null, peakHours = null, totalConfirmed = 0, totalLeads = 0 }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
@@ -5096,6 +5096,154 @@ async function scrapeAlbertsonsStore(store) {
   }
 }
 
+// ─── ExtraMile Liquors (CityHive single-store) ──────────────────────────────
+// ExtraMile is a single-store Chevron at 7000 W Chandler Blvd, AZ 85226 running
+// on the CityHive multi-tenant e-commerce platform. No WAF detected (no Akamai/
+// Incapsula/PerimeterX) — a clean fetch path is sufficient. The site's API uses
+// a public api_key that's exposed in the browser, no auth required.
+//
+// Architecture:
+//   - merchant_id: 66c8c223d933721cd7586082 (Chandler Chevron)
+//   - api_key: 7508df878a8c7566a880e4d3f7fa7972 (public/site-scoped)
+//   - search URL pattern: /shop?ch-query={query}  (SPA renders results)
+//   - product page: /shop/product/{slug}/{productId}?option-id={optionId}
+//   - product offers: /api/v1/merchants/{merchantId}/product/{productId}/offers.json
+//
+// Single store, no per-store filtering needed. Treated as `scrapeOnce: false` with
+// a single fallback store.
+
+const EXTRAMILE_MERCHANT_ID = "66c8c223d933721cd7586082";
+const EXTRAMILE_API_KEY = "7508df878a8c7566a880e4d3f7fa7972";
+const EXTRAMILE_BASE = "https://extramileliquors.com";
+
+// Match ExtraMile (CityHive) product objects against TARGET_BOTTLES. The product
+// shape returned by the browse API includes `name`, `basic_category`, and a
+// `merchants[].product_options[].product_url` field for the direct purchase URL.
+// Stock signal: `merchants[].offer_types` contains "delivery" or "pick_up" when
+// the bottle is currently buyable. Empty offer_types = sold out / unavailable.
+function matchExtraMileProducts(products) {
+  const found = [];
+  for (const p of products) {
+    if (!p?.name) continue;
+    const merchant = p.merchants?.[0];
+    if (!merchant) continue;
+    // Stock check: offer_types is non-empty array when buyable. CityHive returns
+    // ["delivery", "pick_up"] for in-stock; [] for OOS. Defensive: also allow
+    // truthy check on `is_buyable` field if it appears in future schema versions.
+    const offerTypes = merchant.offer_types || [];
+    const inStock = offerTypes.length > 0 || merchant.is_buyable === true;
+    if (!inStock) continue;
+    const opt = merchant.product_options?.[0];
+    const productUrl = opt?.product_url || `${EXTRAMILE_BASE}/shop/product/${p.id}`;
+    // Price: try a handful of common shapes the API might return — undocumented
+    // schema, so be generous about extraction.
+    const priceRaw = opt?.price ?? merchant.price ?? p.price;
+    const price = typeof priceRaw === "number" ? `$${priceRaw.toFixed(2)}`
+                : typeof priceRaw === "string" ? priceRaw
+                : "";
+    const sizeQty = p.size?.quantity || merchant.size?.quantity;
+    const sizeMeasure = p.size?.measure || merchant.size?.measure;
+    const size = sizeQty && sizeMeasure ? `${sizeQty}${sizeMeasure}` : parseSize(p.name);
+    for (const bottle of TARGET_BOTTLES) {
+      if (matchesBottle(p.name, bottle, "extramile")) {
+        found.push({
+          name: bottle.name,
+          url: productUrl,
+          price,
+          sku: p.id || "",
+          size,
+          fulfillment: offerTypes.join(", ") || "available",
+        });
+      }
+    }
+  }
+  return found;
+}
+
+// Fetch ExtraMile products matching a search query. Uses the SPA's underlying
+// browse_categories API endpoint with a query input. CityHive's API expects a
+// POST with `category_params.input_value` set to the search term — the same
+// endpoint that powers `/shop?ch-query=X` in the UI.
+async function fetchExtraMileSearch(query) {
+  const url = `${EXTRAMILE_BASE}/api/v1/merchants/${EXTRAMILE_MERCHANT_ID}/browse_categories/render.json`;
+  // Generate per-request GUIDs so the API treats each request as a fresh client
+  const sdkGuid = crypto.randomUUID();
+  const reqGuid = crypto.randomUUID();
+  const body = {
+    api_key: EXTRAMILE_API_KEY,
+    sdk_guid: sdkGuid,
+    ch_request_guid: reqGuid,
+    client_origin: "app://sites.chandlera6ec3658",
+    local: true,
+    category_params: {
+      children_type: "products",
+      link_type: "vertical_list",
+      input_value: query,
+      minimum_no_of_nodes: 1,
+      max_nodes: 50,
+    },
+  };
+  try {
+    const res = await scraperFetchRetry(url, {
+      method: "POST",
+      headers: { ...FETCH_HEADERS, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+      timeout: 15000,
+      proxyUrl: getRetailerProxyUrl("extramile") || undefined,
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (data.result !== 0) return []; // CityHive convention: result=0 means success
+    const nodes = data.data?.nodes || [];
+    return nodes
+      .filter((n) => n.type === "product" && n.params?.product)
+      .map((n) => n.params.product);
+  } catch {
+    return [];
+  }
+}
+
+// Single-store scraper. Iterates SEARCH_QUERIES and matches results against
+// TARGET_BOTTLES. CityHive's API supports unauthenticated fetches with the
+// site's public api_key, so no browser session is needed.
+async function scrapeExtraMileStore(_store) {
+  const found = [];
+  let validQueries = 0;
+  let failures = 0;
+
+  // shuffleKeepCanaryFirst keeps Buffalo Trace first for canary detection
+  const queries = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES));
+  for (const query of queries) {
+    if (failures > 3) break;
+    try {
+      const products = await fetchExtraMileSearch(query);
+      if (products.length > 0) {
+        const matches = matchExtraMileProducts(products);
+        found.push(...matches);
+        validQueries++;
+        trackHealth("extramile", "ok");
+      } else {
+        // Empty result is normal for many queries (small store catalog)
+        trackHealth("extramile", "ok");
+        validQueries++;
+      }
+    } catch (err) {
+      console.warn(`[extramile] Query "${query}" failed: ${err.message}`);
+      trackHealth("extramile", "fail", { reason: "network" });
+      failures++;
+    }
+    // Polite: don't burst the small CityHive backend — 1-2s between queries
+    await sleep(1000 + Math.random() * 1000);
+  }
+
+  // Bail if we had near-total query failures — could mean API contract changed
+  if (validQueries === 0 && failures > 0) {
+    console.warn("[extramile] All queries failed — check CityHive API contract");
+    return [];
+  }
+  return dedupFound(found);
+}
+
 // ─── Retailer Registry ───────────────────────────────────────────────────────
 // scrapeOnce: results are identical across stores (no store-specific URL/cookie).
 //   Scrape once and broadcast results to all stores.
@@ -5110,7 +5258,8 @@ const RETAILERS = [
   { key: "safeway",     name: "Safeway",     scrapeOnce: false, needsPage: false, scraper: scrapeSafewayStore },
   { key: "albertsons",  name: "Albertsons",  scrapeOnce: false, needsPage: false, scraper: scrapeAlbertsonsStore },
   { key: "walgreens",   name: "Walgreens",   scrapeOnce: true,  needsPage: false, scraper: scrapeWalgreensStore },
-  { key: "samsclub", name: "Sam's Club",  scrapeOnce: true,  needsPage: false, scraper: scrapeSamsClubStore },
+  { key: "samsclub",  name: "Sam's Club",   scrapeOnce: true,  needsPage: false, scraper: scrapeSamsClubStore },
+  { key: "extramile", name: "ExtraMile",    scrapeOnce: false, needsPage: false, scraper: scrapeExtraMileStore },
   // BevMo omitted — no AZ locations
 ];
 
@@ -5463,6 +5612,7 @@ export {
   KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore, classifyKrogerFind, buildKrogerProductUrl, verifyKrogerCandidatesViaWebsite,
   matchSafewayProducts, scrapeSafewayViaFetch, scrapeSafewayViaBrowser, scrapeSafewayStore,
   matchAlbertsonsProducts, scrapeAlbertsonsViaFetch, scrapeAlbertsonsViaBrowser, scrapeAlbertsonsStore, ALBERTSONS_KEY,
+  matchExtraMileProducts, fetchExtraMileSearch, scrapeExtraMileStore, EXTRAMILE_MERCHANT_ID, EXTRAMILE_API_KEY,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth, HEALTH_REASONS,

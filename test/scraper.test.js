@@ -86,6 +86,7 @@ import {
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, matchSafewayProducts, scrapeSafewayStore,
   matchAlbertsonsProducts, scrapeAlbertsonsStore, ALBERTSONS_KEY,
+  matchExtraMileProducts, scrapeExtraMileStore, EXTRAMILE_MERCHANT_ID, EXTRAMILE_API_KEY,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   KROGER_PRODUCTS, checkKrogerKnownProducts, verifyKrogerCandidatesViaWebsite,
@@ -208,9 +209,9 @@ describe("constants", () => {
     expect(TARGET_BOTTLES[0]).toHaveProperty("searchTerms");
   });
 
-  it("RETAILERS has 8 entries", () => {
-    expect(RETAILERS).toHaveLength(8);
-    expect(RETAILERS.map((r) => r.key)).toEqual(["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub"]);
+  it("RETAILERS has 9 entries", () => {
+    expect(RETAILERS).toHaveLength(9);
+    expect(RETAILERS.map((r) => r.key)).toEqual(["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile"]);
   });
 
   it("RETAILERS have correct flags", () => {
@@ -1484,7 +1485,7 @@ describe("buildSummaryEmbed", () => {
       totalGoneOOS: 0, nothingCount: 5, durationSec: 60, health,
     });
     expect(embed.fields).toBeDefined();
-    expect(embed.fields.length).toBe(8); // All 8 retailers always shown
+    expect(embed.fields.length).toBe(9); // All 9 retailers always shown
     const costco = embed.fields.find((f) => f.name === "Costco");
     expect(costco.value).toContain("✅");
     expect(costco.value).toContain("14/14");
@@ -1540,20 +1541,20 @@ describe("buildSummaryEmbed", () => {
     expect(kroger.value).not.toContain("🐤");
   });
 
-  it("shows all 8 retailers as skipped when no health data", () => {
+  it("shows all 9 retailers as skipped when no health data", () => {
     const embed = buildSummaryEmbed({
       storesScanned: 5, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
       totalGoneOOS: 0, nothingCount: 5, durationSec: 60,
     });
     expect(embed.fields).toBeDefined();
-    expect(embed.fields.length).toBe(8);
+    expect(embed.fields.length).toBe(9);
     for (const f of embed.fields) {
       expect(f.value).toContain("⏭️");
       expect(f.inline).toBe(true);
     }
   });
 
-  it("orders fields by retailer registry order (all 8 always present)", () => {
+  it("orders fields by retailer registry order (all 9 always present)", () => {
     const health = {
       samsclub: { queries: 8, succeeded: 8, failed: 0, blocked: 0 },
       walgreens: { queries: 14, succeeded: 14, failed: 0, blocked: 0 },
@@ -1564,7 +1565,7 @@ describe("buildSummaryEmbed", () => {
       storesScanned: 4, retailersScanned: 4, totalNewFinds: 0, totalStillInStock: 0,
       totalGoneOOS: 0, nothingCount: 4, durationSec: 60, health,
     });
-    expect(embed.fields.map((f) => f.name)).toEqual(["Costco", "Total Wine", "Walmart", "Kroger", "Safeway", "Albertsons", "Walgreens", "Sam's Club"]);
+    expect(embed.fields.map((f) => f.name)).toEqual(["Costco", "Total Wine", "Walmart", "Kroger", "Safeway", "Albertsons", "Walgreens", "Sam's Club", "ExtraMile"]);
     // Retailers with health data show real stats
     expect(embed.fields.find((f) => f.name === "Costco").value).toContain("✅");
     // Retailers without health data show skipped
@@ -3038,6 +3039,95 @@ describe("scrapeAlbertsonsStore", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const result = await scrapeAlbertsonsStore({ storeId: "3067", name: "Albertsons Test" });
     expect(Array.isArray(result)).toBe(true);
+  });
+});
+
+// ─── ExtraMile Liquors (CityHive single-store) ──────────────────────────────
+// CityHive product schema: name, basic_category, merchants[].offer_types,
+// merchants[].product_options[].product_url. Stock = offer_types non-empty.
+describe("matchExtraMileProducts", () => {
+  it("returns matched in-stock products with extramile URLs", () => {
+    const products = [{
+      id: "5521cef065613100036c0000",
+      name: "Buffalo Trace Bourbon",
+      basic_category: ["bourbon", "whiskey"],
+      size: { measure: "ml", quantity: "750", unit: "Bottle" },
+      merchants: [{
+        offer_types: ["delivery", "pick_up"],
+        product_options: [{
+          product_id: "5521cef065613100036c0000",
+          product_url: "https://extramileliquors.com/shop/product/buffalo-trace-bourbon/5521cef065613100036c0000?option-id=abc",
+          price: 32.99,
+        }],
+      }],
+    }];
+    const found = matchExtraMileProducts(products);
+    const bt = found.find((f) => f.name === "Buffalo Trace");
+    expect(bt).toBeTruthy();
+    expect(bt.url).toContain("extramileliquors.com");
+    expect(bt.price).toBe("$32.99");
+    expect(bt.size).toBe("750ml");
+  });
+
+  it("filters out products with empty offer_types (sold out)", () => {
+    const found = matchExtraMileProducts([{
+      id: "x", name: "Buffalo Trace Bourbon",
+      merchants: [{ offer_types: [], product_options: [{ product_url: "x" }] }],
+    }]);
+    expect(found).toEqual([]);
+  });
+
+  it("filters products with no merchants array", () => {
+    const found = matchExtraMileProducts([{ id: "x", name: "Buffalo Trace Bourbon" }]);
+    expect(found).toEqual([]);
+  });
+
+  it("handles string price (non-numeric API response)", () => {
+    const found = matchExtraMileProducts([{
+      id: "x", name: "Buffalo Trace Bourbon",
+      merchants: [{ offer_types: ["pick_up"], product_options: [{ product_url: "x", price: "$32.99" }] }],
+    }]);
+    expect(found[0].price).toBe("$32.99");
+  });
+
+  it("falls back to parseSize when size object is missing", () => {
+    const found = matchExtraMileProducts([{
+      id: "x", name: "Buffalo Trace Bourbon 750ml",
+      merchants: [{ offer_types: ["pick_up"], product_options: [{ product_url: "x" }] }],
+    }]);
+    expect(found[0].size).toBe("750ml");
+  });
+
+  it("falls back to default URL when product_options missing", () => {
+    const found = matchExtraMileProducts([{
+      id: "abc123", name: "Buffalo Trace Bourbon",
+      merchants: [{ offer_types: ["pick_up"], product_options: [] }],
+    }]);
+    expect(found[0].url).toBe("https://extramileliquors.com/shop/product/abc123");
+  });
+
+  it("uses extramile retailer key for matchesBottle (per-retailer filtering)", () => {
+    // Penelope is restricted to costco/totalwine/walmart only — should NOT match at extramile
+    const found = matchExtraMileProducts([{
+      id: "x", name: "Penelope Founder's Reserve Bourbon",
+      merchants: [{ offer_types: ["pick_up"], product_options: [{ product_url: "x" }] }],
+    }]);
+    expect(found.find((f) => f.name?.includes("Penelope"))).toBeFalsy();
+  });
+
+  it("accepts is_buyable: true as in-stock signal (alternate schema)", () => {
+    const found = matchExtraMileProducts([{
+      id: "x", name: "Buffalo Trace Bourbon",
+      merchants: [{ offer_types: [], is_buyable: true, product_options: [{ product_url: "x" }] }],
+    }]);
+    expect(found[0].name).toBe("Buffalo Trace");
+  });
+});
+
+describe("ExtraMile config constants", () => {
+  it("exports stable merchant ID and API key", () => {
+    expect(EXTRAMILE_MERCHANT_ID).toBe("66c8c223d933721cd7586082");
+    expect(EXTRAMILE_API_KEY).toBe("7508df878a8c7566a880e4d3f7fa7972");
   });
 });
 
