@@ -91,8 +91,11 @@ import {
   KROGER_PRODUCTS, checkKrogerKnownProducts, verifyKrogerCandidatesViaWebsite,
   trackHealth, HEALTH_REASONS,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
-  REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
+  REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel, inferRetailerFromText,
   shuffleKeepCanaryFirst,
+  CANARY_BY_RETAILER, isCanaryFor,
+  ULTRA_RARE_BOTTLES, rerunCadenceFor,
+  detectHealthDegradation,
   scrapeSafewayViaBrowser,
   handleShutdown, shuttingDown,
   validateEnv,
@@ -8696,4 +8699,100 @@ describe("poll integration", () => {
     await poll();
     // Poll should complete and record outcomes
   }, 15000);
+});
+
+// ─── Per-retailer canary configuration ──────────────────────────────────────
+describe("isCanaryFor (per-retailer canary configuration)", () => {
+  it("falls back to default Buffalo Trace for retailers without explicit config", () => {
+    expect(isCanaryFor("kroger", "Buffalo Trace")).toBe(true);
+    expect(isCanaryFor("walmart", "Buffalo Trace")).toBe(true);
+  });
+
+  it("returns false for non-canary bottles", () => {
+    expect(isCanaryFor("kroger", "Pappy Van Winkle 23 Year")).toBe(false);
+    expect(isCanaryFor("walmart", "Blanton's Original")).toBe(false);
+  });
+
+  it("CANARY_BY_RETAILER is exported as an object (config plumbing in place)", () => {
+    expect(typeof CANARY_BY_RETAILER).toBe("object");
+  });
+});
+
+// ─── Smart re-alert by rarity ────────────────────────────────────────────────
+describe("rerunCadenceFor (smart re-alert by rarity)", () => {
+  it("returns 1 for ultra-rare bottles (re-alert every scan)", () => {
+    expect(rerunCadenceFor({ name: "Pappy Van Winkle 23 Year" })).toBe(1);
+    expect(rerunCadenceFor({ name: "George T. Stagg" })).toBe(1);
+    expect(rerunCadenceFor({ name: "King of Kentucky" })).toBe(1);
+  });
+
+  it("returns default cadence for common bottles", () => {
+    expect(rerunCadenceFor({ name: "Buffalo Trace" })).toBeGreaterThan(1);
+    expect(rerunCadenceFor({ name: "Weller Special Reserve" })).toBeGreaterThan(1);
+  });
+
+  it("handles missing/null bottle gracefully", () => {
+    expect(rerunCadenceFor(null)).toBeGreaterThan(0);
+    expect(rerunCadenceFor({})).toBeGreaterThan(0);
+  });
+
+  it("ULTRA_RARE_BOTTLES contains expected unicorns", () => {
+    expect(ULTRA_RARE_BOTTLES.has("Pappy Van Winkle 23 Year")).toBe(true);
+    expect(ULTRA_RARE_BOTTLES.has("Pappy Van Winkle 15 Year")).toBe(true);
+    expect(ULTRA_RARE_BOTTLES.has("Buffalo Trace")).toBe(false);  // canary, not ultra-rare
+  });
+});
+
+// ─── Health-degradation detection ────────────────────────────────────────────
+describe("detectHealthDegradation", () => {
+  it("returns empty array when fewer than 4 scans available", () => {
+    expect(detectHealthDegradation([])).toEqual([]);
+    expect(detectHealthDegradation([
+      { ts: "2026-04-29T10:00:00Z", retailers: { safeway: { queries: 10, canary: false } } },
+    ])).toEqual([]);
+  });
+
+  it("returns empty array when canary is being found in recent scans", () => {
+    const scans = [];
+    for (let i = 0; i < 4; i++) scans.push({
+      ts: `2026-04-29T${10 + i}:00:00Z`,
+      retailers: { kroger: { queries: 10, canary: true } },
+    });
+    expect(detectHealthDegradation(scans)).toEqual([]);
+  });
+
+  it("flags retailer with 4 consecutive missed canaries", () => {
+    const scans = [];
+    for (let i = 0; i < 4; i++) scans.push({
+      ts: `2026-04-29T${10 + i}:00:00Z`,
+      retailers: {
+        safeway: { queries: 10, canary: false, reasons: { waf: 8, network: 2 } },
+      },
+    });
+    const degraded = detectHealthDegradation(scans);
+    expect(degraded.length).toBe(1);
+    expect(degraded[0].retailer).toBe("safeway");
+    expect(degraded[0].dominantReason).toBe("waf");
+    expect(degraded[0].scansSinceCanary).toBe(4);
+  });
+});
+
+// ─── Reddit retailer inference ───────────────────────────────────────────────
+describe("inferRetailerFromText", () => {
+  it("returns retailer when text mentions it", () => {
+    expect(inferRetailerFromText("KoK at Costco Tempe!", [])).toBe("costco");
+    expect(inferRetailerFromText("BTAC drop at Total Wine Mesa", [])).toBe("totalwine");
+    expect(inferRetailerFromText("Pappy at Fry's Marketplace Higley", [])).toBe("kroger");
+  });
+
+  it("returns null when no retailer mentioned", () => {
+    expect(inferRetailerFromText("Found a bottle today", [])).toBe(null);
+    expect(inferRetailerFromText("", [])).toBe(null);
+  });
+
+  it("picks retailer with most mentions when multiple are named", () => {
+    expect(
+      inferRetailerFromText("Walmart and Walmart had Blanton's. Costco didn't.", [])
+    ).toBe("walmart");
+  });
 });

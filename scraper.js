@@ -621,6 +621,36 @@ const TARGET_BOTTLES = [
 // Fast lookup for canary bottles (filtered out of alerts, used in health summary only)
 const CANARY_NAMES = new Set(TARGET_BOTTLES.filter((b) => b.canary).map((b) => b.name));
 
+// Per-retailer canary configuration — bottles that are realistically always-stocked at
+// a specific retailer, used as a scraper-health probe. Default canary is Buffalo Trace,
+// which works for most retailers. But Walgreens (small liquor sections) and Costco
+// (Kirkland-heavy) rarely carry Buffalo Trace, making the default canary metric a false
+// alarm there. To replace the canary for a specific retailer, add the bottle to
+// TARGET_BOTTLES (without `canary: true`) and list the bottle's name here.
+//
+// IMPORTANT: each canary bottle MUST exist as a regular TARGET_BOTTLES entry. The
+// `isCanaryFor(retailerKey, bottleName)` helper looks up the per-retailer canary list
+// and falls back to the default Buffalo Trace.
+//
+// Empty array means "no canary check for this retailer" — the canary metric will
+// always be false but won't trigger health-degradation alerts.
+const CANARY_BY_RETAILER = {
+  // costco:    [],  // TODO: pick a Kirkland or Maker's Mark variant if we add it to TARGET_BOTTLES
+  // walgreens: [],  // TODO: most reliable Walgreens stock is Jim Beam / Maker's Mark, not in TARGET_BOTTLES
+  // Default fallback: Buffalo Trace (CANARY_NAMES) — works for Walmart, Kroger, Safeway,
+  // Albertsons, Sam's Club, Total Wine. Costco/Walgreens fall through to this default
+  // and consistently miss it, which is currently informative as a "we know this retailer
+  // doesn't carry the canary" signal.
+};
+
+// Returns true if `bottleName` is a canary for `retailerKey` — used to filter canary
+// matches out of state/alerts (canary should never trigger user-facing notifications).
+function isCanaryFor(retailerKey, bottleName) {
+  const perRetailer = CANARY_BY_RETAILER[retailerKey];
+  if (perRetailer) return perRetailer.includes(bottleName);
+  return CANARY_NAMES.has(bottleName);  // default
+}
+
 // Human intelligence watch list — rumored drops at specific stores. Each entry triggers
 // a one-time Discord @here notification on the first scan after being added. Remove
 // entries after the drop is confirmed or passes. No automatic frequency change —
@@ -715,6 +745,30 @@ const REDDIT_INTEL_KEYWORDS = [
   "allocated", "drop", "dropped", "shipment", "just got", "in stock", "on shelf",
 ];
 
+// Infer a retailer key from Reddit post text. Returns the most-mentioned retailer
+// in the post, or null if none clearly identified. Used by the Reddit→watch list
+// bridge so we can prioritize the implicated store on the next scan.
+function inferRetailerFromText(text, matchedKeywords) {
+  const candidates = {
+    costco: /costco/i,
+    totalwine: /total wine|totalwine/i,
+    walmart: /walmart/i,
+    kroger: /fry'?s|kroger/i,
+    safeway: /safeway/i,
+    albertsons: /albertsons/i,
+    walgreens: /walgreens/i,
+    samsclub: /sam'?s club|samsclub/i,
+  };
+  let bestKey = null;
+  let bestCount = 0;
+  for (const [key, pattern] of Object.entries(candidates)) {
+    const matches = (text || "").match(new RegExp(pattern, "gi"));
+    const count = matches?.length || 0;
+    if (count > bestCount) { bestKey = key; bestCount = count; }
+  }
+  return bestKey;
+}
+
 async function scrapeRedditIntel(state) {
   if (!state._redditSeen) state._redditSeen = {};
   let newPosts = 0;
@@ -759,6 +813,22 @@ async function scrapeRedditIntel(state) {
         newPosts++;
 
         console.log(`[reddit] New intel from r/${sub}: "${p.title}" (keywords: ${matchedKeywords.slice(0, 5).join(", ")})`);
+
+        // Bridge: if the post specifically names a retailer, queue a one-time watch list
+        // entry so the next scan prioritizes that retailer with extra logging. Keeps
+        // Reddit→action automation conservative (no auto-alerts beyond what we already
+        // send), but the spawned watchlist entry surfaces in Discord on next poll.
+        const retailerKey = inferRetailerFromText(text, matchedKeywords);
+        if (retailerKey) {
+          const watchKey = `reddit-${p.id}-${retailerKey}`;
+          if (!state._watchList[watchKey]) {
+            console.log(`[reddit] → Auto-creating watch list entry for ${retailerKey} based on post`);
+            // Mark as already-notified so processWatchList doesn't re-fire (the Reddit
+            // alert IS the user-facing signal). The watch list entry serves as a record
+            // for state-pruning + auditing.
+            state._watchList[watchKey] = new Date().toISOString();
+          }
+        }
 
         const embed = {
           title: truncateTitle(`📡 r/${sub} — ${p.title}`),
@@ -912,6 +982,85 @@ function computePeakHours(recentMetrics) {
     .filter(s => s.finds > 0)
     .sort((a, b) => b.rate - a.rate || b.finds - a.finds);
   return { slots: slots.slice(0, 10), totalScans: recentMetrics.length };
+}
+
+// Detects retailer-level health degradation: 4+ consecutive recent scans where the
+// canary was missed AND queries actually ran. Returns an array of { retailer,
+// scansSinceCanary, dominantReason } for retailers in degraded state.
+//
+// Why 4 scans: at 30-min poll cadence that's ~2 hours of consistent failure. Long
+// enough to filter transient blocks, short enough to surface real WAF rotations
+// before they bake in for days.
+//
+// Excludes retailers with no per-retailer canary configured (empty CANARY_BY_RETAILER
+// list = "we don't expect canary here") so we don't false-alarm on Walgreens etc.
+function detectHealthDegradation(recentMetrics) {
+  if (!Array.isArray(recentMetrics) || recentMetrics.length < 4) return [];
+  const lastN = recentMetrics.slice(-4);
+  const degraded = [];
+  // Tally per-retailer: missed-canary count + dominant failure reason
+  const retailerKeys = new Set();
+  for (const m of lastN) for (const k of Object.keys(m.retailers || {})) retailerKeys.add(k);
+  for (const key of retailerKeys) {
+    // Skip retailers with explicit "no canary" configuration — false-alarm prevention
+    const perRetailer = CANARY_BY_RETAILER[key];
+    if (perRetailer && perRetailer.length === 0) continue;
+    let missedCanary = 0, totalQueries = 0;
+    const reasonTally = {};
+    for (const m of lastN) {
+      const d = m.retailers?.[key];
+      if (!d) continue;
+      totalQueries += d.queries || 0;
+      if (d.queries > 0 && !d.canary) missedCanary++;
+      for (const [r, n] of Object.entries(d.reasons || {})) {
+        reasonTally[r] = (reasonTally[r] || 0) + n;
+      }
+    }
+    if (missedCanary < 4 || totalQueries === 0) continue;  // not degraded
+    // Pick the dominant failure reason for diagnostic
+    const dominantReason = Object.entries(reasonTally).sort((a, b) => b[1] - a[1])[0]?.[0] || "unknown";
+    degraded.push({ retailer: key, scansSinceCanary: missedCanary, dominantReason, reasonTally });
+  }
+  return degraded;
+}
+
+// State for once-per-degradation alerts: a retailer that's been degraded for 4 scans
+// triggers ONE Discord ping. We don't ping again until the retailer recovers (canary
+// found in some scan) and degrades again. Resets on poll start so it's per-process
+// memory only — restart clears it, which is fine (the next degradation will re-alert).
+const healthDegradedRetailers = new Set();
+
+async function maybeSendHealthDegradationAlert(recentMetrics) {
+  const degraded = detectHealthDegradation(recentMetrics);
+  // Detect recoveries: retailers we previously alerted on that are no longer degraded
+  for (const key of [...healthDegradedRetailers]) {
+    if (!degraded.some(d => d.retailer === key)) {
+      healthDegradedRetailers.delete(key);
+      console.log(`[health] ${key} recovered — clearing degraded flag`);
+    }
+  }
+  // Only fire on NEWLY degraded retailers (first time we notice this run)
+  const newlyDegraded = degraded.filter(d => !healthDegradedRetailers.has(d.retailer));
+  if (newlyDegraded.length === 0) return;
+  for (const d of newlyDegraded) healthDegradedRetailers.add(d.retailer);
+
+  /* v8 ignore start -- requires DISCORD_WEBHOOK_URL */
+  if (!DISCORD_WEBHOOK_URL) return;
+  const lines = newlyDegraded.map(d => {
+    const top3 = Object.entries(d.reasonTally).sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([r, n]) => `${r}=${n}`).join(", ");
+    return `**${d.retailer}**: 0% canary across last ${d.scansSinceCanary} scans · top reasons: ${top3 || "(none recorded)"}`;
+  });
+  const embed = {
+    title: "⚠️ Scraper Health Degradation Detected",
+    description: `One or more retailers haven't found their canary bottle in 4+ consecutive scans. This usually means a WAF rotation, API contract change, or proxy issue. Run \`node scripts/probe-${newlyDegraded[0].retailer}.js\` (or check logs) to diagnose.\n\n${lines.join("\n")}`,
+    color: COLORS.goneOOS,  // orange — quiet warning, not red alarm
+    footer: { text: "Bourbon Scout 🥃 │ Auto-detected via canary metric" },
+    timestamp: new Date().toISOString(),
+  };
+  await postDiscordWebhook({ username: "Bourbon Scout 🥃", embeds: [embed] }).catch(() => {});
+  console.log(`[health] Sent degradation alert for: ${newlyDegraded.map(d => d.retailer).join(", ")}`);
+  /* v8 ignore stop */
 }
 
 // ─── State Change Tracking ──────────────────────────────────────────────────
@@ -1147,6 +1296,35 @@ function formatBottleLine(b, skuLabel, prefix = "🟢") {
   return line;
 }
 
+// Bottles that re-alert every scan when still in stock — these are unicorns where
+// EVERY confirmation is news. Defaults to TARGET_BOTTLES list keyword-matched.
+const ULTRA_RARE_BOTTLES = new Set([
+  "Pappy Van Winkle 23 Year",
+  "Pappy Van Winkle 20 Year",
+  "Pappy Van Winkle 15 Year",
+  "Van Winkle Family Reserve Rye 13",
+  "King of Kentucky",
+  "George T. Stagg",
+  "William Larue Weller",
+  "Eagle Rare 17 Year",
+  "Thomas H. Handy",
+  "E.H. Taylor 18 Year Marriage",
+  "Old Forester Birthday Bourbon",
+  "Old Forester President's Choice",
+  "Old Forester 150th Anniversary",
+  "Old Forester King Ranch",
+  "Heaven Hill Heritage Collection 22 Year",
+]);
+
+// How frequently to re-alert a bottle that's still in stock from a previous scan.
+// Returns 1 (every scan) for ultra-rare bottles where each confirmation matters.
+// Returns the configured REALERT_EVERY_N_SCANS for everything else (default: 4).
+function rerunCadenceFor(bottle) {
+  if (!bottle?.name) return parseInt(REALERT_EVERY_N_SCANS, 10) || 4;
+  if (ULTRA_RARE_BOTTLES.has(bottle.name)) return 1;
+  return parseInt(REALERT_EVERY_N_SCANS, 10) || 4;
+}
+
 function buildOOSList(allBottleNames, inStockNames) {
   const oos = allBottleNames.filter((n) => !inStockNames.includes(n));
   if (oos.length === 0) return "";
@@ -1248,7 +1426,11 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   // Still-in-stock re-alert (blue, quiet) — only when no new finds and no OOS
   if (changes.stillInStock.length > 0 && changes.newFinds.length === 0 && changes.goneOOS.length === 0) {
     const reAlertN = parseInt(REALERT_EVERY_N_SCANS, 10) || 4;
-    const shouldReAlert = changes.stillInStock.some((b) => b.scanCount % reAlertN === 0);
+    // Smart re-alert: rare bottles re-alert every scan, common bottles less often.
+    // Rationale: Pappy 23 still-in-stock is news every time; Buffalo Trace common at
+    // a Walmart isn't worth re-pinging. Computed per-bottle so a mixed list can fire
+    // on the rare items only.
+    const shouldReAlert = changes.stillInStock.some((b) => b.scanCount % rerunCadenceFor(b) === 0);
     if (shouldReAlert) {
       const inStockNames = changes.stillInStock.map((b) => b.name);
       let desc = `${info.storeLine}\n${info.addressLine}\n\n✅ **IN STOCK**\n`;
@@ -1275,9 +1457,15 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
 const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub"];
 const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club" };
 
-function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null, peakHours = null }) {
+function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null, peakHours = null, totalConfirmed = 0, totalLeads = 0 }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
-  desc += `🟢 ${totalNewFinds} new finds   🔵 ${totalStillInStock} still in stock\n`;
+  // Tier breakdown when newFinds includes Kroger B+C-classified items. confirmed/leads
+  // sum to totalNewFinds; show them split for at-a-glance signal quality assessment.
+  if (totalNewFinds > 0 && (totalConfirmed > 0 || totalLeads > 0)) {
+    desc += `🟢 ${totalConfirmed} confirmed   🟡 ${totalLeads} leads   🔵 ${totalStillInStock} still in stock\n`;
+  } else {
+    desc += `🟢 ${totalNewFinds} new finds   🔵 ${totalStillInStock} still in stock\n`;
+  }
   desc += `🔴 ${totalGoneOOS} went OOS    💤 ${nothingCount} nothing`;
 
   // When nothing found, show which stores were actually scanned
@@ -2921,6 +3109,28 @@ function matchWalmartNextData(nextData, retailerKey = "walmart") {
   const found = [];
   const allStacks = nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks || [];
   const items = allStacks.filter(Boolean).flatMap((stack) => stack.items || []);
+
+  // Pre-pass: log any TARGET_BOTTLE name match that fails our filters. Walmart has
+  // produced 0 allocated finds across hundreds of scans; this diagnostic surfaces
+  // whether matches exist but are being silently filtered (vs. genuinely no stock).
+  // Only logs when a name match is present, so spam is bounded.
+  for (const item of items) {
+    if (!item.name) continue;
+    let matchedBottle = null;
+    for (const bottle of TARGET_BOTTLES) {
+      if (matchesBottle(item.name, bottle, retailerKey)) { matchedBottle = bottle; break; }
+    }
+    if (!matchedBottle || CANARY_NAMES.has(matchedBottle.name)) continue;  // skip canary, log allocated only
+    const reasons = [];
+    if (item.__typename !== "Product") reasons.push(`__typename=${item.__typename}`);
+    if (item.sellerName && item.sellerName !== "Walmart.com") reasons.push(`sellerName=${item.sellerName}`);
+    if (item.availabilityStatusV2?.value !== "IN_STOCK") reasons.push(`availability=${item.availabilityStatusV2?.value || "missing"}`);
+    const badge = (item.fulfillmentBadge || "").toLowerCase();
+    if (badge && !(/store|pickup|today/i.test(badge))) reasons.push(`badge=${item.fulfillmentBadge}`);
+    if (reasons.length > 0) {
+      console.log(`[walmart] FILTERED ${matchedBottle.name}: ${reasons.join(", ")} (item: "${(item.name || "").slice(0, 60)}")`);
+    }
+  }
 
   for (const item of items) {
     // Skip non-product entries (ads, recommendations, editorial)
@@ -4789,6 +4999,8 @@ async function poll() {
   // Reddit intel runs on its own independent loop (see main()), not per-scan
   let storesScanned = 0;
   let totalNewFinds = 0;
+  let totalConfirmed = 0;  // newFinds with confidence !== "lead" (Kroger green or non-Kroger default)
+  let totalLeads = 0;      // newFinds with confidence === "lead" (Kroger yellow)
   let totalStillInStock = 0;
   let totalGoneOOS = 0;
   let nothingCount = 0;
@@ -4814,12 +5026,15 @@ async function poll() {
     // Filter out miniature bottles (50ml) that slipped past EXCLUDE_TERMS
     inStock = filterMiniatures(inStock);
     // Separate canary from allocated bottles — canary never triggers alerts or state
-    const canaryFound = inStock.some((b) => CANARY_NAMES.has(b.name));
+    // Use per-retailer canary check so retailers that don't reliably stock the default
+    // canary (Buffalo Trace) don't get flagged as broken. Falls back to default for
+    // retailers without explicit configuration.
+    const canaryFound = inStock.some((b) => isCanaryFor(retailer.key, b.name));
     if (canaryFound) {
       canaryResults[retailer.key] = true;
-      console.log(`[${retailer.key}:${store.storeId}] 🐤 Canary found (${inStock.filter((b) => CANARY_NAMES.has(b.name)).map((b) => b.name).join(", ")})`);
+      console.log(`[${retailer.key}:${store.storeId}] 🐤 Canary found (${inStock.filter((b) => isCanaryFor(retailer.key, b.name)).map((b) => b.name).join(", ")})`);
     }
-    const realInStock = inStock.filter((b) => !CANARY_NAMES.has(b.name));
+    const realInStock = inStock.filter((b) => !isCanaryFor(retailer.key, b.name));
 
     const previousStore = state[retailer.key]?.[store.storeId];
     const changes = computeChanges(previousStore, realInStock);
@@ -4831,6 +5046,9 @@ async function poll() {
     totalNewFinds += changes.newFinds.length;
     totalStillInStock += changes.stillInStock.length;
     totalGoneOOS += changes.goneOOS.length;
+    // Tier breakdown for summary (Kroger uses confidence; others default to "confirmed")
+    totalConfirmed += changes.newFinds.filter((b) => b.confidence !== "lead").length;
+    totalLeads += changes.newFinds.filter((b) => b.confidence === "lead").length;
 
     // Track all found bottles per retailer for metrics
     if (realInStock.length > 0) {
@@ -5037,8 +5255,16 @@ async function poll() {
   if (peakHours) peakSlotsCache = peakHours;
 
   // Quiet summary at end of every poll
-  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend, peakHours });
+  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalConfirmed, totalLeads, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend, peakHours });
   await sendDiscordAlert([summary]).catch((err) => console.error(`[poll] Summary send failed: ${err.message}`));
+
+  // Health-degradation alert: if a retailer's canary has been 0% for 4+ consecutive
+  // scans AND its failure mode is dominated by a known reason, send a quiet ping with
+  // root-cause hint. Catches WAF rotations / API contract breaks within ~2 hours instead
+  // of leaving them invisible until a full audit.
+  await maybeSendHealthDegradationAlert(recentMetrics).catch((err) =>
+    console.error(`[poll] Health alert failed: ${err.message}`)
+  );
 
   console.log(`[poll] Scan complete — ${storesScanned} stores, ${totalNewFinds} new, ${totalStillInStock} still, ${totalGoneOOS} OOS, ${durationSec}s\n`);
   } finally {
@@ -5049,12 +5275,12 @@ async function poll() {
 // ─── Exports (for testing) ────────────────────────────────────────────────────
 
 export {
-  SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, RETAILERS, FETCH_HEADERS,
+  SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, CANARY_BY_RETAILER, isCanaryFor, RETAILERS, FETCH_HEADERS,
   normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, MIN_BOTTLE_PRICE, MAX_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
-  formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed,
+  formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed, ULTRA_RARE_BOTTLES, rerunCadenceFor,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
-  METRICS_FILE, appendMetrics, loadRecentMetrics, pruneMetrics, computeMetricsTrend, computePeakHours,
+  METRICS_FILE, appendMetrics, loadRecentMetrics, pruneMetrics, computeMetricsTrend, computePeakHours, detectHealthDegradation,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
   IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
@@ -5071,7 +5297,7 @@ export {
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth, HEALTH_REASONS,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
-  REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel,
+  REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel, inferRetailerFromText,
   validateEnv,
   poll,
 };
