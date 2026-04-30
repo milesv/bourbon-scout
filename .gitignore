@@ -5,6 +5,7 @@ stores.json
 metrics.jsonl
 debug/
 browser-profiles/
+browser-state.json
 coverage/
 preview-embeds.html
 .claude/

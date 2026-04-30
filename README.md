@@ -157,6 +157,21 @@ node debug-locators.js
 
 This captures screenshots, full HTML, and selector lists from each retailer's store locator page into `debug/`. Compare against the selectors in `lib/discover-stores.js` and update as needed.
 
+## Audit Scripts
+
+Three diagnostic scripts in `scripts/` for ongoing health checks:
+
+| Script | When to run | What it does |
+|--------|-------------|--------------|
+| `node scripts/probe-waf.js [retailer]` | Weekly, or after a health-degradation alert | Probes each retailer's homepage and reports detected WAF cookies (Akamai `_abck`, Incapsula `incap_ses_*`, PerimeterX `_px*`). Surfaces WAF migrations BEFORE they cause weeks of silent failures. |
+| `node scripts/analyze-drops.js [--days=14] [--retailer=kroger]` | Monthly | Mines `metrics.jsonl` for day-of-week × hour drop patterns. Top hit slots, per-retailer canary timeline, bottle first-appearance log. Used to validate boost-schedule tuning. |
+| `node scripts/audit-state.js [--fix] [--days=30]` | Quarterly | Audits `state.json` for stale entries, broken URLs, missing prices, orphaned stores, expired Reddit-spawned watch list entries. Read-only by default; `--fix` prunes stale watchlist entries. |
+
+The daemon also fires automatic Discord pings:
+- **🟢 New find** — confirmed bottle in stock with strong signal (drive over)
+- **🟡 Lead** — Kroger planogram slot detected but inventory weak (call ahead)
+- **⚠️ Health degradation** — orange embed when a retailer misses canary 4+ scans in a row, with the dominant failure reason (waf / soft_block / contract_drift / proxy / timeout / network)
+
 ## Tests
 
 1663 tests across 5 files using [Vitest](https://vitest.dev/) (94.4% line coverage, 83.8% branch):
