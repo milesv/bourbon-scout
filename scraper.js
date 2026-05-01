@@ -5119,24 +5119,43 @@ const CITYHIVE_API_KEY = "7508df878a8c7566a880e4d3f7fa7972";
 
 // Per-retailer configuration. Add a new CityHive store by appending an entry here
 // + adding to RETAILERS + FALLBACK_STORES. No new scraper code required.
+//
+// `categories` is the critical field — each entry is { id, title } for a CityHive
+// "product_filtered_group" that contains bourbon/whiskey products. Discovered by
+// probing each store's homepage in a browser and noting which categories return
+// bourbon products. CityHive has no search API — the SPA filters categories
+// client-side. Empty array = retailer is plumbed but won't make API calls.
 const CITYHIVE_RETAILERS = {
   extramile: {
     name: "ExtraMile",
     domain: "extramileliquors.com",
     merchantId: "66c8c223d933721cd7586082",
     clientOrigin: "app://sites.chandlera6ec3658",
+    categories: [
+      { id: "6715af5a0e696f319dc09296", title: "On Sale Now" },
+      { id: "66c8c2257085fb54420fdfba", title: "Featured Spirits" },
+      { id: "6712ea8c25e7bf28e3933cbc", title: "Bundles and Specials" },
+    ],
   },
   liquorexpress: {
     name: "Liquor Express Tempe",
     domain: "liquorexpresstempe.store",
     merchantId: "5f88c1ab8f687229c6c2c8a4",
     clientOrigin: "app://sites.liquorex2edadd46",
+    // Categories not yet discovered — store stays effectively skipped (no fetches)
+    // until we can probe their homepage layout. To re-enable: visit the live site,
+    // capture browse_categories POST bodies via DevTools, populate this array.
+    categories: [],
   },
   chandlerliquors: {
     name: "Chandler Liquors",
     domain: "chandlerliquorsaz.com",
     merchantId: "5e8e0a0778e8f16f128f7e5a",
     clientOrigin: "app://sites.chandlerbfdd6edb",
+    categories: [
+      { id: "6590421a8a38b62ba72a8ff4", title: "Stock The Bar" },
+      { id: "65904bac7d7e512bac634da5", title: "Samplers" },
+    ],
   },
 };
 
@@ -5178,8 +5197,12 @@ function matchCityHiveProducts(products, retailerKey, domain) {
   return found;
 }
 
-// Fetch CityHive products matching a search query for a specific retailer.
-async function fetchCityHiveSearch(retailerKey, query) {
+// Fetch products from a specific CityHive category. The SPA's "search" feature is
+// actually client-side filtering over multiple category renders — there is no
+// search endpoint. So we fetch each known bourbon-bearing category for a retailer
+// and run the matcher against ALL products returned, letting matchesBottle do
+// the bottle-name filtering on our side.
+async function fetchCityHiveCategory(retailerKey, categoryId, title) {
   const cfg = CITYHIVE_RETAILERS[retailerKey];
   if (!cfg) return [];
   const url = `https://${cfg.domain}/api/v1/merchants/${cfg.merchantId}/browse_categories/render.json`;
@@ -5191,11 +5214,17 @@ async function fetchCityHiveSearch(retailerKey, query) {
     local: true,
     category_params: {
       children_type: "products",
-      link_type: "vertical_list",
-      input_value: query,
-      minimum_no_of_nodes: 1,
-      max_nodes: 50,
+      link_type: "horizontal_list",
+      minimum_nodes_for_a_render: "0",
+      show_container_title: "TRUE",
+      title: title || "",
+      context_type: "inventory",
+      product_filtered_group_id: categoryId,
+      show_container_action: "false",
+      disable_personalized_product_ranking: "false",
+      action: {},
     },
+    merchant_ids: [],
   };
   try {
     const res = await scraperFetchRetry(url, {
@@ -5218,37 +5247,40 @@ async function fetchCityHiveSearch(retailerKey, query) {
 }
 
 // Generic CityHive store scraper. Same code for all 3 stores; behavior parameterized
-// by `retailerKey` lookup in CITYHIVE_RETAILERS. CityHive supports unauthenticated
-// fetches with the site's public api_key, so no browser session is needed.
+// by the per-retailer `categories` array in CITYHIVE_RETAILERS. CityHive supports
+// unauthenticated fetches with the site's public api_key, so no browser session is
+// needed. Returns [] if the retailer has no configured categories (effectively skips).
 function makeCityHiveScraper(retailerKey) {
   return async function scrapeCityHiveStore(_store) {
     const cfg = CITYHIVE_RETAILERS[retailerKey];
-    if (!cfg) return [];
+    if (!cfg || !cfg.categories || cfg.categories.length === 0) {
+      // No categories configured — silently skip without consuming health budget.
+      return [];
+    }
     const found = [];
-    let validQueries = 0;
+    let validCats = 0;
     let failures = 0;
-    const queries = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES));
-    for (const query of queries) {
+    for (const cat of cfg.categories) {
       if (failures > 3) break;
       try {
-        const products = await fetchCityHiveSearch(retailerKey, query);
+        const products = await fetchCityHiveCategory(retailerKey, cat.id, cat.title);
         if (products.length > 0) {
           const matches = matchCityHiveProducts(products, retailerKey, cfg.domain);
           found.push(...matches);
         }
-        // Empty result is normal for many queries (small store catalog)
+        // Empty category is normal — most categories don't contain target bottles
         trackHealth(retailerKey, "ok");
-        validQueries++;
+        validCats++;
       } catch (err) {
-        console.warn(`[${retailerKey}] Query "${query}" failed: ${err.message}`);
+        console.warn(`[${retailerKey}] Category "${cat.title}" failed: ${err.message}`);
         trackHealth(retailerKey, "fail", { reason: "network" });
         failures++;
       }
-      // Polite: don't burst the small CityHive backend — 1-2s between queries
+      // Polite: don't burst the small CityHive backend — 1-2s between requests
       await sleep(1000 + Math.random() * 1000);
     }
-    if (validQueries === 0 && failures > 0) {
-      console.warn(`[${retailerKey}] All queries failed — check CityHive API contract`);
+    if (validCats === 0 && failures > 0) {
+      console.warn(`[${retailerKey}] All categories failed — check CityHive API contract`);
       return [];
     }
     return dedupFound(found);
@@ -5277,14 +5309,13 @@ const RETAILERS = [
   { key: "albertsons",  name: "Albertsons",  scrapeOnce: false, needsPage: false, scraper: scrapeAlbertsonsStore },
   { key: "walgreens",   name: "Walgreens",   scrapeOnce: true,  needsPage: false, scraper: scrapeWalgreensStore },
   { key: "samsclub",        name: "Sam's Club",          scrapeOnce: true,  needsPage: false, scraper: scrapeSamsClubStore },
-  // CityHive retailers (disabled): scaffolding shipped but the search API is not
-  // yet returning products from clean fetch — needs further probing of the SPA's
-  // full POST body shape. Skipped in the poll loop while we investigate to avoid
-  // noisy 0-result scans and false health-degradation alerts. Re-enable by
-  // removing `disabled: true` once the search API issue is resolved.
-  { key: "extramile",       name: "ExtraMile",           scrapeOnce: false, needsPage: false, scraper: scrapeExtraMileStore,       disabled: true },
+  // CityHive retailers — iterate per-store bourbon-bearing category IDs (no search
+  // API; SPA filters categories client-side). Discovered category IDs configured
+  // in CITYHIVE_RETAILERS. Liquor Express stays disabled until we capture its
+  // category IDs (homepage layout differs — needs another browser probe).
+  { key: "extramile",       name: "ExtraMile",            scrapeOnce: false, needsPage: false, scraper: scrapeExtraMileStore },
   { key: "liquorexpress",   name: "Liquor Express Tempe", scrapeOnce: false, needsPage: false, scraper: scrapeLiquorExpressStore,   disabled: true },
-  { key: "chandlerliquors", name: "Chandler Liquors",    scrapeOnce: false, needsPage: false, scraper: scrapeChandlerLiquorsStore, disabled: true },
+  { key: "chandlerliquors", name: "Chandler Liquors",     scrapeOnce: false, needsPage: false, scraper: scrapeChandlerLiquorsStore },
   // BevMo omitted — no AZ locations
 ];
 
@@ -5642,7 +5673,7 @@ export {
   KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore, classifyKrogerFind, buildKrogerProductUrl, verifyKrogerCandidatesViaWebsite,
   matchSafewayProducts, scrapeSafewayViaFetch, scrapeSafewayViaBrowser, scrapeSafewayStore,
   matchAlbertsonsProducts, scrapeAlbertsonsViaFetch, scrapeAlbertsonsViaBrowser, scrapeAlbertsonsStore, ALBERTSONS_KEY,
-  matchCityHiveProducts, fetchCityHiveSearch, makeCityHiveScraper, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
+  matchCityHiveProducts, fetchCityHiveCategory, makeCityHiveScraper, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
   scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,

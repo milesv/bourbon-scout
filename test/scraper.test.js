@@ -3148,7 +3148,22 @@ describe("CityHive config", () => {
       expect(cfg.domain).toBeTruthy();
       expect(cfg.merchantId).toMatch(/^[0-9a-f]{24}$/);  // BSON ObjectId format
       expect(cfg.clientOrigin).toMatch(/^app:\/\/sites\./);
+      expect(Array.isArray(cfg.categories)).toBe(true);
     }
+  });
+
+  it("ExtraMile and Chandler Liquors have category IDs configured (active)", () => {
+    expect(CITYHIVE_RETAILERS.extramile.categories.length).toBeGreaterThan(0);
+    expect(CITYHIVE_RETAILERS.chandlerliquors.categories.length).toBeGreaterThan(0);
+    // Each category must have id + title
+    for (const cat of CITYHIVE_RETAILERS.extramile.categories) {
+      expect(cat.id).toMatch(/^[0-9a-f]{24}$/);
+      expect(cat.title).toBeTruthy();
+    }
+  });
+
+  it("Liquor Express has empty categories (disabled until categories discovered)", () => {
+    expect(CITYHIVE_RETAILERS.liquorexpress.categories).toEqual([]);
   });
 
   it("each retailer has a distinct merchantId (no copy-paste typos)", () => {
