@@ -1,6 +1,6 @@
 # Bourbon Scout
 
-Automated inventory tracker for allocated and rare bourbon. Monitors 9 major retailers near your zip code and sends real-time Discord alerts with SKU/item numbers, store details, and stock status changes when bottles are spotted or go out of stock.
+Automated inventory tracker for allocated and rare bourbon. Monitors 11 retailers near your zip code (chain stores + local independents on the CityHive platform) and sends real-time Discord alerts with SKU/item numbers, store details, and stock status changes when bottles are spotted or go out of stock.
 
 ## Tracked Bottles (45)
 
@@ -20,7 +20,9 @@ Some bottles are retailer-restricted (e.g., Michter's 10 Year and Penelope only 
 | Albertsons | Clean browser via in-page `fetch()` | Same Azure APIM API as Safeway (same parent company), Incapsula WAF |
 | Walgreens | Clean browser (headed on Mac) | Server-rendered HTML (CSS selectors) |
 | Sam's Club | Fetch-first (got-scraping), clean browser fallback | `__NEXT_DATA__` JSON (per-product) |
-| ExtraMile (Chandler Chevron) | REST API (got-scraping) | JSON via CityHive multi-tenant platform — no WAF, public api_key |
+| ExtraMile (Chandler Chevron) | REST API (got-scraping) | JSON via CityHive — no WAF, public api_key |
+| Liquor Express Tempe | REST API (got-scraping) | JSON via CityHive — same scraper code as ExtraMile, different merchant_id |
+| Chandler Liquors | REST API (got-scraping) | JSON via CityHive — same scraper code as ExtraMile, different merchant_id |
 
 ## How It Works
 
@@ -130,7 +132,7 @@ Four types of color-coded embeds with per-retailer SKU/item numbers and rich sto
 **🟣 Scan Summary** (purple, quiet)
 - Posted after every scan with counts: new finds, still in stock, went OOS, nothing found
 - Shows total stores, retailers, and scan duration
-- All 9 retailers always shown: ✅ (≥75% success), ⚠️ (25-74%), ❌ (<25%), ⏭️ (skipped/no data), with 🐤 canary indicator
+- All 11 retailers always shown: ✅ (≥75% success), ⚠️ (25-74%), ❌ (<25%), ⏭️ (skipped/no data), with 🐤 canary indicator
 - When no allocations are found, lists all scanned stores grouped by retailer
 
 Each embed includes:
@@ -178,7 +180,7 @@ The daemon also fires automatic Discord pings:
 
 ## Tests
 
-1672 tests across 5 files using [Vitest](https://vitest.dev/) (94.4% line coverage, 83.8% branch):
+1675 tests across 5 files using [Vitest](https://vitest.dev/) (94.4% line coverage, 83.8% branch):
 
 ```sh
 npm test                # Run all tests

@@ -86,7 +86,8 @@ import {
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, matchSafewayProducts, scrapeSafewayStore,
   matchAlbertsonsProducts, scrapeAlbertsonsStore, ALBERTSONS_KEY,
-  matchExtraMileProducts, scrapeExtraMileStore, EXTRAMILE_MERCHANT_ID, EXTRAMILE_API_KEY,
+  matchCityHiveProducts, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
+  scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   KROGER_PRODUCTS, checkKrogerKnownProducts, verifyKrogerCandidatesViaWebsite,
@@ -209,9 +210,12 @@ describe("constants", () => {
     expect(TARGET_BOTTLES[0]).toHaveProperty("searchTerms");
   });
 
-  it("RETAILERS has 9 entries", () => {
-    expect(RETAILERS).toHaveLength(9);
-    expect(RETAILERS.map((r) => r.key)).toEqual(["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile"]);
+  it("RETAILERS has 11 entries", () => {
+    expect(RETAILERS).toHaveLength(11);
+    expect(RETAILERS.map((r) => r.key)).toEqual([
+      "costco", "totalwine", "walmart", "kroger", "safeway", "albertsons",
+      "walgreens", "samsclub", "extramile", "liquorexpress", "chandlerliquors",
+    ]);
   });
 
   it("RETAILERS have correct flags", () => {
@@ -1485,7 +1489,7 @@ describe("buildSummaryEmbed", () => {
       totalGoneOOS: 0, nothingCount: 5, durationSec: 60, health,
     });
     expect(embed.fields).toBeDefined();
-    expect(embed.fields.length).toBe(9); // All 9 retailers always shown
+    expect(embed.fields.length).toBe(11); // All 11 retailers always shown
     const costco = embed.fields.find((f) => f.name === "Costco");
     expect(costco.value).toContain("✅");
     expect(costco.value).toContain("14/14");
@@ -1541,20 +1545,20 @@ describe("buildSummaryEmbed", () => {
     expect(kroger.value).not.toContain("🐤");
   });
 
-  it("shows all 9 retailers as skipped when no health data", () => {
+  it("shows all 11 retailers as skipped when no health data", () => {
     const embed = buildSummaryEmbed({
       storesScanned: 5, retailersScanned: 2, totalNewFinds: 0, totalStillInStock: 0,
       totalGoneOOS: 0, nothingCount: 5, durationSec: 60,
     });
     expect(embed.fields).toBeDefined();
-    expect(embed.fields.length).toBe(9);
+    expect(embed.fields.length).toBe(11);
     for (const f of embed.fields) {
       expect(f.value).toContain("⏭️");
       expect(f.inline).toBe(true);
     }
   });
 
-  it("orders fields by retailer registry order (all 9 always present)", () => {
+  it("orders fields by retailer registry order (all 11 always present)", () => {
     const health = {
       samsclub: { queries: 8, succeeded: 8, failed: 0, blocked: 0 },
       walgreens: { queries: 14, succeeded: 14, failed: 0, blocked: 0 },
@@ -1565,7 +1569,10 @@ describe("buildSummaryEmbed", () => {
       storesScanned: 4, retailersScanned: 4, totalNewFinds: 0, totalStillInStock: 0,
       totalGoneOOS: 0, nothingCount: 4, durationSec: 60, health,
     });
-    expect(embed.fields.map((f) => f.name)).toEqual(["Costco", "Total Wine", "Walmart", "Kroger", "Safeway", "Albertsons", "Walgreens", "Sam's Club", "ExtraMile"]);
+    expect(embed.fields.map((f) => f.name)).toEqual([
+      "Costco", "Total Wine", "Walmart", "Kroger", "Safeway", "Albertsons",
+      "Walgreens", "Sam's Club", "ExtraMile", "Liquor Express Tempe", "Chandler Liquors",
+    ]);
     // Retailers with health data show real stats
     expect(embed.fields.find((f) => f.name === "Costco").value).toContain("✅");
     // Retailers without health data show skipped
@@ -3042,11 +3049,13 @@ describe("scrapeAlbertsonsStore", () => {
   });
 });
 
-// ─── ExtraMile Liquors (CityHive single-store) ──────────────────────────────
+// ─── CityHive multi-tenant platform (ExtraMile / Liquor Express / Chandler Liquors)
 // CityHive product schema: name, basic_category, merchants[].offer_types,
 // merchants[].product_options[].product_url. Stock = offer_types non-empty.
-describe("matchExtraMileProducts", () => {
-  it("returns matched in-stock products with extramile URLs", () => {
+// matchCityHiveProducts is parameterized by retailerKey + domain so all three stores
+// share the same matcher.
+describe("matchCityHiveProducts", () => {
+  it("returns matched in-stock products with retailer-specific URLs", () => {
     const products = [{
       id: "5521cef065613100036c0000",
       name: "Buffalo Trace Bourbon",
@@ -3061,7 +3070,7 @@ describe("matchExtraMileProducts", () => {
         }],
       }],
     }];
-    const found = matchExtraMileProducts(products);
+    const found = matchCityHiveProducts(products, "extramile", "extramileliquors.com");
     const bt = found.find((f) => f.name === "Buffalo Trace");
     expect(bt).toBeTruthy();
     expect(bt.url).toContain("extramileliquors.com");
@@ -3070,64 +3079,87 @@ describe("matchExtraMileProducts", () => {
   });
 
   it("filters out products with empty offer_types (sold out)", () => {
-    const found = matchExtraMileProducts([{
+    const found = matchCityHiveProducts([{
       id: "x", name: "Buffalo Trace Bourbon",
       merchants: [{ offer_types: [], product_options: [{ product_url: "x" }] }],
-    }]);
+    }], "extramile", "extramileliquors.com");
     expect(found).toEqual([]);
   });
 
   it("filters products with no merchants array", () => {
-    const found = matchExtraMileProducts([{ id: "x", name: "Buffalo Trace Bourbon" }]);
+    const found = matchCityHiveProducts([{ id: "x", name: "Buffalo Trace Bourbon" }], "extramile", "extramileliquors.com");
     expect(found).toEqual([]);
   });
 
   it("handles string price (non-numeric API response)", () => {
-    const found = matchExtraMileProducts([{
+    const found = matchCityHiveProducts([{
       id: "x", name: "Buffalo Trace Bourbon",
       merchants: [{ offer_types: ["pick_up"], product_options: [{ product_url: "x", price: "$32.99" }] }],
-    }]);
+    }], "extramile", "extramileliquors.com");
     expect(found[0].price).toBe("$32.99");
   });
 
   it("falls back to parseSize when size object is missing", () => {
-    const found = matchExtraMileProducts([{
+    const found = matchCityHiveProducts([{
       id: "x", name: "Buffalo Trace Bourbon 750ml",
       merchants: [{ offer_types: ["pick_up"], product_options: [{ product_url: "x" }] }],
-    }]);
+    }], "extramile", "extramileliquors.com");
     expect(found[0].size).toBe("750ml");
   });
 
-  it("falls back to default URL when product_options missing", () => {
-    const found = matchExtraMileProducts([{
+  it("falls back to default URL with the correct domain when product_options missing", () => {
+    // Default URL falls back per-retailer — Liquor Express domain should appear when
+    // we pass that retailer's domain to the matcher.
+    const found = matchCityHiveProducts([{
       id: "abc123", name: "Buffalo Trace Bourbon",
       merchants: [{ offer_types: ["pick_up"], product_options: [] }],
-    }]);
-    expect(found[0].url).toBe("https://extramileliquors.com/shop/product/abc123");
+    }], "liquorexpress", "liquorexpresstempe.store");
+    expect(found[0].url).toBe("https://liquorexpresstempe.store/shop/product/abc123");
   });
 
-  it("uses extramile retailer key for matchesBottle (per-retailer filtering)", () => {
-    // Penelope is restricted to costco/totalwine/walmart only — should NOT match at extramile
-    const found = matchExtraMileProducts([{
+  it("uses the passed retailer key for matchesBottle (per-retailer filtering)", () => {
+    // Penelope is restricted to costco/totalwine/walmart only — should NOT match at any CityHive store
+    const found = matchCityHiveProducts([{
       id: "x", name: "Penelope Founder's Reserve Bourbon",
       merchants: [{ offer_types: ["pick_up"], product_options: [{ product_url: "x" }] }],
-    }]);
+    }], "chandlerliquors", "chandlerliquorsaz.com");
     expect(found.find((f) => f.name?.includes("Penelope"))).toBeFalsy();
   });
 
   it("accepts is_buyable: true as in-stock signal (alternate schema)", () => {
-    const found = matchExtraMileProducts([{
+    const found = matchCityHiveProducts([{
       id: "x", name: "Buffalo Trace Bourbon",
       merchants: [{ offer_types: [], is_buyable: true, product_options: [{ product_url: "x" }] }],
-    }]);
+    }], "extramile", "extramileliquors.com");
     expect(found[0].name).toBe("Buffalo Trace");
   });
 });
 
-describe("ExtraMile config constants", () => {
-  it("exports stable merchant ID and API key", () => {
-    expect(EXTRAMILE_MERCHANT_ID).toBe("66c8c223d933721cd7586082");
-    expect(EXTRAMILE_API_KEY).toBe("7508df878a8c7566a880e4d3f7fa7972");
+describe("CityHive config", () => {
+  it("exports stable shared API key", () => {
+    expect(CITYHIVE_API_KEY).toBe("7508df878a8c7566a880e4d3f7fa7972");
+  });
+
+  it("registers all three CityHive retailers with required fields", () => {
+    for (const key of ["extramile", "liquorexpress", "chandlerliquors"]) {
+      const cfg = CITYHIVE_RETAILERS[key];
+      expect(cfg).toBeTruthy();
+      expect(cfg.name).toBeTruthy();
+      expect(cfg.domain).toBeTruthy();
+      expect(cfg.merchantId).toMatch(/^[0-9a-f]{24}$/);  // BSON ObjectId format
+      expect(cfg.clientOrigin).toMatch(/^app:\/\/sites\./);
+    }
+  });
+
+  it("each retailer has a distinct merchantId (no copy-paste typos)", () => {
+    const ids = Object.values(CITYHIVE_RETAILERS).map(r => r.merchantId);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("scraper functions are distinct per retailer (curried correctly)", () => {
+    expect(scrapeExtraMileStore).not.toBe(scrapeLiquorExpressStore);
+    expect(scrapeLiquorExpressStore).not.toBe(scrapeChandlerLiquorsStore);
+    expect(scrapeExtraMileStore).not.toBe(scrapeChandlerLiquorsStore);
   });
 });
 

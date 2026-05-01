@@ -123,7 +123,7 @@ const retailerProxyUrls = {}; // retailerKey → full proxy URL (for browser pro
 function refreshProxySession() {
   if (!PROXY_URL) return;
   // Assign each retailer its own sticky port (= its own residential IP)
-  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile"];
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile", "liquorexpress", "chandlerliquors"];
   const basePort = 10000 + Math.floor(Math.random() * 9000); // leave room for 8 retailers
   const backupBasePort = 10000 + Math.floor(Math.random() * 9000);
   for (let i = 0; i < retailers.length; i++) {
@@ -212,7 +212,7 @@ function failoverToBackupProxy() {
   if (!BACKUP_PROXY_URL) return false;
   /* v8 ignore start -- requires BACKUP_PROXY_URL at module load (tested in proxy.test.js env) */
   console.log("[proxy] Failing over ALL retailers to backup proxy");
-  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile"];
+  const retailers = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile", "liquorexpress", "chandlerliquors"];
   const basePort = 10000 + Math.floor(Math.random() * 9000);
   for (let i = 0; i < retailers.length; i++) {
     try {
@@ -692,7 +692,7 @@ function watchListKey(entry) {
   return `${entry.bottle || "Allocated Bourbon"}:${entry.retailer}:${[...entry.stores].sort().join(",")}`;
 }
 
-const WATCH_LIST_RETAILER_NAMES = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club", extramile: "ExtraMile" };
+const WATCH_LIST_RETAILER_NAMES = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club", extramile: "ExtraMile", liquorexpress: "Liquor Express Tempe", chandlerliquors: "Chandler Liquors" };
 
 function buildWatchListEmbed(entry) {
   const retailerName = WATCH_LIST_RETAILER_NAMES[entry.retailer] || entry.retailer;
@@ -1274,12 +1274,12 @@ const COLORS = {
 
 const SKU_LABELS = {
   costco: "Item #", totalwine: "Item #", walmart: "Item #",
-  kroger: "SKU", safeway: "UPC", albertsons: "UPC", samsclub: "Item #", extramile: "Item #",
+  kroger: "SKU", safeway: "UPC", albertsons: "UPC", samsclub: "Item #", extramile: "Item #", liquorexpress: "Item #", chandlerliquors: "Item #",
 };
 
 const STORE_TYPE_LABELS = {
   costco: "Warehouse", totalwine: "Store", walmart: "Store",
-  kroger: "Store", safeway: "Store", albertsons: "Store", samsclub: "Club", extramile: "Store",
+  kroger: "Store", safeway: "Store", albertsons: "Store", samsclub: "Club", extramile: "Store", liquorexpress: "Store", chandlerliquors: "Store",
 };
 
 function parseCity(address) {
@@ -1556,8 +1556,8 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   return embeds;
 }
 
-const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile"];
-const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club", extramile: "ExtraMile" };
+const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile", "liquorexpress", "chandlerliquors"];
+const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club", extramile: "ExtraMile", liquorexpress: "Liquor Express Tempe", chandlerliquors: "Chandler Liquors" };
 
 function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null, peakHours = null, totalConfirmed = 0, totalLeads = 0 }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
@@ -5096,47 +5096,65 @@ async function scrapeAlbertsonsStore(store) {
   }
 }
 
-// ─── ExtraMile Liquors (CityHive single-store) ──────────────────────────────
-// ExtraMile is a single-store Chevron at 7000 W Chandler Blvd, AZ 85226 running
-// on the CityHive multi-tenant e-commerce platform. No WAF detected (no Akamai/
-// Incapsula/PerimeterX) — a clean fetch path is sufficient. The site's API uses
-// a public api_key that's exposed in the browser, no auth required.
+// ─── CityHive Multi-Tenant Platform Scrapers ────────────────────────────────
+// CityHive (cityhive.net) is a SaaS e-commerce platform powering many independent
+// liquor stores. The platform exposes an unauthenticated REST API at
+// /api/v1/merchants/{merchantId}/... using a public site-scoped api_key. No WAF
+// detected on any store — clean fetch path is sufficient for all of them.
 //
-// Architecture:
-//   - merchant_id: 66c8c223d933721cd7586082 (Chandler Chevron)
-//   - api_key: 7508df878a8c7566a880e4d3f7fa7972 (public/site-scoped)
-//   - search URL pattern: /shop?ch-query={query}  (SPA renders results)
-//   - product page: /shop/product/{slug}/{productId}?option-id={optionId}
-//   - product offers: /api/v1/merchants/{merchantId}/product/{productId}/offers.json
+// Each store is a separate retailer in our system (different inventory + branding)
+// but shares this single scraper code, parameterized by CITYHIVE_RETAILERS config.
 //
-// Single store, no per-store filtering needed. Treated as `scrapeOnce: false` with
-// a single fallback store.
+// API request shape:
+//   POST https://{domain}/api/v1/merchants/{merchantId}/browse_categories/render.json
+//   Body: { api_key, sdk_guid, ch_request_guid, client_origin, local: true,
+//           category_params: { children_type: "products", input_value: <query>, ... } }
+//
+// The same `api_key` works across all CityHive sites — it's the platform's
+// public/site-scoped key, surfaced in every browser bundle. `merchantId` and
+// `client_origin` are per-store. Discoverable from the SPA via DevTools.
 
-const EXTRAMILE_MERCHANT_ID = "66c8c223d933721cd7586082";
-const EXTRAMILE_API_KEY = "7508df878a8c7566a880e4d3f7fa7972";
-const EXTRAMILE_BASE = "https://extramileliquors.com";
+// Shared platform-wide API key. Same value across every CityHive merchant.
+const CITYHIVE_API_KEY = "7508df878a8c7566a880e4d3f7fa7972";
 
-// Match ExtraMile (CityHive) product objects against TARGET_BOTTLES. The product
-// shape returned by the browse API includes `name`, `basic_category`, and a
-// `merchants[].product_options[].product_url` field for the direct purchase URL.
-// Stock signal: `merchants[].offer_types` contains "delivery" or "pick_up" when
-// the bottle is currently buyable. Empty offer_types = sold out / unavailable.
-function matchExtraMileProducts(products) {
+// Per-retailer configuration. Add a new CityHive store by appending an entry here
+// + adding to RETAILERS + FALLBACK_STORES. No new scraper code required.
+const CITYHIVE_RETAILERS = {
+  extramile: {
+    name: "ExtraMile",
+    domain: "extramileliquors.com",
+    merchantId: "66c8c223d933721cd7586082",
+    clientOrigin: "app://sites.chandlera6ec3658",
+  },
+  liquorexpress: {
+    name: "Liquor Express Tempe",
+    domain: "liquorexpresstempe.store",
+    merchantId: "5f88c1ab8f687229c6c2c8a4",
+    clientOrigin: "app://sites.liquorex2edadd46",
+  },
+  chandlerliquors: {
+    name: "Chandler Liquors",
+    domain: "chandlerliquorsaz.com",
+    merchantId: "5e8e0a0778e8f16f128f7e5a",
+    clientOrigin: "app://sites.chandlerbfdd6edb",
+  },
+};
+
+// Match CityHive product objects against TARGET_BOTTLES. The product shape returned
+// by the browse API includes `name`, `basic_category`, and a `merchants[].product_options[]`
+// array. Stock signal: `merchants[].offer_types` contains "delivery"/"pick_up" when
+// buyable; empty array means OOS. Backward-compat: also honor `is_buyable: true`.
+function matchCityHiveProducts(products, retailerKey, domain) {
   const found = [];
   for (const p of products) {
     if (!p?.name) continue;
     const merchant = p.merchants?.[0];
     if (!merchant) continue;
-    // Stock check: offer_types is non-empty array when buyable. CityHive returns
-    // ["delivery", "pick_up"] for in-stock; [] for OOS. Defensive: also allow
-    // truthy check on `is_buyable` field if it appears in future schema versions.
     const offerTypes = merchant.offer_types || [];
     const inStock = offerTypes.length > 0 || merchant.is_buyable === true;
     if (!inStock) continue;
     const opt = merchant.product_options?.[0];
-    const productUrl = opt?.product_url || `${EXTRAMILE_BASE}/shop/product/${p.id}`;
-    // Price: try a handful of common shapes the API might return — undocumented
-    // schema, so be generous about extraction.
+    const productUrl = opt?.product_url || `https://${domain}/shop/product/${p.id}`;
     const priceRaw = opt?.price ?? merchant.price ?? p.price;
     const price = typeof priceRaw === "number" ? `$${priceRaw.toFixed(2)}`
                 : typeof priceRaw === "string" ? priceRaw
@@ -5145,7 +5163,7 @@ function matchExtraMileProducts(products) {
     const sizeMeasure = p.size?.measure || merchant.size?.measure;
     const size = sizeQty && sizeMeasure ? `${sizeQty}${sizeMeasure}` : parseSize(p.name);
     for (const bottle of TARGET_BOTTLES) {
-      if (matchesBottle(p.name, bottle, "extramile")) {
+      if (matchesBottle(p.name, bottle, retailerKey)) {
         found.push({
           name: bottle.name,
           url: productUrl,
@@ -5160,20 +5178,16 @@ function matchExtraMileProducts(products) {
   return found;
 }
 
-// Fetch ExtraMile products matching a search query. Uses the SPA's underlying
-// browse_categories API endpoint with a query input. CityHive's API expects a
-// POST with `category_params.input_value` set to the search term — the same
-// endpoint that powers `/shop?ch-query=X` in the UI.
-async function fetchExtraMileSearch(query) {
-  const url = `${EXTRAMILE_BASE}/api/v1/merchants/${EXTRAMILE_MERCHANT_ID}/browse_categories/render.json`;
-  // Generate per-request GUIDs so the API treats each request as a fresh client
-  const sdkGuid = crypto.randomUUID();
-  const reqGuid = crypto.randomUUID();
+// Fetch CityHive products matching a search query for a specific retailer.
+async function fetchCityHiveSearch(retailerKey, query) {
+  const cfg = CITYHIVE_RETAILERS[retailerKey];
+  if (!cfg) return [];
+  const url = `https://${cfg.domain}/api/v1/merchants/${cfg.merchantId}/browse_categories/render.json`;
   const body = {
-    api_key: EXTRAMILE_API_KEY,
-    sdk_guid: sdkGuid,
-    ch_request_guid: reqGuid,
-    client_origin: "app://sites.chandlera6ec3658",
+    api_key: CITYHIVE_API_KEY,
+    sdk_guid: crypto.randomUUID(),
+    ch_request_guid: crypto.randomUUID(),
+    client_origin: cfg.clientOrigin,
     local: true,
     category_params: {
       children_type: "products",
@@ -5189,7 +5203,7 @@ async function fetchExtraMileSearch(query) {
       headers: { ...FETCH_HEADERS, "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(body),
       timeout: 15000,
-      proxyUrl: getRetailerProxyUrl("extramile") || undefined,
+      proxyUrl: getRetailerProxyUrl(retailerKey) || undefined,
     });
     if (!res.ok) return [];
     const data = await res.json();
@@ -5203,46 +5217,50 @@ async function fetchExtraMileSearch(query) {
   }
 }
 
-// Single-store scraper. Iterates SEARCH_QUERIES and matches results against
-// TARGET_BOTTLES. CityHive's API supports unauthenticated fetches with the
-// site's public api_key, so no browser session is needed.
-async function scrapeExtraMileStore(_store) {
-  const found = [];
-  let validQueries = 0;
-  let failures = 0;
-
-  // shuffleKeepCanaryFirst keeps Buffalo Trace first for canary detection
-  const queries = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES));
-  for (const query of queries) {
-    if (failures > 3) break;
-    try {
-      const products = await fetchExtraMileSearch(query);
-      if (products.length > 0) {
-        const matches = matchExtraMileProducts(products);
-        found.push(...matches);
-        validQueries++;
-        trackHealth("extramile", "ok");
-      } else {
+// Generic CityHive store scraper. Same code for all 3 stores; behavior parameterized
+// by `retailerKey` lookup in CITYHIVE_RETAILERS. CityHive supports unauthenticated
+// fetches with the site's public api_key, so no browser session is needed.
+function makeCityHiveScraper(retailerKey) {
+  return async function scrapeCityHiveStore(_store) {
+    const cfg = CITYHIVE_RETAILERS[retailerKey];
+    if (!cfg) return [];
+    const found = [];
+    let validQueries = 0;
+    let failures = 0;
+    const queries = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES));
+    for (const query of queries) {
+      if (failures > 3) break;
+      try {
+        const products = await fetchCityHiveSearch(retailerKey, query);
+        if (products.length > 0) {
+          const matches = matchCityHiveProducts(products, retailerKey, cfg.domain);
+          found.push(...matches);
+        }
         // Empty result is normal for many queries (small store catalog)
-        trackHealth("extramile", "ok");
+        trackHealth(retailerKey, "ok");
         validQueries++;
+      } catch (err) {
+        console.warn(`[${retailerKey}] Query "${query}" failed: ${err.message}`);
+        trackHealth(retailerKey, "fail", { reason: "network" });
+        failures++;
       }
-    } catch (err) {
-      console.warn(`[extramile] Query "${query}" failed: ${err.message}`);
-      trackHealth("extramile", "fail", { reason: "network" });
-      failures++;
+      // Polite: don't burst the small CityHive backend — 1-2s between queries
+      await sleep(1000 + Math.random() * 1000);
     }
-    // Polite: don't burst the small CityHive backend — 1-2s between queries
-    await sleep(1000 + Math.random() * 1000);
-  }
-
-  // Bail if we had near-total query failures — could mean API contract changed
-  if (validQueries === 0 && failures > 0) {
-    console.warn("[extramile] All queries failed — check CityHive API contract");
-    return [];
-  }
-  return dedupFound(found);
+    if (validQueries === 0 && failures > 0) {
+      console.warn(`[${retailerKey}] All queries failed — check CityHive API contract`);
+      return [];
+    }
+    return dedupFound(found);
+  };
 }
+
+// Per-retailer scraper functions (curried from the generic factory).
+// Each is registered separately in RETAILERS so per-retailer health tracking,
+// state.json organization, and Discord alerts work cleanly.
+const scrapeExtraMileStore = makeCityHiveScraper("extramile");
+const scrapeLiquorExpressStore = makeCityHiveScraper("liquorexpress");
+const scrapeChandlerLiquorsStore = makeCityHiveScraper("chandlerliquors");
 
 // ─── Retailer Registry ───────────────────────────────────────────────────────
 // scrapeOnce: results are identical across stores (no store-specific URL/cookie).
@@ -5258,8 +5276,10 @@ const RETAILERS = [
   { key: "safeway",     name: "Safeway",     scrapeOnce: false, needsPage: false, scraper: scrapeSafewayStore },
   { key: "albertsons",  name: "Albertsons",  scrapeOnce: false, needsPage: false, scraper: scrapeAlbertsonsStore },
   { key: "walgreens",   name: "Walgreens",   scrapeOnce: true,  needsPage: false, scraper: scrapeWalgreensStore },
-  { key: "samsclub",  name: "Sam's Club",   scrapeOnce: true,  needsPage: false, scraper: scrapeSamsClubStore },
-  { key: "extramile", name: "ExtraMile",    scrapeOnce: false, needsPage: false, scraper: scrapeExtraMileStore },
+  { key: "samsclub",        name: "Sam's Club",          scrapeOnce: true,  needsPage: false, scraper: scrapeSamsClubStore },
+  { key: "extramile",       name: "ExtraMile",           scrapeOnce: false, needsPage: false, scraper: scrapeExtraMileStore },
+  { key: "liquorexpress",   name: "Liquor Express Tempe", scrapeOnce: false, needsPage: false, scraper: scrapeLiquorExpressStore },
+  { key: "chandlerliquors", name: "Chandler Liquors",    scrapeOnce: false, needsPage: false, scraper: scrapeChandlerLiquorsStore },
   // BevMo omitted — no AZ locations
 ];
 
@@ -5612,7 +5632,8 @@ export {
   KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore, classifyKrogerFind, buildKrogerProductUrl, verifyKrogerCandidatesViaWebsite,
   matchSafewayProducts, scrapeSafewayViaFetch, scrapeSafewayViaBrowser, scrapeSafewayStore,
   matchAlbertsonsProducts, scrapeAlbertsonsViaFetch, scrapeAlbertsonsViaBrowser, scrapeAlbertsonsStore, ALBERTSONS_KEY,
-  matchExtraMileProducts, fetchExtraMileSearch, scrapeExtraMileStore, EXTRAMILE_MERCHANT_ID, EXTRAMILE_API_KEY,
+  matchCityHiveProducts, fetchCityHiveSearch, makeCityHiveScraper, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
+  scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth, HEALTH_REASONS,
