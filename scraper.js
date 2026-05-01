@@ -5277,9 +5277,14 @@ const RETAILERS = [
   { key: "albertsons",  name: "Albertsons",  scrapeOnce: false, needsPage: false, scraper: scrapeAlbertsonsStore },
   { key: "walgreens",   name: "Walgreens",   scrapeOnce: true,  needsPage: false, scraper: scrapeWalgreensStore },
   { key: "samsclub",        name: "Sam's Club",          scrapeOnce: true,  needsPage: false, scraper: scrapeSamsClubStore },
-  { key: "extramile",       name: "ExtraMile",           scrapeOnce: false, needsPage: false, scraper: scrapeExtraMileStore },
-  { key: "liquorexpress",   name: "Liquor Express Tempe", scrapeOnce: false, needsPage: false, scraper: scrapeLiquorExpressStore },
-  { key: "chandlerliquors", name: "Chandler Liquors",    scrapeOnce: false, needsPage: false, scraper: scrapeChandlerLiquorsStore },
+  // CityHive retailers (disabled): scaffolding shipped but the search API is not
+  // yet returning products from clean fetch — needs further probing of the SPA's
+  // full POST body shape. Skipped in the poll loop while we investigate to avoid
+  // noisy 0-result scans and false health-degradation alerts. Re-enable by
+  // removing `disabled: true` once the search API issue is resolved.
+  { key: "extramile",       name: "ExtraMile",           scrapeOnce: false, needsPage: false, scraper: scrapeExtraMileStore,       disabled: true },
+  { key: "liquorexpress",   name: "Liquor Express Tempe", scrapeOnce: false, needsPage: false, scraper: scrapeLiquorExpressStore,   disabled: true },
+  { key: "chandlerliquors", name: "Chandler Liquors",    scrapeOnce: false, needsPage: false, scraper: scrapeChandlerLiquorsStore, disabled: true },
   // BevMo omitted — no AZ locations
 ];
 
@@ -5425,6 +5430,11 @@ async function poll() {
 
   const tasks = [];
   for (const [ri, retailer] of RETAILERS.entries()) {
+    // Permanent skip: retailer is shipped but disabled (e.g., scaffolding for a
+    // future scraper that's not yet working). No health tracking, no error
+    // budget impact — just silent skip.
+    if (retailer.disabled) continue;
+
     const stores = prioritizeStores(retailer.key, storeCache.retailers[retailer.key] || []);
     if (stores.length === 0) continue;
 
