@@ -20,9 +20,9 @@ Some bottles are retailer-restricted (e.g., Michter's 10 Year and Penelope only 
 | Albertsons | Clean browser via in-page `fetch()` | Same Azure APIM API as Safeway (same parent company), Incapsula WAF |
 | Walgreens | Clean browser (headed on Mac) | Server-rendered HTML (CSS selectors) |
 | Sam's Club | Fetch-first (got-scraping), clean browser fallback | `__NEXT_DATA__` JSON (per-product) |
-| ExtraMile (Chandler Chevron) | REST API (got-scraping) | JSON via CityHive — no WAF, public api_key |
-| Liquor Express Tempe | REST API (got-scraping) | JSON via CityHive — same scraper code as ExtraMile, different merchant_id |
-| Chandler Liquors | REST API (got-scraping) | JSON via CityHive — same scraper code as ExtraMile, different merchant_id |
+| ExtraMile (Chandler Chevron) | REST API (got-scraping) | JSON via CityHive — iterates per-store bourbon-bearing category IDs (no search API; SPA filters categories client-side) |
+| Chandler Liquors | REST API (got-scraping) | JSON via CityHive — same scraper as ExtraMile, different merchant_id + category IDs |
+| ~~Liquor Express Tempe~~ | *(disabled)* | Configured but disabled — different homepage layout than other CityHive stores; needs browser-mediated scraping to enable |
 
 ## How It Works
 
@@ -180,7 +180,7 @@ The daemon also fires automatic Discord pings:
 
 ## Tests
 
-1675 tests across 5 files using [Vitest](https://vitest.dev/) (94.4% line coverage, 83.8% branch):
+1682 tests across 5 files using [Vitest](https://vitest.dev/) (91.4% line coverage, 81.8% branch):
 
 ```sh
 npm test                # Run all tests

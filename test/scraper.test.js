@@ -86,7 +86,7 @@ import {
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, matchSafewayProducts, scrapeSafewayStore,
   matchAlbertsonsProducts, scrapeAlbertsonsStore, ALBERTSONS_KEY,
-  matchCityHiveProducts, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
+  matchCityHiveProducts, makeCityHiveScraper, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
   scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
@@ -3175,6 +3175,50 @@ describe("CityHive config", () => {
     expect(scrapeExtraMileStore).not.toBe(scrapeLiquorExpressStore);
     expect(scrapeLiquorExpressStore).not.toBe(scrapeChandlerLiquorsStore);
     expect(scrapeExtraMileStore).not.toBe(scrapeChandlerLiquorsStore);
+  });
+});
+
+// CityHive scraper: when categories array is empty (e.g. Liquor Express, until
+// its category IDs are discovered), the scraper should silently return [] without
+// making any API calls or consuming health-tracking budget.
+describe("makeCityHiveScraper — empty categories early-exit", () => {
+  it("returns [] immediately when retailer has no categories configured", async () => {
+    _resetScraperHealth();
+    // Liquor Express is configured with `categories: []` (disabled-by-config)
+    const result = await scrapeLiquorExpressStore({ storeId: "x", name: "y" });
+    expect(result).toEqual([]);
+    // Critical: should NOT have tracked any health entries (no API calls made)
+    expect(_getScraperHealth().liquorexpress).toBeUndefined();
+  });
+
+  it("returns [] when retailerKey is unknown", async () => {
+    // The makeCityHiveScraper factory should defend against bogus retailer keys
+    // (e.g. config typo, partial deletion). Returns [] without crashing.
+    const fakeScraper = makeCityHiveScraper("not-a-real-retailer");
+    const result = await fakeScraper({ storeId: "x", name: "y" });
+    expect(result).toEqual([]);
+  });
+});
+
+// RETAILERS registry: `disabled: true` flag should cause the poll loop to skip
+// the retailer entirely. Used for shipping scaffolding without enabling it.
+describe("RETAILERS disabled flag", () => {
+  it("Liquor Express is marked disabled (categories empty + flag set)", () => {
+    const liqEx = RETAILERS.find(r => r.key === "liquorexpress");
+    expect(liqEx).toBeTruthy();
+    expect(liqEx.disabled).toBe(true);
+  });
+
+  it("ExtraMile and Chandler Liquors are NOT disabled (active)", () => {
+    const em = RETAILERS.find(r => r.key === "extramile");
+    const cl = RETAILERS.find(r => r.key === "chandlerliquors");
+    expect(em.disabled).toBeFalsy();
+    expect(cl.disabled).toBeFalsy();
+  });
+
+  it("only Liquor Express has disabled: true (no other retailer accidentally disabled)", () => {
+    const disabledKeys = RETAILERS.filter(r => r.disabled).map(r => r.key);
+    expect(disabledKeys).toEqual(["liquorexpress"]);
   });
 });
 
