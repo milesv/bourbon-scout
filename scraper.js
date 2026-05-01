@@ -5142,9 +5142,16 @@ const CITYHIVE_RETAILERS = {
     domain: "liquorexpresstempe.store",
     merchantId: "5f88c1ab8f687229c6c2c8a4",
     clientOrigin: "app://sites.liquorex2edadd46",
-    // Categories not yet discovered — store stays effectively skipped (no fetches)
-    // until we can probe their homepage layout. To re-enable: visit the live site,
-    // capture browse_categories POST bodies via DevTools, populate this array.
+    // Disabled — Liquor Express's CityHive instance uses a DIFFERENT layout than
+    // ExtraMile / Chandler Liquors. Their homepage does NOT issue any
+    // `browse_categories/render.json` calls (no auto-rendered category lists), and
+    // their `search_filters.json` endpoint returns 403 to clean got-scraping fetches
+    // (CloudFront-gated; works only inside a real browser session). To enable:
+    //   (a) Refactor scraper to support browser-mediated CityHive scraping, OR
+    //   (b) Capture the actual product-listing endpoint by clicking around the SPA
+    //       in DevTools (e.g. interact with filter dropdowns, navigate to /shop/?...).
+    // Effort: ~2-4 hours of focused probing. Payoff is uncertain — small store,
+    // small allocated catalog. Park here unless it becomes a priority.
     categories: [],
   },
   chandlerliquors: {
