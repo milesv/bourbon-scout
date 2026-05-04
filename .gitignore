@@ -7,6 +7,7 @@ debug/
 browser-profiles/
 browser-state.json
 watchlist.json
+waf-state.json
 coverage/
 preview-embeds.html
 .claude/

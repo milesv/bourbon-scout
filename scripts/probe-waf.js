@@ -15,6 +15,9 @@
 // Run weekly or after seeing canary degradation alerts.
 
 import { chromium } from "playwright-core";
+import { readFile, writeFile } from "node:fs/promises";
+
+const STATE_FILE = new URL("../waf-state.json", import.meta.url);
 
 const CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
@@ -81,12 +84,27 @@ async function probe(retailerKey, { url, expected }) {
   return result;
 }
 
+async function loadPriorState() {
+  try {
+    const raw = await readFile(STATE_FILE, "utf-8");
+    return JSON.parse(raw);
+  } catch { return {}; }
+}
+
+async function savePriorState(state) {
+  await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
 async function main() {
   const filterKey = process.argv[2];
   const targets = filterKey ? [filterKey] : Object.keys(RETAILER_PROBES);
+  const prior = await loadPriorState();
+  const newState = { ...prior };
+
   console.log("\n🔍 WAF cookie probe — detects migrations early\n");
   console.log("Retailer       Expected               Detected               Verdict");
   console.log("─".repeat(95));
+  const rotations = [];
   for (const k of targets) {
     const probe_ = RETAILER_PROBES[k];
     if (!probe_) {
@@ -96,8 +114,42 @@ async function main() {
     process.stdout.write(`${k.padEnd(14)} ${probe_.expected.padEnd(22)} `);
     const r = await probe(k, probe_);
     process.stdout.write(`${(r.detected || []).join(",").padEnd(22)} ${r.verdict}\n`);
+
+    // Compare with prior probe — flag rotations even when expected/actual still match
+    const detectedKey = [...(r.detected || [])].sort().join(",");
+    if (prior[k]?.detected && prior[k].detected !== detectedKey) {
+      rotations.push({
+        retailer: k,
+        prior: prior[k].detected || "(none)",
+        current: detectedKey || "(none)",
+        priorAt: prior[k].lastSeen,
+      });
+    }
+    newState[k] = {
+      detected: detectedKey,
+      verdict: r.verdict,
+      lastSeen: new Date().toISOString(),
+    };
   }
-  console.log("\n");
+  console.log();
+
+  if (rotations.length > 0) {
+    console.log("\n🚨 WAF ROTATIONS DETECTED SINCE LAST PROBE:\n");
+    for (const r of rotations) {
+      console.log(`  • ${r.retailer}: ${r.prior} → ${r.current}  (prior probe: ${r.priorAt})`);
+    }
+    console.log("\nNext steps:");
+    console.log("  • Update RETAILER_PROBES.expected in this script");
+    console.log("  • Update CLAUDE.md retailer table to reflect new WAF");
+    console.log("  • Audit affected scraper's cookie/pre-warm logic");
+    console.log("  • Run `node scripts/error-budget.js` to see if scraper is degrading");
+  } else if (Object.keys(prior).length > 0) {
+    console.log("✅ No WAF rotations detected since last probe.");
+  } else {
+    console.log("(First run — baseline saved. Re-run later to detect rotations.)");
+  }
+  await savePriorState(newState);
+  console.log(`\nState saved to ${STATE_FILE.pathname.replace(process.cwd(), ".")}\n`);
 }
 
 main().catch((err) => {

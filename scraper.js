@@ -1740,7 +1740,22 @@ function normalizeText(text) {
 
 // Product titles containing these terms are not individual bottles — skip them to prevent
 // sampler packs, gift sets, etc. from triggering multiple bottle matches at once.
-const EXCLUDE_TERMS = ["sampler", "gift set", "variety pack", "combo pack", "bundle", "miniature", "mini bottle", " 50ml", " 50 ml"];
+// Reject any product whose title contains these terms before matching against
+// `searchTerms`. Catches three classes of false positives:
+//   1. Multi-bottle bundles that match many bottle names at once
+//   2. Miniature bottles (50ml) that aren't the bottle we want
+//   3. Merchandise/apparel that happens to share a bottle name (e.g. Walmart's
+//      "Elmer T. Lee S to 5XL T-Shirt" — the matcher caught this in production).
+const EXCLUDE_TERMS = [
+  // Multi-bottle bundles
+  "sampler", "gift set", "variety pack", "combo pack", "bundle",
+  // Miniatures
+  "miniature", "mini bottle", " 50ml", " 50 ml",
+  // Merchandise / non-bottle products (Elmer T. Lee T-Shirt false positive at Walmart)
+  "t-shirt", "t shirt", "tshirt", "shirt", "hoodie", "sweatshirt",
+  "hat", "cap", "mug", "glass set", "glasses set", "tumbler", "decanter",
+  "poster", "sign", "barrel head", "stave", "keychain", "keyring",
+];
 
 function matchesBottle(text, bottle, retailerKey) {
   const lower = normalizeText(text);
@@ -2834,6 +2849,37 @@ function isTotalWineShippingOption(o) {
   return label.includes("ship");
 }
 
+// Extract `window.INITIAL_STATE = {...};` from Total Wine HTML and parse safely.
+// Returns parsed object or null. Handles two real-world wrinkles:
+//   1. `</script>` inside JSON string values (use brace-counting, not regex)
+//   2. JavaScript `undefined` literals embedded in object values (replace with null
+//      before JSON.parse — Total Wine started doing this in 2026 and silently
+//      broke every known-URL re-check that used JSON.parse directly)
+function parseTotalWineInitialState(html) {
+  if (!html) return null;
+  const idx = html.indexOf("window.INITIAL_STATE");
+  if (idx === -1) return null;
+  const braceStart = html.indexOf("{", idx);
+  if (braceStart === -1) return null;
+  let depth = 0, inStr = false, escape = false, end = -1;
+  for (let j = braceStart; j < html.length; j++) {
+    const ch = html[j];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
+  }
+  if (end === -1) return null;
+  // Sanitize JS `undefined` → `null`. Pattern matches `:undefined` after a colon
+  // (object value position) plus a comma, brace, or closing bracket. Avoids
+  // false-positive replacement inside string values (which appear in `inStr`
+  // territory but JSON.stringify never quotes the literal token `undefined`).
+  const raw = html.slice(braceStart, end).replace(/:\s*undefined\s*([,}\]])/g, ":null$1");
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
 function matchTotalWineInitialState(state) {
   const found = [];
   const products = state?.search?.results?.products;
@@ -2936,23 +2982,8 @@ async function scrapeTotalWineViaFetch(store, { cachedCookies = "" } = {}) {
       const res = await scraperFetchRetry(url, { headers, timeout: 15000, proxyUrl: twProxy });
       if (!res.ok) { failures++; return; }
       const html = await res.text();
-      const idx = html.indexOf("window.INITIAL_STATE");
-      if (idx === -1) { failures++; return; }
-      const braceStart = html.indexOf("{", idx);
-      if (braceStart === -1) { failures++; return; }
-      // Use brace counting to find the matching closing brace (handles </script> inside JSON strings)
-      let depth = 0, inStr = false, escape = false, end = -1;
-      for (let j = braceStart; j < html.length; j++) {
-        const ch = html[j];
-        if (escape) { escape = false; continue; }
-        if (ch === "\\") { escape = true; continue; }
-        if (ch === '"') { inStr = !inStr; continue; }
-        if (inStr) continue;
-        if (ch === "{") depth++;
-        else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
-      }
-      if (end === -1) { failures++; return; }
-      const state = JSON.parse(html.slice(braceStart, end));
+      const state = parseTotalWineInitialState(html);
+      if (!state) { failures++; return; }
       if (!state?.search?.results) { failures++; return; }
       validPages++;
       trackHealth("totalwine", "ok");
@@ -3147,22 +3178,8 @@ async function checkTotalWineKnownUrls(store) {
       const res = await scraperFetchRetry(storeUrl, { headers: { ...FETCH_HEADERS }, timeout: 15000, proxyUrl: twProxy || undefined });
       if (!res.ok) continue;
       const html = await res.text();
-      const idx = html.indexOf("window.INITIAL_STATE");
-      if (idx === -1) continue;
-      const braceStart = html.indexOf("{", idx);
-      if (braceStart === -1) continue;
-      let depth = 0, inStr = false, escape = false, end = -1;
-      for (let j = braceStart; j < html.length; j++) {
-        const ch = html[j];
-        if (escape) { escape = false; continue; }
-        if (ch === "\\") { escape = true; continue; }
-        if (ch === '"') { inStr = !inStr; continue; }
-        if (inStr) continue;
-        if (ch === "{") depth++;
-        else if (ch === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
-      }
-      if (end === -1) continue;
-      const state = JSON.parse(html.slice(braceStart, end));
+      const state = parseTotalWineInitialState(html);
+      if (!state) continue;
       const matched = matchTotalWineInitialState(state);
       if (matched.length > 0) {
         found.push(...matched);
@@ -3261,7 +3278,12 @@ function matchWalmartNextData(nextData, retailerKey = "walmart") {
     const reasons = [];
     if (item.__typename !== "Product") reasons.push(`__typename=${item.__typename}`);
     if (item.sellerName && item.sellerName !== "Walmart.com") reasons.push(`sellerName=${item.sellerName}`);
-    if (item.availabilityStatusV2?.value !== "IN_STOCK") reasons.push(`availability=${item.availabilityStatusV2?.value || "missing"}`);
+    // Reject specific OOS values rather than accepting only IN_STOCK — picks up
+    // LIMITED_STOCK / IN_STOCK_AT_STORE / etc. that we previously dropped.
+    const avail = item.availabilityStatusV2?.value;
+    if (avail && /OUT_OF_STOCK|NOT_AVAILABLE|UNAVAILABLE|RETIRED|DISCONTINUED/i.test(avail)) {
+      reasons.push(`availability=${avail}`);
+    }
     const badge = (item.fulfillmentBadge || "").toLowerCase();
     if (badge && !(/store|pickup|today/i.test(badge))) reasons.push(`badge=${item.fulfillmentBadge}`);
     if (reasons.length > 0) {
@@ -3276,8 +3298,10 @@ function matchWalmartNextData(nextData, retailerKey = "walmart") {
     if (item.sellerName && item.sellerName !== "Walmart.com") continue;
 
     if (!item.name) continue;
-    const inStock = item.availabilityStatusV2?.value === "IN_STOCK";
-    if (!inStock) continue;
+    // Reject specific bad availability values rather than requiring exactly IN_STOCK.
+    // Walmart returns LIMITED_STOCK and (rarely) IN_STOCK_AT_STORE which are buyable.
+    const avail = item.availabilityStatusV2?.value;
+    if (avail && /OUT_OF_STOCK|NOT_AVAILABLE|UNAVAILABLE|RETIRED|DISCONTINUED/i.test(avail)) continue;
     // Skip ship-only items — we want walk-in/pickup availability
     const badge = (item.fulfillmentBadge || "").toLowerCase();
     if (badge && !(/store|pickup|today/i.test(badge))) continue;
@@ -3979,6 +4003,13 @@ async function scrapeSamsClubViaBrowser(page) {
   const found = [];
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
   for (const [bottleName, productId] of entries) {
+    // Bail out fast if the page was closed by the caller's withTimeout — without
+    // this the loop logs N "page.goto: Target page closed" errors per iteration,
+    // which is what was producing the 6-hour scan times in production.
+    if (page.isClosed?.()) {
+      console.warn(`[samsclub] Page closed mid-scan — bailing out of remaining ${entries.length - entries.indexOf([bottleName, productId])} products`);
+      break;
+    }
     const url = `https://www.samsclub.com/ip/${productId}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -4645,6 +4676,10 @@ async function scrapeSafewayViaBrowser(page, store) {
 
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
     if (consecutiveBlocks >= 4) { trackHealth("safeway", "blocked"); continue; }
+    if (page.isClosed?.()) {
+      console.warn(`[safeway:${store.storeId}] Page closed mid-scan — bailing out of remaining queries`);
+      break;
+    }
 
     try {
       // Primary: call Safeway API from browser context — inherits _abck cookies
@@ -4929,6 +4964,13 @@ async function scrapeAlbertsonsViaBrowser(page, store) {
 
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
     if (consecutiveBlocks >= 4) { trackHealth("albertsons", "blocked"); continue; }
+    // Page-closed bail-out: if the caller's withTimeout fired, page.evaluate would
+    // error N times in a row. Detect early and bail to avoid cascading log spam
+    // and wasted retries (this was contributing to multi-hour scan times).
+    if (page.isClosed?.()) {
+      console.warn(`[albertsons:${store.storeId}] Page closed mid-scan — bailing out of remaining queries`);
+      break;
+    }
 
     try {
       const apiUrl = `${baseUrl}?request-id=0&url=https://www.albertsons.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
@@ -5142,16 +5184,14 @@ const CITYHIVE_RETAILERS = {
     domain: "liquorexpresstempe.store",
     merchantId: "5f88c1ab8f687229c6c2c8a4",
     clientOrigin: "app://sites.liquorex2edadd46",
-    // Disabled — Liquor Express's CityHive instance uses a DIFFERENT layout than
-    // ExtraMile / Chandler Liquors. Their homepage does NOT issue any
-    // `browse_categories/render.json` calls (no auto-rendered category lists), and
-    // their `search_filters.json` endpoint returns 403 to clean got-scraping fetches
-    // (CloudFront-gated; works only inside a real browser session). To enable:
-    //   (a) Refactor scraper to support browser-mediated CityHive scraping, OR
-    //   (b) Capture the actual product-listing endpoint by clicking around the SPA
-    //       in DevTools (e.g. interact with filter dropdowns, navigate to /shop/?...).
-    // Effort: ~2-4 hours of focused probing. Payoff is uncertain — small store,
-    // small allocated catalog. Park here unless it becomes a priority.
+    // Disabled BY DESIGN. Probed twice (May 2026): their CityHive instance uses
+    // a different layout (no auto-rendered `browse_categories/render.json` calls
+    // on homepage). Search routes through `/api/v1/products/search_filters.json`
+    // with subtype query params — workable but requires reverse-engineering.
+    // Critically: their `search_filters.json` reports total spirits = 11 SKUs
+    // (10 bourbons, 9 whiskeys). Tiny inventory. Allocated finds are essentially
+    // impossible regardless of scraper quality. Re-enable only if their inventory
+    // grows materially or they expand into allocated bourbon territory.
     categories: [],
   },
   chandlerliquors: {
@@ -5539,12 +5579,27 @@ async function poll() {
     }
   }
 
-  // Run all stores concurrently (limit 8 — 6 retailers, fetch-first scrapers are lightweight)
-  await runWithConcurrency(tasks, 8);
-
-  // Per-poll time budget: if the main scan took too long (>12 min of a 15-min budget),
-  // skip canary retries to avoid cascading delays into the next poll.
+  // Hard poll deadline — kill the whole scan after 25 min even if scrapers are
+  // hung. Without this, browser cascades (page.goto: closed loops) have produced
+  // 6+ hour scans that delay or skip the next poll entirely. The withTimeout
+  // wrapper races runWithConcurrency against a fixed deadline; on timeout we
+  // log loud + emit a fail-fast metric so degradation alerts fire next scan.
   const POLL_BUDGET_MS = 25 * 60 * 1000; // 25 minutes
+  const concurrencyResult = await withTimeout(
+    runWithConcurrency(tasks, 8),
+    POLL_BUDGET_MS,
+    "POLL_TIMED_OUT"
+  );
+  if (concurrencyResult === "POLL_TIMED_OUT") {
+    console.warn(`[poll] 🛑 Hard timeout — scan exceeded ${POLL_BUDGET_MS / 60000}min budget. ` +
+      `Hung scrapers will be abandoned; in-flight Discord posts may not complete. ` +
+      `Granular reasons: ${JSON.stringify(Object.fromEntries(Object.entries(scraperHealth || {}).map(([k, v]) => [k, v?.reasons || {}])))}.`);
+    // Fall through — recordResult / Discord summary still runs with whatever
+    // partial data was collected.
+  }
+
+  // Per-poll time budget: if the main scan took too long, skip canary retries
+  // to avoid cascading delays into the next poll.
   const elapsed = Date.now() - scanStart;
   const budgetRemaining = POLL_BUDGET_MS - elapsed;
   if (budgetRemaining < 3 * 60 * 1000) {
@@ -5675,7 +5730,7 @@ export {
   shouldSkipRetailer, recordRetailerOutcome, prioritizeStores, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkCostcoKnownUrlsViaBrowser, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
   FETCH_BLOCKED_PATTERNS, isFetchBlocked, isCostcoBlocked,
   matchCostcoProductPage, matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
-  matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
+  matchTotalWineInitialState, parseTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   KROGER_PRODUCTS, checkKrogerKnownProducts, getKrogerToken, scrapeKrogerStore, classifyKrogerFind, buildKrogerProductUrl, verifyKrogerCandidatesViaWebsite,
   matchSafewayProducts, scrapeSafewayViaFetch, scrapeSafewayViaBrowser, scrapeSafewayStore,

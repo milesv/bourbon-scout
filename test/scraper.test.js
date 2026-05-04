@@ -82,7 +82,7 @@ import {
   shouldSkipRetailer, recordRetailerOutcome, prioritizeStores, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkCostcoKnownUrlsViaBrowser, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS, classifyKrogerFind, buildKrogerProductUrl,
   FETCH_BLOCKED_PATTERNS, isFetchBlocked, isCostcoBlocked,
   matchCostcoProductPage, matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
-  matchTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
+  matchTotalWineInitialState, parseTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, matchSafewayProducts, scrapeSafewayStore,
   matchAlbertsonsProducts, scrapeAlbertsonsStore, ALBERTSONS_KEY,
@@ -1025,9 +1025,28 @@ describe("matchWalmartNextData", () => {
     expect(matchWalmartNextData(data)).toHaveLength(0);
   });
 
-  it("ignores canAddToCart without IN_STOCK status", () => {
-    // canAddToCart alone is not sufficient — requires availabilityStatusV2.value === "IN_STOCK"
+  it("accepts items with missing availabilityStatusV2 (treats as not-OOS)", () => {
+    // Filter relaxed in 2026-05: instead of requiring exactly IN_STOCK, we now reject
+    // only specific bad values (OUT_OF_STOCK / NOT_AVAILABLE / etc.). Missing
+    // availability is treated as "potentially available" — catches LIMITED_STOCK,
+    // IN_STOCK_AT_STORE, and other variants Walmart returns at AZ stores.
     const data = makeNextData([{ __typename: "Product", name: "Weller Special Reserve", canAddToCart: true, sellerName: "Walmart.com" }]);
+    expect(matchWalmartNextData(data)).toHaveLength(1);
+  });
+
+  it("rejects LIMITED_STOCK is NOT a bad value (treats as available)", () => {
+    const data = makeNextData([{
+      __typename: "Product", name: "Weller Special Reserve",
+      availabilityStatusV2: { value: "LIMITED_STOCK" }, sellerName: "Walmart.com",
+    }]);
+    expect(matchWalmartNextData(data)).toHaveLength(1);
+  });
+
+  it("rejects DISCONTINUED items", () => {
+    const data = makeNextData([{
+      __typename: "Product", name: "Weller Special Reserve",
+      availabilityStatusV2: { value: "DISCONTINUED" }, sellerName: "Walmart.com",
+    }]);
     expect(matchWalmartNextData(data)).toHaveLength(0);
   });
 
@@ -2265,6 +2284,50 @@ describe("fetchRetry", () => {
       .mockRejectedValueOnce(new Error("ECONNRESET"))
       .mockRejectedValueOnce(new Error("ECONNREFUSED"));
     await expect(runWithFakeTimers(() => fetchRetry("http://example.com", {}))).rejects.toThrow("ECONNREFUSED");
+  });
+});
+
+// parseTotalWineInitialState extracts the inline JS object from raw HTML.
+// Critical bug it fixes: Total Wine started embedding JS literal `undefined`
+// (not valid JSON) in 2026, silently breaking known-URL re-checks.
+describe("parseTotalWineInitialState — undefined token sanitization", () => {
+  it("returns null when INITIAL_STATE is not in HTML", () => {
+    expect(parseTotalWineInitialState("<html>nothing here</html>")).toBeNull();
+    expect(parseTotalWineInitialState("")).toBeNull();
+    expect(parseTotalWineInitialState(null)).toBeNull();
+  });
+
+  it("parses standard valid JSON INITIAL_STATE", () => {
+    const html = `<script>window.INITIAL_STATE = {"search":{"results":{"products":[]}},"x":1};</script>`;
+    const state = parseTotalWineInitialState(html);
+    expect(state?.search?.results?.products).toEqual([]);
+    expect(state?.x).toBe(1);
+  });
+
+  it("sanitizes JS `undefined` tokens to `null` (the 2026 bug)", () => {
+    // Real shape Total Wine started returning: object values are JS `undefined`,
+    // which is invalid JSON. JSON.parse() blows up. Our parser regex-replaces
+    // `:undefined,` and `:undefined}` with `:null,`/`:null}` before parsing.
+    const html = `<script>window.INITIAL_STATE = {"client":undefined,"search":{"results":{"products":[]}},"y":undefined};</script>`;
+    const state = parseTotalWineInitialState(html);
+    expect(state).toBeTruthy();
+    expect(state.client).toBe(null);
+    expect(state.y).toBe(null);
+    expect(state.search.results.products).toEqual([]);
+  });
+
+  it("does NOT touch the literal string 'undefined' inside JSON string values", () => {
+    // We must only replace `undefined` in object-value position. A product whose
+    // description literally contains the word "undefined" must be preserved.
+    const html = `<script>window.INITIAL_STATE = {"x":undefined,"name":"is undefined or not"};</script>`;
+    const state = parseTotalWineInitialState(html);
+    expect(state.x).toBe(null);
+    expect(state.name).toBe("is undefined or not");
+  });
+
+  it("returns null when JSON is structurally invalid even after sanitization", () => {
+    const html = `<script>window.INITIAL_STATE = {"broken":[1,2`;  // unterminated
+    expect(parseTotalWineInitialState(html)).toBeNull();
   });
 });
 
