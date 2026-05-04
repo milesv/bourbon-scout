@@ -43,6 +43,12 @@ const {
   PROXY_URL,
   BACKUP_PROXY_URL,
   SECONDARY_ZIPS,
+  // Optional heartbeat URL (e.g., healthchecks.io check). Daemon pings this URL
+  // on every successful scan completion. If you don't ping for >grace period
+  // (configured at healthchecks.io, suggested 90 min), they email/notify you.
+  // Free for 20 checks. https://healthchecks.io/docs/. Set HEALTHCHECK_URL=...
+  // No SMS — email/Discord/Slack notification routes only.
+  HEALTHCHECK_URL,
 } = process.env;
 
 // Parse cron-style POLL_INTERVAL into milliseconds for setTimeout-based scheduling.
@@ -303,11 +309,18 @@ const METRICS_FILE = new URL("./metrics.jsonl", import.meta.url);
 const PROFILES_DIR = join(dirname(fileURLToPath(import.meta.url)), "browser-profiles");
 
 // ─── Adaptive Retailer Skipping ──────────────────────────────────────────────
-// Back off from retailers that fail repeatedly. After MAX_CONSECUTIVE_FAILURES,
-// skip scans for SKIP_COOLDOWN_MS to let IP reputation recover.
+// Back off from retailers that fail repeatedly. Two tiers of backoff:
+//   1. Acute (3 consecutive failures): 30-min cooldown — handles transient WAF
+//      blocks, proxy IP rotations, etc. Auto-recovers when scraper succeeds.
+//   2. Chronic (LONG_FAILURE_THRESHOLD consecutive failures): extended cooldown
+//      = 6h. Avoids burning proxy bandwidth on long-broken scrapers (e.g., a
+//      WAF migration that takes days to resolve). Still auto-recovers on first
+//      success so the retailer comes back when it's actually working again.
 const retailerFailures = {};
 const MAX_CONSECUTIVE_FAILURES = 3;
-const SKIP_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
+const SKIP_COOLDOWN_MS = 30 * 60 * 1000; // 30 min — acute
+const LONG_FAILURE_THRESHOLD = 12;       // ~6 hours of failures at 30-min cadence
+const LONG_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours — chronic
 
 function shouldSkipRetailer(key) {
   const f = retailerFailures[key];
@@ -330,7 +343,13 @@ function recordRetailerOutcome(key, success) {
     retailerFailures[key].skipUntil = null;
   } else {
     retailerFailures[key].consecutive++;
-    if (retailerFailures[key].consecutive >= MAX_CONSECUTIVE_FAILURES) {
+    if (retailerFailures[key].consecutive >= LONG_FAILURE_THRESHOLD) {
+      // Chronic failure — extended cooldown to save proxy bandwidth + browser
+      // launches on a clearly broken retailer. The 6h window is long enough
+      // for WAF rotations / IP reputation recoveries to resolve naturally.
+      retailerFailures[key].skipUntil = Date.now() + LONG_COOLDOWN_MS;
+      console.log(`[${key}] ${LONG_FAILURE_THRESHOLD} consecutive failures — long cooldown (6h). Probably WAF rotation or chronic block.`);
+    } else if (retailerFailures[key].consecutive >= MAX_CONSECUTIVE_FAILURES) {
       retailerFailures[key].skipUntil = Date.now() + SKIP_COOLDOWN_MS;
       console.log(`[${key}] ${MAX_CONSECUTIVE_FAILURES} consecutive failures — backing off for 30min`);
     }
@@ -832,9 +851,35 @@ async function scrapeRedditIntel(state) {
         const matchedKeywords = REDDIT_INTEL_KEYWORDS.filter((kw) => text.includes(kw));
         if (matchedKeywords.length === 0) continue; // Not relevant
 
+        // Score the post — reduces false positives without an LLM. Heuristics:
+        //   +2: contains a known retailer keyword
+        //   +2: contains a target-bottle keyword
+        //   +2: less than 1h old (true real-time)
+        //   +1: positive Reddit score (>= 1, not downvoted to oblivion)
+        //   +1: at least one comment (someone engaged with it)
+        //   -3: looks like a question (ISO/asking patterns)
+        //
+        // Threshold: 4. Below threshold = log + skip alert. Lets us tune without
+        // needing to drop noisy keywords entirely.
+        const RETAILER_HINTS = ["costco", "total wine", "fry's", "frys", "walmart", "safeway", "albertsons", "walgreens", "sam's club", "samsclub", "extramile", "chandler liquors", "liquor express"];
+        const BOTTLE_HINTS = ["pappy", "stagg", "blanton", "weller", "eh taylor", "e.h. taylor", "taylor", "btac", "elmer", "kok", "king of kentucky", "old forester", "michter"];
+        const QUESTION_PATTERNS = [/\biso\b/i, /\blooking for\b/i, /\bwhere can i\b/i, /\bwhere do i\b/i, /\?$/, /\banyone know\b/i, /\bany luck\b/i, /\bgot any\b/i];
+        let score = 0;
+        if (RETAILER_HINTS.some((r) => text.includes(r))) score += 2;
+        if (BOTTLE_HINTS.some((b) => text.includes(b))) score += 2;
+        if (ageMs < 60 * 60 * 1000) score += 2;  // < 1 hour old
+        if ((p.score || 0) >= 1) score += 1;
+        if ((p.num_comments || 0) >= 1) score += 1;
+        if (QUESTION_PATTERNS.some((re) => re.test(text))) score -= 3;
+
         // Mark as seen regardless of whether alert sends
         state._redditSeen[p.id] = new Date().toISOString();
         newPosts++;
+
+        if (score < 4) {
+          console.log(`[reddit] Low-signal post skipped (score=${score}): "${p.title.slice(0, 60)}"`);
+          continue;
+        }
 
         // Cross-source confirmation: extract any TARGET_BOTTLE names mentioned in the
         // post and record the timestamp. When the scraper later finds the SAME bottle
@@ -1104,6 +1149,15 @@ async function maybeSendHealthDegradationAlert(recentMetrics) {
 // Pure function: computes diffs between previous state and current scan results.
 // previousStore: { bottles: { "Weller 12": { url, price, sku, firstSeen, lastSeen, scanCount } } } or undefined
 // currentFound: [{ name, url, price, sku, size, fulfillment }]
+// Parse a price string like "$249.99" or "$1,249.00" → 249.99 number, or null.
+function parsePriceNumber(s) {
+  if (!s || typeof s !== "string") return null;
+  const m = s.match(/[\d,]+\.?\d*/);
+  if (!m) return null;
+  const n = parseFloat(m[0].replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
 function computeChanges(previousStore, currentFound) {
   const prevBottles = previousStore?.bottles || {};
   const currentByName = new Map(currentFound.map((b) => [b.name, b]));
@@ -1118,11 +1172,33 @@ function computeChanges(previousStore, currentFound) {
       firstSeen: prevBottles[b.name].firstSeen,
       scanCount: (prevBottles[b.name].scanCount || 0) + 1,
     }));
+  // Price-change detection: bottle was in previous scan AND price changed.
+  // Significant changes only — ≥10% drop or rise. Used to surface clearance
+  // events (Stagg dropping from $250 → $180 is meaningful) and price spikes
+  // (commonly indicates real allocated stock at retailer who only stocks the
+  // bottle when it's "trending" — surfaces a real-time inventory signal).
+  const priceChanges = [];
+  for (const b of stillInStock) {
+    const prev = prevBottles[b.name];
+    const prevPrice = parsePriceNumber(prev?.price);
+    const currPrice = parsePriceNumber(b.price);
+    if (prevPrice == null || currPrice == null || prevPrice === 0) continue;
+    const pctChange = ((currPrice - prevPrice) / prevPrice) * 100;
+    if (Math.abs(pctChange) >= 10) {
+      priceChanges.push({
+        ...b,
+        prevPrice: prev.price,
+        currPrice: b.price,
+        pctChange,
+        direction: pctChange < 0 ? "drop" : "rise",
+      });
+    }
+  }
   const goneOOS = [...prevNames]
     .filter((name) => !currNames.has(name))
     .map((name) => ({ name, ...prevBottles[name] }));
 
-  return { newFinds, stillInStock, goneOOS };
+  return { newFinds, stillInStock, goneOOS, priceChanges };
 }
 
 // Mutates state in place for a given retailer+store. Preserves firstSeen for continuing bottles.
@@ -1525,6 +1601,38 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
     });
   }
 
+  // Price-change embed (purple, quiet) — significant ≥10% movement on a bottle
+  // already in stock. Drops can signal clearance ("Stagg from $250 → $180"); rises
+  // can flag spike pricing or partial-allocation refresh. Fires regardless of new
+  // finds, since price changes are independent signals.
+  if (changes.priceChanges?.length > 0) {
+    const drops = changes.priceChanges.filter((b) => b.direction === "drop");
+    const rises = changes.priceChanges.filter((b) => b.direction === "rise");
+    let desc = `${info.storeLine}\n${info.addressLine}\n\n💰 **PRICE CHANGE**\n`;
+    if (drops.length > 0) {
+      desc += `\n📉 **Drops:**\n`;
+      desc += drops.map((b) => {
+        const url = b.url ? ` [link](${b.url})` : "";
+        return `🟣 ${b.name}: ~~${b.prevPrice}~~ → **${b.currPrice}** (${b.pctChange.toFixed(1)}%)${url}`;
+      }).join("\n");
+    }
+    if (rises.length > 0) {
+      desc += `\n📈 **Rises:**\n`;
+      desc += rises.map((b) => {
+        const url = b.url ? ` [link](${b.url})` : "";
+        return `🟣 ${b.name}: ${b.prevPrice} → **${b.currPrice}** (+${b.pctChange.toFixed(1)}%)${url}`;
+      }).join("\n");
+    }
+    embeds.push({
+      title: truncateTitle(`💰 PRICE CHANGE — ${info.title}`),
+      description: truncateDescription(desc),
+      color: COLORS.summary,  // purple
+      footer: { text: `Bourbon Scout 🥃 │ ${retailerName} · price-history signal` },
+      timestamp: new Date().toISOString(),
+      _urgent: false,
+    });
+  }
+
   // Still-in-stock re-alert (blue, quiet) — only when no new finds and no OOS
   if (changes.stillInStock.length > 0 && changes.newFinds.length === 0 && changes.goneOOS.length === 0) {
     const reAlertN = parseInt(REALERT_EVERY_N_SCANS, 10) || 4;
@@ -1670,6 +1778,41 @@ async function fetchRetry(url, opts) {
 // Uses Chrome cipher suites + HTTP/2 to defeat Akamai/PerimeterX TLS fingerprinting that
 // trivially identifies node-fetch's Node.js JA3 hash regardless of HTTP header spoofing.
 // node-fetch is still used for Discord webhooks and API endpoints (no bot detection there).
+// Cumulative bandwidth tracking (fetch-only — browser bandwidth is invisible to us).
+// Reset at module load; reported in scan summary embed and via _getBandwidthStats().
+// Helps detect runaway proxy bills before DataImpulse 407s start firing. Per-retailer
+// breakdown shows which scraper is the heaviest.
+const bandwidthStats = {
+  totalBytes: 0,
+  byRetailer: {}, // key: retailer key, value: bytes
+  startTs: Date.now(),
+};
+
+function trackBandwidth(retailerKey, byteSize) {
+  if (!byteSize || byteSize < 0) return;
+  bandwidthStats.totalBytes += byteSize;
+  bandwidthStats.byRetailer[retailerKey || "unknown"] = (bandwidthStats.byRetailer[retailerKey || "unknown"] || 0) + byteSize;
+}
+
+// Heuristic: derive retailer key from URL host. Used when we don't have explicit
+// retailer context at the fetch layer. Defensive — returns "unknown" on no match.
+function retailerKeyForUrl(url) {
+  if (!url) return "unknown";
+  if (url.includes("kroger.com") || url.includes("frysfood.com")) return "kroger";
+  if (url.includes("totalwine.com")) return "totalwine";
+  if (url.includes("walmart.com")) return "walmart";
+  if (url.includes("costco.com")) return "costco";
+  if (url.includes("safeway.com")) return "safeway";
+  if (url.includes("albertsons.com")) return "albertsons";
+  if (url.includes("walgreens.com")) return "walgreens";
+  if (url.includes("samsclub.com")) return "samsclub";
+  if (url.includes("extramileliquors")) return "extramile";
+  if (url.includes("liquorexpresstempe")) return "liquorexpress";
+  if (url.includes("chandlerliquorsaz")) return "chandlerliquors";
+  if (url.includes("reddit.com")) return "reddit";
+  return "unknown";
+}
+
 async function scraperFetch(url, { headers, timeout = 15000, proxyUrl, redirect, method, body } = {}) {
   const gotOpts = {
     url,
@@ -1685,6 +1828,9 @@ async function scraperFetch(url, { headers, timeout = 15000, proxyUrl, redirect,
   if (body) gotOpts.body = body;
   const response = await gotScraping(gotOpts);
   const statusCode = response.statusCode;
+  // Track response bytes for bandwidth attribution
+  const respSize = (response.body && typeof response.body === "string") ? response.body.length : 0;
+  trackBandwidth(retailerKeyForUrl(url), respSize);
   // Detect proxy quota exhaustion — attempt failover to backup proxy
   if (statusCode === 407) {
     if (!primaryProxyExhausted) {
@@ -5396,10 +5542,15 @@ async function poll() {
   let totalStillInStock = 0;
   let totalGoneOOS = 0;
   // Alert deduplication: tracks bottle names that already fired an URGENT (@here) alert
-  // earlier in this scan. Subsequent same-bottle finds at other stores downgrade to
-  // quiet alerts to prevent Discord spam (e.g. Pappy 15 at 4 Marketplace stores =
-  // 1 @here ping + 3 quiet "also at" alerts instead of 4 @here pings).
+  // earlier in this scan. Subsequent same-bottle finds at other stores get buffered
+  // into `secondaryFindsBuffer` and consolidated into one Discord embed at end of
+  // scan. This prevents Discord spam during boost windows when 4 Marketplace stores
+  // get the same allocation simultaneously: 1 @here ping at first store + 1
+  // consolidated "also at: Higley, Greenfield, Riggs" embed at end.
   const urgentlyAlertedThisScan = new Set();
+  // key: `${retailerKey}:${bottleName}` → array of { storeName, info, find }
+  // Drained at end of poll() into one Discord embed per bottle.
+  const secondaryFindsBuffer = new Map();
   let nothingCount = 0;
   const retailersSeen = new Set();
   const scannedStores = [];
@@ -5479,11 +5630,14 @@ async function poll() {
       // Otherwise mark all bottles as alerted and proceed with @here ping.
       const allAlreadyAlerted = confirmedNames.every((n) => urgentlyAlertedThisScan.has(n));
       if (allAlreadyAlerted) {
-        console.log(`[${retailer.key}:${store.storeId}] 🟢 New (deduped — already pinged this scan): ${confirmedNames.join(", ")}`);
-        // Append "(also at: <store>)" annotation to embed title for context
-        const annotated = urgentEmbeds.map((e) => ({ ...e, title: `🎯 ALSO AT — ${e.title.replace(/^🚨 NEW FIND — /, "")}` }));
-        try { await sendDiscordAlert(annotated); }
-        catch (err) { discordFailures++; console.error(`[discord] Dedup alert failed: ${err.message}`); }
+        // BUFFER subsequent finds rather than firing per-store. End-of-scan flush
+        // consolidates into one Discord embed per bottle with all stores listed.
+        console.log(`[${retailer.key}:${store.storeId}] 🟢 New (buffered for end-of-scan dedup): ${confirmedNames.join(", ")}`);
+        for (const find of changes.newFinds.filter((b) => b.confidence !== "lead")) {
+          const key = `${retailer.key}:${find.name}`;
+          if (!secondaryFindsBuffer.has(key)) secondaryFindsBuffer.set(key, []);
+          secondaryFindsBuffer.get(key).push({ retailer, store, find });
+        }
       } else {
         console.log(`[${retailer.key}:${store.storeId}] 🟢 New: ${confirmedNames.join(", ")}`);
         for (const n of confirmedNames) urgentlyAlertedThisScan.add(n);
@@ -5696,6 +5850,40 @@ async function poll() {
   // Update peak slots cache for dynamic boost scheduling
   if (peakHours) peakSlotsCache = peakHours;
 
+  // Flush secondary-finds buffer: consolidates "same bottle at multiple stores"
+  // into one Discord embed per bottle. Single sendDiscordAlert call (quiet, no
+  // @here) with addresses + Google Maps links for each store. Reduces Discord
+  // spam during boost windows when allocations hit several Marketplace Fry's
+  // simultaneously. Fires before the summary embed so the consolidation sits
+  // chronologically with the original urgent alert.
+  if (secondaryFindsBuffer.size > 0) {
+    const consolidatedEmbeds = [];
+    for (const [key, entries] of secondaryFindsBuffer.entries()) {
+      const [retailerKey, bottleName] = key.split(":");
+      const retailer = entries[0].retailer;
+      const find = entries[0].find;  // first find — has price/url/etc
+      const storeLines = entries.map(({ store }) => {
+        const info = formatStoreInfo(retailerKey, retailer.name, store);
+        return `${info.storeLine}\n${info.addressLine}`;
+      }).join("\n\n");
+      const skuLabel = SKU_LABELS[retailerKey] || "Item #";
+      const desc = `🎯 **Same bottle, ${entries.length} more store(s):**\n\n${formatBottleLine(find, skuLabel, "🟢")}\n\n${storeLines}`;
+      consolidatedEmbeds.push({
+        title: truncateTitle(`🎯 ALSO AT — ${bottleName} (${entries.length} stores)`),
+        description: truncateDescription(desc),
+        color: COLORS.newFind,
+        footer: { text: `Bourbon Scout 🥃 │ ${retailer.name} · multi-store consolidation` },
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (consolidatedEmbeds.length > 0) {
+      console.log(`[poll] Sending ${consolidatedEmbeds.length} consolidated multi-store embed(s)`);
+      await sendDiscordAlert(consolidatedEmbeds).catch((err) =>
+        console.error(`[poll] Consolidated alert failed: ${err.message}`)
+      );
+    }
+  }
+
   // Quiet summary at end of every poll
   const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalConfirmed, totalLeads, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend, peakHours });
   await sendDiscordAlert([summary]).catch((err) => console.error(`[poll] Summary send failed: ${err.message}`));
@@ -5707,6 +5895,17 @@ async function poll() {
   await maybeSendHealthDegradationAlert(recentMetrics).catch((err) =>
     console.error(`[poll] Health alert failed: ${err.message}`)
   );
+
+  // Liveness heartbeat — fire-and-forget GET to a healthchecks.io-style endpoint.
+  // External service (configured at healthchecks.io, free for 20 checks) emails/
+  // pings if no ping arrives within grace period. Detects daemon crashes within
+  // ~90 min — the May 1-2 26-hour gap was invisible until manual log inspection.
+  // No-op when env var is unset, so this is purely opt-in.
+  if (HEALTHCHECK_URL) {
+    /* v8 ignore next 3 -- network-side-effect-only call */
+    fetch(HEALTHCHECK_URL, { method: "GET", signal: AbortSignal.timeout(5000) })
+      .catch((err) => console.warn(`[heartbeat] ping failed: ${err.message}`));
+  }
 
   console.log(`[poll] Scan complete — ${storesScanned} stores, ${totalNewFinds} new, ${totalStillInStock} still, ${totalGoneOOS} OOS, ${durationSec}s\n`);
   } finally {
@@ -5739,7 +5938,7 @@ export {
   scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
-  trackHealth, HEALTH_REASONS,
+  trackHealth, HEALTH_REASONS, trackBandwidth, retailerKeyForUrl,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel, inferRetailerFromText,
   validateEnv,
@@ -5748,6 +5947,12 @@ export {
 
 // Test helpers for setting module-level state
 export function _setStoreCache(cache) { storeCache = cache; }
+export function _getBandwidthStats() { return bandwidthStats; }
+export function _resetBandwidthStats() {
+  bandwidthStats.totalBytes = 0;
+  for (const k of Object.keys(bandwidthStats.byRetailer)) delete bandwidthStats.byRetailer[k];
+  bandwidthStats.startTs = Date.now();
+}
 export function _resetPolling() { polling = false; }
 export function _resetKrogerToken() { krogerToken = null; krogerTokenPromise = null; }
 export function _resetBrowserStateCache() { browserStateCache = null; }
@@ -5782,9 +5987,35 @@ function validateEnv() {
   return warnings;
 }
 
+// Rotate the daemon log if it exceeds LOG_ROTATE_THRESHOLD_BYTES. macOS launchd
+// writes to ~/Library/Logs/bourbon-scout.log indefinitely — without rotation it
+// can grow to GBs over a year. We do a simple "rename to .old + truncate" at
+// startup. Cheap, no external rotation dependency, recoverable if needed.
+const LOG_ROTATE_THRESHOLD_BYTES = 50 * 1024 * 1024;  // 50 MB
+async function maybeRotateLog() {
+  /* v8 ignore start -- filesystem side effect, only runs in real daemon */
+  try {
+    const homedir = process.env.HOME || "/tmp";
+    const logPath = `${homedir}/Library/Logs/bourbon-scout.log`;
+    const oldPath = `${homedir}/Library/Logs/bourbon-scout.log.old`;
+    const fs = await import("node:fs/promises");
+    let stat;
+    try { stat = await fs.stat(logPath); } catch { return; } // no log yet
+    if (stat.size < LOG_ROTATE_THRESHOLD_BYTES) return;
+    // Move current to .old (overwrites any prior .old) — preserves last
+    // window of history while letting the daemon write to a fresh file.
+    await fs.rename(logPath, oldPath);
+    console.log(`[log-rotate] Rotated ${(stat.size / 1024 / 1024).toFixed(1)}MB log → bourbon-scout.log.old`);
+  } catch (err) {
+    console.warn(`[log-rotate] failed (non-fatal): ${err.message}`);
+  }
+  /* v8 ignore stop */
+}
+
 /* v8 ignore start -- entry point: calls discoverStores + process.exit + setTimeout scheduling */
 async function main() {
   console.log("Bourbon Scout 🥃 starting up...");
+  await maybeRotateLog();
   const envWarnings = validateEnv();
   for (const w of envWarnings) console.warn(`[startup] ⚠️ ${w}`);
   if (proxyAgent) console.log(`[proxy] Routing scraper traffic through proxy`);

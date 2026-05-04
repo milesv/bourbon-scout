@@ -91,7 +91,7 @@ import {
   scrapeWalgreensViaBrowser, scrapeWalgreensStore,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   KROGER_PRODUCTS, checkKrogerKnownProducts, verifyKrogerCandidatesViaWebsite,
-  trackHealth, HEALTH_REASONS,
+  trackHealth, HEALTH_REASONS, trackBandwidth, retailerKeyForUrl,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel, inferRetailerFromText,
   shuffleKeepCanaryFirst,
@@ -103,6 +103,7 @@ import {
   validateEnv,
   poll, main,
   _setStoreCache, _resetPolling, _resetKrogerToken, _resetBrowserStateCache, _resetWalgreensCoords,
+  _getBandwidthStats, _resetBandwidthStats,
   _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
   _resetRetailerFailures, _resetKnownProducts, _getKnownProducts, _setKnownProducts,
   acquireRetailerLock, _resetRetailerBrowserLocks, _resetRetailerBrowserBlocked,
@@ -9038,5 +9039,133 @@ describe("inferRetailerFromText", () => {
     expect(
       inferRetailerFromText("Walmart and Walmart had Blanton's. Costco didn't.", [])
     ).toBe("walmart");
+  });
+});
+
+// ─── Price-change detection ──────────────────────────────────────────────────
+// Detects ≥10% price movement on bottles already in stock. Surfaces clearance
+// events (price drops) and spike pricing (rises that may indicate fresh stock).
+describe("computeChanges priceChanges", () => {
+  it("detects significant price drops (>=10%)", () => {
+    const previousStore = {
+      bottles: { "Stagg Jr": { price: "$80.00", url: "x", sku: "1" } },
+    };
+    const currentFound = [{ name: "Stagg Jr", price: "$60.00", url: "x", sku: "1" }];
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.priceChanges).toHaveLength(1);
+    expect(changes.priceChanges[0].direction).toBe("drop");
+    expect(changes.priceChanges[0].pctChange).toBeCloseTo(-25, 0);
+    expect(changes.priceChanges[0].prevPrice).toBe("$80.00");
+    expect(changes.priceChanges[0].currPrice).toBe("$60.00");
+  });
+
+  it("detects significant price rises", () => {
+    const previousStore = { bottles: { "Pappy 15": { price: "$300", url: "x", sku: "1" } } };
+    const currentFound = [{ name: "Pappy 15", price: "$500", url: "x", sku: "1" }];
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.priceChanges).toHaveLength(1);
+    expect(changes.priceChanges[0].direction).toBe("rise");
+    expect(changes.priceChanges[0].pctChange).toBeCloseTo(66.67, 1);
+  });
+
+  it("ignores small price changes under 10% threshold", () => {
+    const previousStore = { bottles: { "Buffalo Trace": { price: "$30.00", url: "x", sku: "1" } } };
+    const currentFound = [{ name: "Buffalo Trace", price: "$31.50", url: "x", sku: "1" }];  // 5% change
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.priceChanges).toEqual([]);
+  });
+
+  it("ignores when previous or current price is unparseable", () => {
+    const previousStore = { bottles: { "X": { price: "Call store", sku: "1" } } };
+    const currentFound = [{ name: "X", price: "$50.00", sku: "1" }];
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.priceChanges).toEqual([]);
+  });
+
+  it("ignores price changes for new finds (no previous price)", () => {
+    const previousStore = { bottles: {} };
+    const currentFound = [{ name: "Pappy 15", price: "$300", sku: "1" }];
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.priceChanges).toEqual([]);
+    expect(changes.newFinds).toHaveLength(1);
+  });
+
+  it("handles comma-formatted prices (e.g. '$1,200.00')", () => {
+    const previousStore = { bottles: { "Stagg": { price: "$1,200.00", sku: "1" } } };
+    const currentFound = [{ name: "Stagg", price: "$900.00", sku: "1" }];
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.priceChanges).toHaveLength(1);
+    expect(changes.priceChanges[0].pctChange).toBeCloseTo(-25, 0);
+  });
+});
+
+// ─── Bandwidth tracking ──────────────────────────────────────────────────────
+describe("trackBandwidth + retailerKeyForUrl", () => {
+  beforeEach(() => _resetBandwidthStats());
+
+  it("attributes bytes to the right retailer based on URL host", () => {
+    expect(retailerKeyForUrl("https://www.kroger.com/v1/products")).toBe("kroger");
+    expect(retailerKeyForUrl("https://www.frysfood.com/p/x")).toBe("kroger");  // same parent
+    expect(retailerKeyForUrl("https://www.totalwine.com/search")).toBe("totalwine");
+    expect(retailerKeyForUrl("https://extramileliquors.com/api/")).toBe("extramile");
+    expect(retailerKeyForUrl("https://chandlerliquorsaz.com/")).toBe("chandlerliquors");
+    expect(retailerKeyForUrl("https://www.example-unknown.com/")).toBe("unknown");
+    expect(retailerKeyForUrl("")).toBe("unknown");
+    expect(retailerKeyForUrl(null)).toBe("unknown");
+  });
+
+  it("accumulates bytes per retailer", () => {
+    trackBandwidth("kroger", 1024);
+    trackBandwidth("kroger", 2048);
+    trackBandwidth("walmart", 512);
+    const s = _getBandwidthStats();
+    expect(s.totalBytes).toBe(3584);
+    expect(s.byRetailer.kroger).toBe(3072);
+    expect(s.byRetailer.walmart).toBe(512);
+  });
+
+  it("ignores zero/negative byte sizes (defensive)", () => {
+    trackBandwidth("kroger", 0);
+    trackBandwidth("kroger", -100);
+    const s = _getBandwidthStats();
+    expect(s.totalBytes).toBe(0);
+  });
+});
+
+// ─── Auto-disable burning-budget retailers (long cooldown) ────────────────────
+describe("recordRetailerOutcome long cooldown", () => {
+  beforeEach(() => {
+    // Reset retailer failures (no exposed helper, just clobber via 12 successes)
+  });
+
+  it("triggers 6h cooldown after 12 consecutive failures (chronic)", () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    // Use a unique retailer key per test to avoid leak between runs
+    const key = `chronic-${Math.random().toString(36).slice(2, 8)}`;
+    for (let i = 0; i < 12; i++) recordRetailerOutcome(key, false);
+    // After 12 failures, the next shouldSkipRetailer call should report cooldown
+    expect(shouldSkipRetailer(key)).toBe(true);
+    // Verify the cooldown message indicates "long cooldown" was triggered
+    const hasLong = consoleSpy.mock.calls.some(args => /long cooldown/i.test(args.join(" ")));
+    expect(hasLong).toBe(true);
+    consoleSpy.mockRestore();
+  });
+
+  it("triggers 30min cooldown after 3 consecutive (acute, before chronic)", () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const key = `acute-${Math.random().toString(36).slice(2, 8)}`;
+    for (let i = 0; i < 3; i++) recordRetailerOutcome(key, false);
+    expect(shouldSkipRetailer(key)).toBe(true);
+    const hasAcute = consoleSpy.mock.calls.some(args => /backing off for 30min/i.test(args.join(" ")));
+    expect(hasAcute).toBe(true);
+    consoleSpy.mockRestore();
+  });
+
+  it("recovers immediately on success (clears consecutive count)", () => {
+    const key = `recover-${Math.random().toString(36).slice(2, 8)}`;
+    for (let i = 0; i < 11; i++) recordRetailerOutcome(key, false);
+    recordRetailerOutcome(key, true);  // recovery
+    // No cooldown should be active
+    expect(shouldSkipRetailer(key)).toBe(false);
   });
 });
