@@ -8,6 +8,7 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 11 ret
 - **`com.bourbon-scout.plist`** — macOS launchd daemon config. Keeps scraper running with auto-restart. Logs to `~/Library/Logs/bourbon-scout.log`.
 - **`scripts/install-daemon.sh`** / **`scripts/uninstall-daemon.sh`** — Install/remove the launchd daemon.
 - **`browser-profiles/`** — Per-retailer persistent Chrome profile directories (auto-created). Contains HTTP cache, service workers, IndexedDB, visited history. Gitignored.
+- **`lib/bottles.js`** — Phase 1 of modularization. Pure data + pure functions: `SEARCH_QUERIES`, `TARGET_BOTTLES`, `CANARY_NAMES`, `CANARY_BY_RETAILER`, `isCanaryFor`, `BOTTLE_INTEREST_TIERS`, `ULTRA_RARE_BOTTLES`, `IGNORED_BOTTLES`, `bottleInterestTier`. Designed to be importable from any future per-retailer module without circular-import risk (no env-var reads, no network, no module state). `scraper.js` imports and re-exports these for backward compatibility with tests.
 - **`lib/geo.js`** — Zip-to-coordinates (`zipToCoords`) via zippopotam.us API and `haversine` distance calculation. No dependencies.
 - **`lib/discover-stores.js`** — Auto-discovers nearby stores for all retailers given a zip code and radius. Caches results to `stores.json` with a 7-day TTL. Uses vanilla `playwright-core` with `--disable-blink-features=AutomationControlled` for browser-based store locators and Kroger REST API for Kroger.
 - **`lib/fallback-stores.js`** — Static hardcoded store data for the 85283 area. `FALLBACK_STORES` used when browser-based store locators fail (e.g., CI datacenter IPs get blocked). `EXTRA_STORES` contains user-specified stores outside the discovery radius (e.g., Costco Scottsdale #427, Costco Paradise Valley #1058) — always merged after discovery, deduped by storeId.
@@ -233,6 +234,54 @@ When a retailer's store locator stops finding stores (selectors broke):
 - **Walmart rejection-reason diagnostic** — When `matchWalmartNextData` finds a name match but rejects the item (sellerName, availability, fulfillment), logs the specific filter that fired. Walmart has produced 0 non-canary finds across 290+ scans; this surfaces whether matches exist but get filtered (vs. no allocated stock at our stores).
 - **Reddit → watch list bridge** — `inferRetailerFromText(text, keywords)` extracts the most-mentioned retailer from a Reddit post body, used in `scrapeRedditIntel` to auto-create a `_watchList` entry for each match. Records the intelligence; doesn't auto-create proactive scans (the Reddit alert IS the user-facing signal). Pre-marked as already-notified so the existing `processWatchList` doesn't fire twice.
 - **Two-tier summary embed** — `buildSummaryEmbed` accepts `totalConfirmed` + `totalLeads` and shows them split when present. The `poll()` aggregator splits `changes.newFinds` by `confidence` to compute the tier counts. Lets a quick glance at the summary differentiate "5 confirmed (drive over)" from "5 leads (call first)".
+
+## Modularization plan
+
+`scraper.js` is ~6200 lines. Splitting it lowers regression risk and reduces context cost when iterating on a single retailer. Strategy: **shared deps first, then per-retailer slices**, each phase a self-contained PR with green tests.
+
+### Phase 1 — done ✅
+
+`lib/bottles.js` extracts pure data + pure functions: `SEARCH_QUERIES`, `TARGET_BOTTLES`, `CANARY_NAMES`, `CANARY_BY_RETAILER`, `isCanaryFor`, `BOTTLE_INTEREST_TIERS`, `ULTRA_RARE_BOTTLES`, `IGNORED_BOTTLES`, `bottleInterestTier`. `scraper.js` imports + re-exports for backward-compat. Zero test changes; 907/907 green.
+
+### Phase 2 — shared HTTP + matching layer (planned)
+
+Extract three more pure-ish modules before touching any retailer:
+
+1. **`lib/match.js`** — `matchesBottle`, `EXCLUDE_TERMS`, `normalizeText`, `dedupFound`, `parseSize`, `truncateTitle`, `filterMiniatures`, `MIN_BOTTLE_PRICE`, `MAX_BOTTLE_PRICE`. All pure functions or pure constants — same circular-import-safe profile as Phase 1.
+2. **`lib/http.js`** — `scraperFetch`, `scraperFetchRetry`, `fetchRetry`, `FETCH_HEADERS`, `getGreasedBrand`, `CHROME_VERSION`, `IS_MAC`. Reads env (proxy URL) but only at call time, not at import time. Exports a `getRetailerProxy(key)` getter rather than a frozen agent.
+3. **`lib/blocked.js`** — `isBlockedPage`, `isFetchBlocked`, `isCostcoBlocked`, plus `solveHumanChallenge`. Body-text heuristics — no env, no state.
+
+After Phase 2, the per-retailer modules in Phase 3 will only need to import `lib/bottles.js`, `lib/match.js`, `lib/http.js`, `lib/blocked.js` + a small set of orchestration helpers (`trackHealth`, `acquireRetailerLock`, `getCachedCookies`, `cacheRetailerCookies`).
+
+### Phase 3 — per-retailer modules (planned)
+
+One PR per retailer, in order of independence (least intertwined first):
+
+1. `lib/retailers/walgreens.js` — browser-only, scrapeOnce, no fetch path. Smallest surface area. (~150 lines)
+2. `lib/retailers/samsclub.js` — fetch-first per-product, scrapeOnce. Uses `SAMSCLUB_PRODUCTS` map. (~300 lines)
+3. `lib/retailers/totalwine.js` — fetch-first via `INITIAL_STATE`, browser fallback. (~400 lines)
+4. `lib/retailers/walmart.js` — fetch-first via `__NEXT_DATA__`, browser fallback. (~400 lines)
+5. `lib/retailers/costco.js` — fetch-first + browser known-URL fallback. Most complex, save for last. (~600 lines)
+6. `lib/retailers/kroger.js` — pure API, but lots of B+C tier classification logic. (~500 lines)
+7. `lib/retailers/safeway.js` + `lib/retailers/albertsons.js` — same Incapsula playbook, can share helpers. (~350 lines each)
+8. `lib/retailers/cityhive.js` — already largely factored via `makeCityHiveScraper`. Lift to its own file. (~200 lines)
+
+Each retailer file exports `scrape{Name}Store` (or `scrape{Name}Once` for scrapeOnce retailers) plus any retailer-specific match helpers. `scraper.js` imports them and registers in `RETAILERS`.
+
+### Phase 4 — orchestration cleanup (planned)
+
+Once retailers are out, what remains in `scraper.js` is the poll loop, Discord embedding, state management, and watch list / Reddit intel. Consider splitting:
+
+- `lib/state.js` — `loadState`, `saveState`, `pruneState`, `updateStoreState`, `computeChanges`, `loadKnownProducts`.
+- `lib/discord.js` — `postDiscordWebhook`, `buildStoreEmbeds`, `buildSummaryEmbed`, `sendUrgentAlert`, `sendDiscordAlert`, `formatBottleLine`, `formatStoreInfo`.
+- `lib/intel.js` — `scrapeRedditIntel`, `loadWatchList`, `processWatchList`.
+- `scraper.js` becomes a slim entry point: `poll()`, `main()`, schedule logic, env validation.
+
+**Regression-minimization rules for every phase:**
+- Each phase imports + re-exports through `scraper.js` so test imports keep working.
+- No behavioral changes during the move — extraction-only commits.
+- Run full test suite after every phase. 907/907 must stay green.
+- One module per commit. Easy bisect if something breaks.
 
 ## Auxiliary scripts
 
