@@ -944,20 +944,55 @@ async function scrapeRedditIntel(state) {
 // State is nested by retailer key then store ID:
 // { "costco": { "0489": ["Weller 12 Year"] }, "walmart": { "2436": [] } }
 
+// #7 — State.json corruption recovery. Atomic-rename writes prevent torn files
+// at the OS level, but a crash mid-`JSON.stringify` could still produce malformed
+// content (e.g. process killed before serialization completes, signal during
+// large state.json write). On parse failure, fall back to .bak (last known-good).
+// `state.json.bak` is rewritten just before each new save — so the backup is one
+// generation behind, which is exactly what we want to recover from "current is
+// garbage but last save was fine".
+const STATE_BAK_PATH = () => fileURLToPath(STATE_FILE) + ".bak";
+
 async function loadState() {
+  // Try main file first
   try {
     const raw = await readFile(STATE_FILE, "utf-8");
     const parsed = JSON.parse(raw);
-    return (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : {};
-  } catch {
-    return {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    console.warn("[state] state.json had invalid shape — trying .bak");
+  } catch (err) {
+    // ENOENT is expected on fresh installs; only warn for real parse/IO errors
+    if (err && err.code !== "ENOENT") {
+      console.warn(`[state] state.json read/parse failed (${err.message}) — trying .bak`);
+    }
   }
+  // Fall back to .bak
+  try {
+    const raw = await readFile(STATE_BAK_PATH(), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      console.warn("[state] Recovered from state.json.bak");
+      return parsed;
+    }
+  } catch { /* no usable backup either */ }
+  return {};
 }
 
 async function saveState(state) {
-  const tmp = fileURLToPath(STATE_FILE) + ".tmp";
+  const target = fileURLToPath(STATE_FILE);
+  const tmp = target + ".tmp";
+  // Snapshot the previous good state to .bak BEFORE overwriting. Best-effort:
+  // missing source on first save is fine. We don't gate on the copy succeeding —
+  // saving the new state is more important than preserving the backup.
+  try {
+    const prevRaw = await readFile(target, "utf-8");
+    // Validate it's parseable before trusting it as a backup. A pre-existing
+    // corrupt state.json should not become our "known-good" fallback.
+    JSON.parse(prevRaw);
+    await writeFile(STATE_BAK_PATH(), prevRaw);
+  } catch { /* no previous good state, or it was corrupt — skip backup */ }
   await writeFile(tmp, JSON.stringify(state, null, 2));
-  await rename(tmp, fileURLToPath(STATE_FILE));
+  await rename(tmp, target);
 }
 
 // ─── Scan Metrics ────────────────────────────────────────────────────────────
@@ -1151,13 +1186,37 @@ function parsePriceNumber(s) {
   return Number.isFinite(n) ? n : null;
 }
 
+// #12 — Restock detection threshold. A bottle re-appearing at the same store
+// after ≥7 days OOS is a much stronger signal than a first-time find: it's
+// verifiable shelving turnover, the drop is fresh enough to act on, and the
+// pattern of "appears, goes OOS, sits dormant 1+ week, reappears" matches
+// real allocation cycles (BTAC October, Pappy quarterly drops, etc.). The
+// `restock: true` flag elevates the embed to "♻️ RESTOCK" with the dormant
+// duration shown. 7d threshold avoids triggering on ~daily Akamai-induced
+// flips where state.json briefly empties.
+const RESTOCK_GAP_MS = 7 * 24 * 60 * 60 * 1000;
+
 function computeChanges(previousStore, currentFound) {
   const prevBottles = previousStore?.bottles || {};
+  const oosHistory = previousStore?.oosHistory || {};
   const currentByName = new Map(currentFound.map((b) => [b.name, b]));
   const prevNames = new Set(Object.keys(prevBottles));
   const currNames = new Set(currentByName.keys());
+  const now = Date.now();
 
-  const newFinds = currentFound.filter((b) => !prevNames.has(b.name));
+  const newFinds = currentFound.filter((b) => !prevNames.has(b.name)).map((b) => {
+    const oos = oosHistory[b.name];
+    if (oos?.lastGone) {
+      const gap = now - new Date(oos.lastGone).getTime();
+      if (gap >= RESTOCK_GAP_MS) {
+        return { ...b, restock: true, lastGoneOOS: oos.lastGone, restockGapDays: Math.floor(gap / 86400000) };
+      }
+    }
+    return b;
+  });
+  // Tail of the original logic — `currentFound.filter(...)` was reassigned to
+  // newFinds with restock decoration, but stillInStock/priceChanges/goneOOS
+  // shouldn't see the decoration.
   const stillInStock = currentFound
     .filter((b) => prevNames.has(b.name))
     .map((b) => ({
@@ -1200,10 +1259,47 @@ function computeChanges(previousStore, currentFound) {
 // pattern detection. After 30 entries, oldest are dropped.
 const PRICE_HISTORY_LIMIT = 30;
 
+// #12 — Cap per-store oosHistory size. 100 distinct bottle names is well above
+// the 46 in TARGET_BOTTLES so this is purely a defensive bound against state
+// schema drift or accidental key explosion. LRU eviction keeps the most-recent
+// transitions when capped.
+const OOS_HISTORY_CAP = 100;
+
 function updateStoreState(state, retailerKey, storeId, currentFound) {
   if (!state[retailerKey]) state[retailerKey] = {};
   const prev = state[retailerKey][storeId]?.bottles || {};
+  const prevOosHistory = state[retailerKey][storeId]?.oosHistory || {};
   const now = new Date().toISOString();
+
+  // Track restock signals: when a bottle transitions from "was in prev" to
+  // "not in current", record the OOS timestamp. When it later re-appears,
+  // computeChanges checks this entry to decide whether to elevate the find
+  // to a restock embed.
+  const oosHistory = { ...prevOosHistory };
+  const currentNames = new Set(currentFound.map((b) => b.name));
+  for (const name of Object.keys(prev)) {
+    if (!currentNames.has(name)) {
+      oosHistory[name] = { lastGone: now };
+    }
+  }
+  // When a bottle COMES BACK (newFind that was previously gone), clear its
+  // entry so we don't accidentally trigger restock again on a transient gap.
+  // The current scan already received `restock: true` if the gap was ≥7d.
+  for (const name of currentNames) {
+    if (oosHistory[name] && !prev[name]) {
+      delete oosHistory[name];
+    }
+  }
+  // LRU cap: drop oldest entries if the map exploded
+  const oosKeys = Object.keys(oosHistory);
+  let trimmedOosHistory = oosHistory;
+  if (oosKeys.length > OOS_HISTORY_CAP) {
+    const sorted = oosKeys
+      .map((k) => [k, new Date(oosHistory[k].lastGone).getTime()])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, OOS_HISTORY_CAP);
+    trimmedOosHistory = Object.fromEntries(sorted.map(([k]) => [k, oosHistory[k]]));
+  }
 
   const bottles = {};
   for (const b of currentFound) {
@@ -1243,7 +1339,7 @@ function updateStoreState(state, retailerKey, storeId, currentFound) {
     };
   }
 
-  state[retailerKey][storeId] = { bottles, lastScanned: now };
+  state[retailerKey][storeId] = { bottles, lastScanned: now, oosHistory: trimmedOosHistory };
 }
 
 function pruneState(state, activeStores) {
@@ -1440,6 +1536,8 @@ const COLORS = {
   goneOOS:  0xe67e22,  // orange — went out of stock
   summary:  0x9b59b6,  // purple — scan summary
   rumor:    0xf39c12,  // gold — human intelligence rumor alert
+  restock:  0xe91e63,  // pink/magenta — bottle re-appeared after ≥7d OOS gap (highest-signal new find)
+  priceChange: 0x9b59b6, // purple — price-change tier (existing)
 };
 
 // ─── Store Info Formatting ──────────────────────────────────────────────────
@@ -1472,6 +1570,18 @@ function parseState(address) {
   return match ? match[1] : "";
 }
 
+// #13 — Format a clickable phone number link if present on the store record.
+// `tel:` URI works on mobile (taps to dial) and Discord renders the link inline
+// with the displayed number. Stores can populate `phone` via fallback-stores.js
+// or future per-retailer discoverers — the rendering layer just shows it when
+// available, no daemon-restart required to take advantage of new numbers.
+function formatPhoneLink(phone) {
+  if (!phone) return null;
+  // Strip non-digits for the tel: URI; preserve the original formatting for display.
+  const digits = String(phone).replace(/[^0-9+]/g, "");
+  return `📞 [${phone}](tel:${digits})`;
+}
+
 function formatStoreInfo(retailerKey, retailerName, store) {
   const dist = store.distanceMiles != null ? ` · ${store.distanceMiles} mi` : "";
   const city = parseCity(store.address);
@@ -1490,6 +1600,7 @@ function formatStoreInfo(retailerKey, retailerName, store) {
     title: `${displayName} (#${store.storeId})${dist}`,
     storeLine: `🏬 ${displayName}${storeNum}${cityState}`,
     addressLine: mapsLink,
+    phoneLine: formatPhoneLink(store.phone),
     skuLabel: SKU_LABELS[retailerKey] || "Item #",
   };
 }
@@ -1587,14 +1698,52 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   const allNames = TARGET_BOTTLES.filter((b) => !CANARY_NAMES.has(b.name)).map((b) => b.name);
   const embeds = [];
 
-  // Split new finds into "confirmed" (strong signal) and "lead" (weak signal) tiers.
-  // Only the Kroger scraper currently sets `confidence` — anything without it defaults
-  // to "confirmed" so existing retailers keep their current behavior.
-  // Filter out bottles in "ignore" tier — silently tracked but no alerts
+  // Split new finds into "restock" (highest signal — bottle re-appeared after
+  // ≥7d OOS gap), "confirmed" (strong signal), and "lead" (weak signal). Restocks
+  // pre-empt the regular tier so a bottle isn't double-rendered. Only the Kroger
+  // scraper currently sets `confidence` — anything without it defaults to
+  // "confirmed" so existing retailers keep their current behavior.
+  // Filter out bottles in "ignore" tier — silently tracked but no alerts.
   const alertableFinds = changes.newFinds.filter((b) => !IGNORED_BOTTLES.has(b.name));
-  const confirmedFinds = alertableFinds.filter((b) => b.confidence !== "lead");
-  const leadFinds = alertableFinds.filter((b) => b.confidence === "lead");
+  const restockFinds = alertableFinds.filter((b) => b.restock === true);
+  const nonRestockFinds = alertableFinds.filter((b) => b.restock !== true);
+  const confirmedFinds = nonRestockFinds.filter((b) => b.confidence !== "lead");
+  const leadFinds = nonRestockFinds.filter((b) => b.confidence === "lead");
   const inStockNames = [...changes.newFinds, ...changes.stillInStock].map((b) => b.name);
+
+  // #12 — Restock embed (pink/magenta, urgent — @here ping). Bottles appearing
+  // here have been verifiably OOS at this store for ≥7 days, then surfaced again.
+  // That's the single strongest signal we have: not "first appearance from
+  // search-result hallucination" but "store actually rotated stock". Renders
+  // before confirmed finds so a restock displaces a regular new-find embed for
+  // the same scan.
+  if (restockFinds.length > 0) {
+    const phoneInline = info.phoneLine ? `\n${info.phoneLine}` : "";
+    let desc = `${info.storeLine}\n${info.addressLine}${phoneInline}\n\n♻️ **RESTOCK** — bottle re-appeared after extended OOS (real stock rotation)\n\n`;
+    desc += restockFinds.map((b) => {
+      const gapStr = b.restockGapDays != null ? ` · last gone OOS ${b.restockGapDays}d ago` : "";
+      return `${formatBottleLine(b, info.skuLabel, "♻️")}${gapStr ? `\n   📅${gapStr}` : ""}`;
+    }).join("\n\n");
+
+    if (changes.stillInStock.length > 0) {
+      desc += `\n\n✅ **STILL IN STOCK (${changes.stillInStock.length})**\n`;
+      desc += changes.stillInStock.map((b) => {
+        const since = b.firstSeen ? ` (since ${timeAgo(b.firstSeen)})` : "";
+        return `🔵 ${b.name} — ${b.price || "N/A"} · 🏷️ ${info.skuLabel}${b.sku || "?"}${since}`;
+      }).join("\n");
+    }
+
+    desc += buildOOSList(allNames, inStockNames);
+
+    embeds.push({
+      title: truncateTitle(`♻️ RESTOCK — ${info.title}`),
+      description: truncateDescription(desc),
+      color: COLORS.restock,
+      footer: { text: `Bourbon Scout 🥃 │ ${retailerName} · verified stock rotation` },
+      timestamp: new Date().toISOString(),
+      _urgent: true,
+    });
+  }
 
   // Confirmed embed (green, urgent — @here ping)
   if (confirmedFinds.length > 0) {
@@ -1621,9 +1770,11 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
     });
   }
 
-  // Lead embed (yellow, quiet — no @here, just a heads-up)
+  // Lead embed (yellow, quiet — no @here, just a heads-up). Includes phone line
+  // when available so "call ahead" guidance is actually actionable (#13).
   if (leadFinds.length > 0) {
-    let desc = `${info.storeLine}\n${info.addressLine}\n\n🔍 **POTENTIAL LEAD** — store has a planogram slot for these bottles, but inventory signal is weak. Call ahead before driving.\n\n`;
+    const phoneInline = info.phoneLine ? `\n${info.phoneLine}` : "";
+    let desc = `${info.storeLine}\n${info.addressLine}${phoneInline}\n\n🔍 **POTENTIAL LEAD** — store has a planogram slot for these bottles, but inventory signal is weak. Call ahead before driving.\n\n`;
     desc += leadFinds.map((b) => formatBottleLine(b, info.skuLabel, "🟡")).join("\n\n");
     embeds.push({
       title: truncateTitle(`🔍 LEAD — ${info.title}`),
@@ -2283,6 +2434,23 @@ async function launchRetailerBrowser(retailerKey, opts = {}) {
 async function closeRetailerBrowsers() {
   for (const key of Object.keys(retailerBrowserCache)) {
     const { context } = retailerBrowserCache[key];
+    // #5 — Page leak detector. Each scraper is supposed to call page.close() in
+    // a finally block; if an unhandled error skips that, pages accumulate on the
+    // persistent context and slow Chrome to a crawl over a long-running daemon.
+    // Log when we find > 3 stragglers (the threshold is empirical: warmup may
+    // briefly hold 2 pages during a retry without being a leak).
+    try {
+      const pages = context.pages?.() || [];
+      if (pages.length > 3) {
+        console.warn(`[browser-leak] ${key} closing with ${pages.length} pages still open — likely missed a page.close() in a finally block`);
+        // Force-close the leaked pages explicitly. context.close() should reap
+        // them anyway, but doing it eagerly means we get clear logs if any
+        // individual close hangs.
+        for (const p of pages) {
+          try { await p.close({ runBeforeUnload: false }); } catch { /* best-effort */ }
+        }
+      }
+    } catch { /* defensive: pages() not available on all context mocks */ }
     // Timeout prevents a hung Chrome process from blocking saveState and summary
     await withTimeout(context.close().catch(() => {}), 10000, undefined);
     delete retailerBrowserCache[key];
@@ -2539,9 +2707,12 @@ async function scrapeCostcoViaFetch() {
 async function scrapeCostcoOnce(page) {
   const costcoT0 = Date.now();
   // Pre-warm: visit homepage to let Akamai sensor set _abck cookie.
-  // Use networkidle + longer dwell so sensor scripts fully execute and phone home.
-  await page.goto("https://www.costco.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
-  await sleep(3000 + Math.random() * 2000);
+  // #3 — Use domcontentloaded (not networkidle): Akamai sensors keep beaconing
+  // forever so networkidle never fires, eating the full 20s timeout per call.
+  // domcontentloaded returns in 1-3s; the explicit 5-8s dwell that follows is
+  // what sensors actually need to run. Net pre-warm savings: ~15-18s per scan.
+  await page.goto("https://www.costco.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+  await sleep(5000 + Math.random() * 3000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "fast" });
   // Category navigation adds browsing depth (homepage → category → search) which raises
@@ -3037,9 +3208,13 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
   const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
   if (!skipPreWarm) {
     // Pre-warm: visit homepage to let PerimeterX sensor collect behavioral telemetry.
-    await page.goto("https://www.totalwine.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+    // #3 — domcontentloaded (not networkidle): PerimeterX `_px*` cookies are set
+    // during the JS execution window after DOMContentLoaded, but the sensor never
+    // stops beaconing (chat widget, analytics, telemetry) so networkidle eats the
+    // 20s timeout. Explicit 6-9s dwell covers _px* issuance.
+    await page.goto("https://www.totalwine.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
     console.log(`[totalwine:${store.storeId}] Homepage loaded (${elapsed()})`);
-    await sleep(4000 + Math.random() * 3000); // PerimeterX needs longer JS execution time
+    await sleep(6000 + Math.random() * 3000); // PerimeterX needs longer JS execution time
     await solveHumanChallenge(page);
     await humanizePage(page, { pace: "slow" });
     // Category navigation adds browsing depth for PerimeterX behavioral scoring.
@@ -3452,9 +3627,12 @@ async function scrapeWalmartViaFetch(store) {
 // Browser-based Walmart scraper (fallback). Accepts a shared page.
 async function scrapeWalmartViaBrowser(store, page) {
   const wmT0 = Date.now();
-  // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies
-  await page.goto("https://www.walmart.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
-  await sleep(3000 + Math.random() * 3000);
+  // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies.
+  // #3 — domcontentloaded (not networkidle): Walmart runs both Akamai _abck AND
+  // PerimeterX _px* in parallel; both keep beaconing so networkidle never settles.
+  // Explicit 5-9s dwell covers cookie issuance for both.
+  await page.goto("https://www.walmart.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+  await sleep(5000 + Math.random() * 4000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "medium" });
   await navigateCategory(page, "walmart");
@@ -4126,7 +4304,9 @@ async function scrapeSamsClubViaFetch() {
 async function scrapeSamsClubViaBrowser(page) {
   // Pre-warm: visit homepage to let PerimeterX sensor collect behavioral telemetry.
   // Same parent company as Walmart — uses the same PerimeterX integration.
-  await page.goto("https://www.samsclub.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  // #3 — domcontentloaded (not networkidle): PerimeterX never lets the page idle.
+  // Explicit 5-8s dwell already covers _px* issuance (kept as-is).
+  await page.goto("https://www.samsclub.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
   await sleep(5000 + Math.random() * 3000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "slow" });
@@ -5154,9 +5334,12 @@ async function scrapeAlbertsonsViaBrowser(page, store) {
   const t0 = Date.now();
   const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 
-  await page.goto("https://www.albertsons.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
+  // #3 — domcontentloaded (not networkidle): Albertsons uses Incapsula (same as
+  // Safeway post-2026 migration). Incapsula sensor never goes idle. Explicit
+  // 6-9s dwell covers `incap_ses_*` issuance (matches Safeway's tuning).
+  await page.goto("https://www.albertsons.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
   console.log(`[albertsons:${store.storeId}] Homepage loaded (${elapsed()})`);
-  await sleep(4000 + Math.random() * 3000);
+  await sleep(6000 + Math.random() * 3000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "slow" });
   await navigateCategory(page, "albertsons");

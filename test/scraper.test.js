@@ -9637,3 +9637,272 @@ describe("formatBandwidthCost (#11)", () => {
     expect(Number.isFinite(r.projectedDaily)).toBe(true);
   });
 });
+
+// ─── #7: State .bak corruption recovery ───────────────────────────────────────
+
+describe("loadState .bak fallback (#7)", () => {
+  beforeEach(() => {
+    mocks.readFile.mockReset();
+    mocks.writeFile.mockReset();
+  });
+
+  it("loads main state.json on the happy path", async () => {
+    mocks.readFile.mockResolvedValueOnce(JSON.stringify({ costco: { "100": { bottles: {} } } }));
+    const result = await loadState();
+    expect(result.costco["100"]).toBeDefined();
+  });
+
+  it("falls back to .bak when main is corrupt JSON", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.readFile
+      .mockResolvedValueOnce("{not valid json")  // main
+      .mockResolvedValueOnce(JSON.stringify({ recovered: true })); // .bak
+    const result = await loadState();
+    expect(result.recovered).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Recovered from state.json.bak"));
+    warnSpy.mockRestore();
+  });
+
+  it("returns {} when both main and .bak are unusable", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.readFile
+      .mockResolvedValueOnce("garbage")
+      .mockResolvedValueOnce("also garbage");
+    const result = await loadState();
+    expect(result).toEqual({});
+    warnSpy.mockRestore();
+  });
+
+  it("returns {} on first install (both files missing)", async () => {
+    const enoent = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    mocks.readFile.mockRejectedValue(enoent);
+    const result = await loadState();
+    expect(result).toEqual({});
+  });
+
+  it("rejects array as top-level (not an object) and falls back", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.readFile
+      .mockResolvedValueOnce(JSON.stringify(["this", "is", "an", "array"]))
+      .mockResolvedValueOnce(JSON.stringify({ valid: true }));
+    const result = await loadState();
+    expect(result.valid).toBe(true);
+    warnSpy.mockRestore();
+  });
+});
+
+describe("saveState .bak rotation (#7)", () => {
+  beforeEach(() => {
+    mocks.readFile.mockReset();
+    mocks.writeFile.mockReset();
+    mocks.rename.mockReset();
+    mocks.rename.mockResolvedValue(undefined);
+    mocks.writeFile.mockResolvedValue(undefined);
+  });
+
+  it("snapshots previous good state to .bak before overwriting", async () => {
+    const prevState = JSON.stringify({ costco: { "100": {} } });
+    mocks.readFile.mockResolvedValueOnce(prevState);
+    await saveState({ costco: { "100": { bottles: {} } } });
+    // First writeFile call should be to the .bak path
+    const bakWrite = mocks.writeFile.mock.calls.find((c) =>
+      c[0].toString().endsWith("state.json.bak"),
+    );
+    expect(bakWrite).toBeDefined();
+    expect(bakWrite[1]).toBe(prevState);
+  });
+
+  it("skips .bak rotation when previous state was corrupt (don't preserve garbage)", async () => {
+    mocks.readFile.mockResolvedValueOnce("{corrupt");
+    await saveState({ costco: { "100": {} } });
+    // No .bak write should happen
+    const bakWrite = mocks.writeFile.mock.calls.find((c) =>
+      c[0].toString().endsWith("state.json.bak"),
+    );
+    expect(bakWrite).toBeUndefined();
+  });
+
+  it("proceeds with save when previous state file is missing (first save)", async () => {
+    const enoent = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    mocks.readFile.mockRejectedValue(enoent);
+    await saveState({ costco: {} });
+    // .tmp written + renamed even without a backup
+    expect(mocks.rename).toHaveBeenCalled();
+  });
+});
+
+// ─── #12: Restock detection ───────────────────────────────────────────────────
+
+describe("computeChanges restock detection (#12)", () => {
+  it("flags restock when previous OOS gap >= 7 days", () => {
+    const eightDaysAgo = new Date(Date.now() - 8 * 86400000).toISOString();
+    const previousStore = {
+      bottles: {},
+      oosHistory: { "Pappy Van Winkle 15 Year": { lastGone: eightDaysAgo } },
+    };
+    const currentFound = [{ name: "Pappy Van Winkle 15 Year", price: "$129", url: "x" }];
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.newFinds).toHaveLength(1);
+    expect(changes.newFinds[0].restock).toBe(true);
+    expect(changes.newFinds[0].lastGoneOOS).toBe(eightDaysAgo);
+    expect(changes.newFinds[0].restockGapDays).toBe(8);
+  });
+
+  it("does NOT flag restock when gap is < 7 days", () => {
+    const threeDaysAgo = new Date(Date.now() - 3 * 86400000).toISOString();
+    const previousStore = {
+      bottles: {},
+      oosHistory: { "Pappy Van Winkle 15 Year": { lastGone: threeDaysAgo } },
+    };
+    const currentFound = [{ name: "Pappy Van Winkle 15 Year", price: "$129", url: "x" }];
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.newFinds[0].restock).toBeUndefined();
+  });
+
+  it("does NOT flag restock when no oosHistory entry exists (first-ever find)", () => {
+    const previousStore = { bottles: {}, oosHistory: {} };
+    const currentFound = [{ name: "Pappy Van Winkle 15 Year", price: "$129", url: "x" }];
+    const changes = computeChanges(previousStore, currentFound);
+    expect(changes.newFinds[0].restock).toBeUndefined();
+  });
+
+  it("handles missing oosHistory gracefully (back-compat with old state)", () => {
+    const previousStore = { bottles: {} }; // no oosHistory key at all
+    const currentFound = [{ name: "Pappy Van Winkle 15 Year", price: "$129", url: "x" }];
+    expect(() => computeChanges(previousStore, currentFound)).not.toThrow();
+  });
+});
+
+describe("updateStoreState oosHistory tracking (#12)", () => {
+  it("records lastGone when a bottle transitions to OOS", () => {
+    const state = {
+      costco: {
+        "100": {
+          bottles: { "Eagle Rare 17 Year": { firstSeen: "x", lastSeen: "y", scanCount: 1, priceHistory: [] } },
+          oosHistory: {},
+        },
+      },
+    };
+    updateStoreState(state, "costco", "100", []); // empty current → all bottles went OOS
+    expect(state.costco["100"].oosHistory["Eagle Rare 17 Year"]).toBeDefined();
+    expect(state.costco["100"].oosHistory["Eagle Rare 17 Year"].lastGone).toBeDefined();
+  });
+
+  it("clears oosHistory entry when a previously-OOS bottle re-appears as new find", () => {
+    const oldTs = new Date(Date.now() - 10 * 86400000).toISOString();
+    const state = {
+      costco: {
+        "100": {
+          bottles: {}, // currently nothing in stock
+          oosHistory: { "Eagle Rare 17 Year": { lastGone: oldTs } },
+        },
+      },
+    };
+    updateStoreState(state, "costco", "100", [
+      { name: "Eagle Rare 17 Year", url: "x", price: "$200", sku: "1", size: "750ml", fulfillment: "" },
+    ]);
+    // Bottle is back → its oosHistory entry should be cleared
+    expect(state.costco["100"].oosHistory["Eagle Rare 17 Year"]).toBeUndefined();
+  });
+
+  it("preserves oosHistory across scans where bottle continues to be OOS", () => {
+    const oldTs = new Date(Date.now() - 5 * 86400000).toISOString();
+    const state = {
+      costco: {
+        "100": {
+          bottles: {},
+          oosHistory: { "Stagg Jr": { lastGone: oldTs } },
+        },
+      },
+    };
+    updateStoreState(state, "costco", "100", []);
+    // Bottle was already OOS, still OOS — entry unchanged
+    expect(state.costco["100"].oosHistory["Stagg Jr"].lastGone).toBe(oldTs);
+  });
+});
+
+// ─── #13: Phone numbers in alerts ─────────────────────────────────────────────
+
+describe("formatStoreInfo phone line (#13)", () => {
+  it("returns phoneLine when store.phone is present", () => {
+    const info = formatStoreInfo("costco", "Costco", {
+      storeId: "736",
+      name: "Costco Chandler",
+      address: "1425 W Queen Creek Rd, Chandler, AZ 85248",
+      phone: "(480) 685-7501",
+    });
+    expect(info.phoneLine).toContain("(480) 685-7501");
+    expect(info.phoneLine).toContain("tel:4806857501");
+  });
+
+  it("phoneLine is null when phone is absent (back-compat)", () => {
+    const info = formatStoreInfo("costco", "Costco", {
+      storeId: "736",
+      name: "Costco Chandler",
+      address: "1425 W Queen Creek Rd, Chandler, AZ 85248",
+    });
+    expect(info.phoneLine).toBeNull();
+  });
+
+  it("strips non-digit chars from tel: URI", () => {
+    const info = formatStoreInfo("walgreens", "Walgreens", {
+      storeId: "1",
+      name: "Walgreens",
+      address: "Main St, Tempe, AZ 85283",
+      phone: "+1 480-555-1234",
+    });
+    expect(info.phoneLine).toContain("tel:+14805551234");
+  });
+});
+
+describe("buildStoreEmbeds restock + phone (#12 + #13)", () => {
+  it("renders ♻️ RESTOCK embed instead of standard NEW FIND when restock=true", () => {
+    const eightDaysAgo = new Date(Date.now() - 8 * 86400000).toISOString();
+    const changes = {
+      newFinds: [
+        { name: "Pappy Van Winkle 15 Year", price: "$129", url: "x", sku: "1", restock: true, lastGoneOOS: eightDaysAgo, restockGapDays: 8 },
+      ],
+      stillInStock: [],
+      goneOOS: [],
+      priceChanges: [],
+    };
+    const embeds = buildStoreEmbeds("costco", "Costco", { storeId: "736", name: "Costco Chandler", address: "Main St, Chandler, AZ 85248" }, changes);
+    expect(embeds.length).toBeGreaterThan(0);
+    expect(embeds[0].title).toMatch(/♻️ RESTOCK/);
+    expect(embeds[0]._urgent).toBe(true);
+    expect(embeds[0].description).toContain("8d ago");
+  });
+
+  it("includes phoneLine in lead embed when store.phone is set", () => {
+    const changes = {
+      newFinds: [{ name: "Pappy Van Winkle 15 Year", price: "$129", url: "x", sku: "1", confidence: "lead" }],
+      stillInStock: [],
+      goneOOS: [],
+      priceChanges: [],
+    };
+    const embeds = buildStoreEmbeds("kroger", "Kroger", {
+      storeId: "111",
+      name: "Fry's Higley",
+      address: "Higley Rd, Gilbert, AZ 85234",
+      phone: "(480) 555-9999",
+    }, changes);
+    const leadEmbed = embeds.find((e) => e.title.includes("LEAD"));
+    expect(leadEmbed.description).toContain("(480) 555-9999");
+    expect(leadEmbed.description).toContain("tel:4805559999");
+  });
+
+  it("omits phone line when store.phone is missing (no rendering artifact)", () => {
+    const changes = {
+      newFinds: [{ name: "Pappy Van Winkle 15 Year", price: "$129", url: "x", sku: "1", confidence: "lead" }],
+      stillInStock: [],
+      goneOOS: [],
+      priceChanges: [],
+    };
+    const embeds = buildStoreEmbeds("kroger", "Kroger", {
+      storeId: "111", name: "Fry's", address: "x, Gilbert, AZ 85234",
+    }, changes);
+    const leadEmbed = embeds.find((e) => e.title.includes("LEAD"));
+    expect(leadEmbed.description).not.toContain("📞");
+    expect(leadEmbed.description).not.toContain("tel:");
+  });
+});
