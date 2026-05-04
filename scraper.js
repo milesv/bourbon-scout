@@ -25,9 +25,37 @@ import {
   IGNORED_BOTTLES,
   bottleInterestTier,
 } from "./lib/bottles.js";
+import {
+  isBlockedPage,
+  isFetchBlocked,
+  isCostcoBlocked,
+  FETCH_BLOCKED_PATTERNS,
+  solveHumanChallenge,
+} from "./lib/blocked.js";
+import {
+  normalizeText,
+  EXCLUDE_TERMS,
+  matchesBottle,
+  parsePrice,
+  dedupFound,
+  parseSize,
+  truncateTitle,
+  DISCORD_TITLE_LIMIT,
+  filterMiniatures,
+  MIN_BOTTLE_PRICE,
+  MAX_BOTTLE_PRICE,
+} from "./lib/match.js";
+import {
+  IS_MAC,
+  CHROME_VERSION,
+  CHROME_PATH,
+  getGreasedBrand,
+  FETCH_HEADERS,
+  fetchRetry,
+} from "./lib/http.js";
 
-// Re-export bottle catalog so existing test imports (`from "../scraper.js"`) keep working.
-// Phase 1 of the modularization roadmap — see CLAUDE.md.
+// Re-export so existing test imports (`from "../scraper.js"`) keep working.
+// Phase 1 + Phase 2 of the modularization roadmap — see CLAUDE.md.
 export {
   SEARCH_QUERIES,
   TARGET_BOTTLES,
@@ -38,6 +66,28 @@ export {
   ULTRA_RARE_BOTTLES,
   IGNORED_BOTTLES,
   bottleInterestTier,
+  isBlockedPage,
+  isFetchBlocked,
+  isCostcoBlocked,
+  FETCH_BLOCKED_PATTERNS,
+  solveHumanChallenge,
+  normalizeText,
+  EXCLUDE_TERMS,
+  matchesBottle,
+  parsePrice,
+  dedupFound,
+  parseSize,
+  truncateTitle,
+  DISCORD_TITLE_LIMIT,
+  filterMiniatures,
+  MIN_BOTTLE_PRICE,
+  MAX_BOTTLE_PRICE,
+  IS_MAC,
+  CHROME_VERSION,
+  CHROME_PATH,
+  getGreasedBrand,
+  FETCH_HEADERS,
+  fetchRetry,
 };
 
 // rebrowser-patches: patched CDP commands to evade Akamai/PerimeterX automation detection
@@ -1393,11 +1443,7 @@ function buildOOSList(allBottleNames, inStockNames) {
 
 // Discord limits embed descriptions to 4096 chars. Truncate the OOS tail if needed.
 const DISCORD_DESC_LIMIT = 4096;
-const DISCORD_TITLE_LIMIT = 256;
-function truncateTitle(title) {
-  if (title.length <= DISCORD_TITLE_LIMIT) return title;
-  return title.slice(0, DISCORD_TITLE_LIMIT - 1) + "…";
-}
+// truncateTitle + DISCORD_TITLE_LIMIT live in lib/match.js (re-exported above).
 function truncateDescription(desc) {
   if (desc.length <= DISCORD_DESC_LIMIT) return desc;
   // Find the OOS section and truncate it to fit
@@ -1645,17 +1691,7 @@ function shuffle(arr) {
   return a;
 }
 
-// Fetch with one retry on transient network errors (timeouts, DNS failures).
-// HTTP error responses (4xx/5xx) are NOT retried — caller handles those.
-async function fetchRetry(url, opts) {
-  try {
-    return await fetch(url, opts);
-  } catch (err) {
-    console.warn(`[fetchRetry] ${err.message} — retrying in 1s`);
-    await sleep(1000);
-    return await fetch(url, opts);
-  }
-}
+// fetchRetry lives in lib/http.js (re-exported above).
 
 // Scraper-grade HTTP fetch with Chrome TLS fingerprint impersonation (via got-scraping).
 // Returns a node-fetch-compatible response object { ok, status, text(), json(), headers }.
@@ -1750,94 +1786,10 @@ async function scraperFetchRetry(url, opts) {
   }
 }
 
-// Parse bottle size from product title text (e.g., "750ml", "1.75L", "750 ML")
-function parseSize(text) {
-  if (!text) return "";
-  const match = text.match(/([\d.]+)\s*(ml|cl|l|liter|litre)/i);
-  if (!match) return "";
-  const [, num, unit] = match;
-  const u = unit.toLowerCase();
-  if (u === "ml") return `${num}ml`;
-  if (u === "cl") return `${Math.round(parseFloat(num) * 10)}ml`;
-  return `${parseFloat(num)}L`;
-}
+// parseSize, normalizeText live in lib/match.js (re-exported above).
 
-// Normalize unicode curly quotes/apostrophes to ASCII before matching.
-// Retailers inconsistently use \u2018/\u2019 ("Blanton\u2019s") vs ASCII ("Blanton's").
-function normalizeText(text) {
-  return text.toLowerCase().replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'").replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"');
-}
-
-// Product titles containing these terms are not individual bottles — skip them to prevent
-// sampler packs, gift sets, etc. from triggering multiple bottle matches at once.
-// Reject any product whose title contains these terms before matching against
-// `searchTerms`. Catches three classes of false positives:
-//   1. Multi-bottle bundles that match many bottle names at once
-//   2. Miniature bottles (50ml) that aren't the bottle we want
-//   3. Merchandise/apparel that happens to share a bottle name (e.g. Walmart's
-//      "Elmer T. Lee S to 5XL T-Shirt" — the matcher caught this in production).
-const EXCLUDE_TERMS = [
-  // Multi-bottle bundles
-  "sampler", "gift set", "variety pack", "combo pack", "bundle",
-  // Miniatures
-  "miniature", "mini bottle", " 50ml", " 50 ml",
-  // Merchandise / non-bottle products (Elmer T. Lee T-Shirt false positive at Walmart)
-  "t-shirt", "t shirt", "tshirt", "shirt", "hoodie", "sweatshirt",
-  "hat", "cap", "mug", "glass set", "glasses set", "tumbler", "decanter",
-  "poster", "sign", "barrel head", "stave", "keychain", "keyring",
-];
-
-function matchesBottle(text, bottle, retailerKey) {
-  const lower = normalizeText(text);
-  if (EXCLUDE_TERMS.some((t) => lower.includes(t))) return false;
-  if (retailerKey && bottle.retailers && !bottle.retailers.includes(retailerKey)) return false;
-  return bottle.searchTerms.some((term) => lower.includes(term));
-}
-
-// Dedup found bottles by name, preferring the entry with the lowest price.
-// Falls back to first occurrence if prices are equal or unparseable.
-function dedupFound(found) {
-  const byName = new Map();
-  for (const f of found) {
-    const prev = byName.get(f.name);
-    if (!prev) { byName.set(f.name, f); continue; }
-    const prevPrice = parsePrice(prev.price);
-    const currPrice = parsePrice(f.price);
-    if (currPrice > 0 && (prevPrice === 0 || currPrice < prevPrice)) {
-      byName.set(f.name, f);
-    }
-  }
-  return Array.from(byName.values());
-}
-
-// Extract numeric price from strings like "$29.99", "29.99", "$1,299.99"
-function parsePrice(str) {
-  if (!str) return 0;
-  const match = str.replace(/,/g, "").match(/([\d.]+)/);
-  return match ? parseFloat(match[1]) : 0;
-}
-
-// Filter out miniature bottles (50ml) that slip past EXCLUDE_TERMS because the product
-// title doesn't mention the size. Price is the reliable signal: no allocated 750ml bourbon
-// is under $20, but 50ml miniatures are typically $8-15. Also catches size when available.
-const MIN_BOTTLE_PRICE = 20;
-const MAX_BOTTLE_PRICE = 500; // No allocated bourbon retails above $350 (Pappy 23). $500+ = secondary market.
-function filterMiniatures(found) {
-  return found.filter((f) => {
-    const size = (f.size || "").toLowerCase();
-    if (size && size !== "" && size !== "750ml" && size !== "1l" && size !== "1.75l") {
-      const ml = parseInt(size);
-      if (!isNaN(ml) && ml < 200) return false; // Explicit small size (50ml, 100ml)
-    }
-    const price = parsePrice(f.price);
-    if (price > 0 && price < MIN_BOTTLE_PRICE) return false; // Miniature price range
-    if (price > 0 && price > MAX_BOTTLE_PRICE) {
-      console.warn(`[filter] Rejected "${f.name}" at ${f.price} — exceeds $${MAX_BOTTLE_PRICE} ceiling`);
-      return false;
-    }
-    return true;
-  });
-}
+// EXCLUDE_TERMS, matchesBottle, dedupFound, parsePrice, filterMiniatures,
+// MIN_BOTTLE_PRICE, MAX_BOTTLE_PRICE all live in lib/match.js (re-exported above).
 
 // Hard timeout for async operations. Returns fallback value on timeout.
 function withTimeout(promise, ms, fallback) {
@@ -1861,65 +1813,8 @@ async function runWithConcurrency(tasks, limit) {
   await Promise.all(executing);
 }
 
-// Auto-detect Chrome version from the system binary to keep UA + Sec-CH-UA in sync
-// with the TLS fingerprint. Hardcoded versions drift when Chrome auto-updates,
-// creating a TLS-vs-UA mismatch that anti-bot systems specifically flag.
-const IS_MAC = process.platform === "darwin";
-
-// Synchronous version detection at module load — execFileSync is fast (<50ms)
-let CHROME_VERSION = "146";
-try {
-  if (IS_MAC) {
-    const { execFileSync } = await import("node:child_process");
-    const out = execFileSync("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", ["--version"], { timeout: 5000 }).toString().trim();
-    const match = out.match(/Chrome\s+(\d+)/);
-    if (match) CHROME_VERSION = match[1];
-  }
-} catch { /* use fallback */ }
-
-// Replicate Chromium's Sec-CH-UA GREASE algorithm (user_agent_utils.cc).
-// Each Chrome major version deterministically selects a grease brand name, version,
-// and entry ordering. Hardcoding a single brand string creates a version mismatch
-// signal when Chrome auto-updates — this function auto-matches any version.
-function getGreasedBrand(majorVersion) {
-  const chars = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
-  const versions = ["8", "99", "24"];
-  const orders = [[0,1,2], [0,2,1], [1,0,2], [1,2,0], [2,0,1], [2,1,0]];
-  const brand = `Not${chars[majorVersion % 11]}A${chars[(majorVersion + 1) % 11]}Brand`;
-  const ver = versions[majorVersion % 3];
-  const order = orders[majorVersion % 6];
-  const entries = [
-    `"${brand}";v="${ver}"`,
-    `"Chromium";v="${majorVersion}"`,
-    `"Google Chrome";v="${majorVersion}"`,
-  ];
-  return order.map(i => entries[i]).join(", ");
-}
-
-// Headers for fetch-based scrapers — property insertion order matches Chrome's HTTP/2
-// wire order. got-scraping's TransformHeadersAgent only sorts HTTP/1.1 headers; on H2,
-// Node's http2.request() sends headers in JS object iteration order (= insertion order).
-// Akamai pattern-matches header order as a zero-CPU bot signal — Client Hints before
-// User-Agent is critical. Platform-aware: macOS UA on Mac to match TLS fingerprint.
-const FETCH_HEADERS = {
-  "Sec-CH-UA": getGreasedBrand(Number(CHROME_VERSION)),
-  "Sec-CH-UA-Mobile": "?0",
-  "Sec-CH-UA-Platform": IS_MAC ? '"macOS"' : '"Windows"',
-  "Upgrade-Insecure-Requests": "1",
-  "User-Agent": IS_MAC
-    ? `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION}.0.0.0 Safari/537.36`
-    : `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION}.0.0.0 Safari/537.36`,
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-  "Sec-Fetch-Site": "cross-site",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-User": "?1",
-  "Sec-Fetch-Dest": "document",
-  "Cache-Control": "max-age=0",
-  "Accept-Encoding": "gzip, deflate",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Referer": "https://www.google.com/",
-  "priority": "u=0, i",
-};
+// IS_MAC, CHROME_VERSION, getGreasedBrand, FETCH_HEADERS live in lib/http.js
+// (imported and re-exported at the top of this file).
 
 // ─── Browser Management ──────────────────────────────────────────────────────
 
@@ -1947,11 +1842,7 @@ async function saveBrowserState(context) {
   } catch { /* best-effort */ }
 }
 
-// Use system Chrome on Mac for authentic TLS fingerprint (Playwright's bundled
-// Chromium has a recognizable TLS signature that Akamai/PerimeterX flag).
-const CHROME_PATH = IS_MAC
-  ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-  : null;
+// CHROME_PATH lives in lib/http.js (re-exported above).
 
 async function launchBrowser() {
   const launchOpts = {
@@ -2315,109 +2206,8 @@ async function newPage() {
 // ─── Retailer Scrapers ───────────────────────────────────────────────────────
 // Each scraper accepts a store object and returns an array of { name, url, price }.
 
-// Detect bot challenge/block pages that return HTTP 200 but no real content.
-// Returns true if the page appears to be a challenge, access denied, or CAPTCHA page.
-async function isBlockedPage(page) {
-  const title = await page.title().catch(() => "");
-  const lower = title.toLowerCase();
-  if (lower.includes("access denied") || lower.includes("robot") ||
-      lower.includes("captcha") || lower.includes("challenge") ||
-      lower.includes("blocked") || lower.includes("verify")) {
-    return true;
-  }
-  // Check body text for challenges that use normal-looking titles
-  const bodyText = String(await page.evaluate(() => document.body?.innerText?.slice(0, 5000) || "").catch(() => ""));
-  const bodyLower = bodyText.toLowerCase();
-  return bodyLower.includes("please verify") || bodyLower.includes("are you a robot") ||
-    bodyLower.includes("security check") || bodyLower.includes("one more step") ||
-    bodyLower.includes("checking your browser") || bodyLower.includes("press & hold");
-}
-
-// Detect and solve PerimeterX "Press & Hold" challenge.
-// PerimeterX renders the button via captcha.js inside #px-captcha — the "Press & Hold"
-// text is drawn by the script (canvas/shadow DOM), not as a regular DOM element.
-// Returns true if a challenge was found and solved, false otherwise.
-// Fixed-delay sleep — no jitter. Used in solveHumanChallenge where minimum hold
-// time matters and ±30% sleep jitter could drop below PerimeterX's threshold.
-// Still uses setTimeout so vitest fake timers work correctly.
-const rawSleep = sleep; // Alias; hold duration is set high enough to absorb jitter
-
-async function solveHumanChallenge(page) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const bodyText = String(await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || "").catch(() => ""));
-      if (!bodyText.includes("Press & Hold")) return false;
-
-      if (attempt === 0) console.log("[bot] Detected Press & Hold challenge — solving...");
-      else console.log("[bot] Retry attempt #2...");
-
-      /* v8 ignore start -- PerimeterX challenge solver requires real browser mouse/hold interactions */
-      const target = await page.waitForSelector("#px-captcha", { timeout: 5000 }).catch(() => null);
-      if (!target) {
-        console.warn("[bot] #px-captcha not found — cannot solve");
-        return false;
-      }
-      await rawSleep(1000 + Math.random() * 1000);
-
-      const box = await target.boundingBox();
-      if (!box) {
-        console.warn("[bot] #px-captcha has no bounding box");
-        if (attempt === 0) { await rawSleep(2000); continue; }
-        return false;
-      }
-
-      const cx = box.x + box.width / 2 + (Math.random() * 10 - 5);
-      const cy = box.y + box.height / 2 + (Math.random() * 6 - 3);
-      await page.mouse.move(cx, cy, { steps: 15 + Math.floor(Math.random() * 10) });
-      await rawSleep(300 + Math.random() * 400);
-
-      await page.mouse.down();
-      const holdMs = 14000 + Math.random() * 4000;
-      console.log(`[bot] Holding for ${(holdMs / 1000).toFixed(1)}s...`);
-
-      const microMoves = Math.floor(holdMs / 2000);
-      const moveInterval = holdMs / (microMoves + 1);
-      for (let m = 0; m < microMoves; m++) {
-        await rawSleep(moveInterval);
-        await page.mouse.move(
-          cx + (Math.random() * 4 - 2),
-          cy + (Math.random() * 4 - 2),
-          { steps: 2 },
-        ).catch(() => {});
-      }
-      await rawSleep(moveInterval);
-      await page.mouse.up();
-
-      await Promise.race([
-        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }),
-        rawSleep(15000),
-      ]).catch(() => {});
-      await rawSleep(1500 + Math.random() * 1000);
-
-      const stillBlocked = await page.evaluate(() =>
-        (document.body?.innerText || "").includes("Press & Hold"),
-      ).catch(() => true);
-
-      if (!stillBlocked) {
-        console.log("[bot] Challenge solved successfully");
-        return true;
-      }
-      if (attempt === 0) {
-        console.warn("[bot] Challenge still present — retrying with longer hold...");
-        await rawSleep(2000 + Math.random() * 2000);
-        continue;
-      }
-      console.warn("[bot] Challenge still present after 2 attempts");
-      /* v8 ignore stop */
-      return false;
-    } catch (err) {
-      console.warn(`[bot] Challenge solve error: ${err.message}`);
-      if (attempt === 0) { await rawSleep(2000).catch(() => {}); continue; }
-      return false;
-    }
-  }
-  return false;
-}
+// isBlockedPage / solveHumanChallenge live in lib/blocked.js — imported and re-exported
+// at the top of this file. See "Phase 2 modularization" in CLAUDE.md.
 
 // ─── Costco: fetch-first with browser fallback ──────────────────────────────
 // Costco search has no store filter — results are identical across warehouses.
@@ -2443,22 +2233,7 @@ function matchCostcoTiles($) {
   return found;
 }
 
-// Akamai/PerimeterX challenge patterns to detect blocked responses in fetch HTML.
-// Shared across all fetch paths (Costco, Walmart, Sam's Club).
-const FETCH_BLOCKED_PATTERNS = [
-  "Access Denied", "robot", "captcha",
-  "Request unsuccessful", "Incapsula",
-  "Enable JavaScript", "verify you are human",
-  "_ct_challenge", "px-captcha",
-  "Please verify", "security check",
-  "one more step", "checking your browser",
-];
-function isFetchBlocked(html) {
-  const lower = html.length > 10000 ? html.slice(0, 10000).toLowerCase() : html.toLowerCase();
-  return FETCH_BLOCKED_PATTERNS.some((p) => lower.includes(p.toLowerCase()));
-}
-// Backward-compatible alias for Costco-specific callers
-const isCostcoBlocked = isFetchBlocked;
+// FETCH_BLOCKED_PATTERNS / isFetchBlocked / isCostcoBlocked live in lib/blocked.js.
 
 // Try fetching Costco search HTML directly and parsing with cheerio (no browser needed).
 // Returns found[] on success, null if blocked by Akamai Bot Manager.
@@ -5799,19 +5574,22 @@ async function poll() {
 
 // ─── Exports (for testing) ────────────────────────────────────────────────────
 
+// Names re-exported from lib/bottles.js, lib/blocked.js, lib/match.js, lib/http.js
+// are NOT listed here — they're already re-exported at the top of this file via
+// `export { ... }` statements right after the corresponding `import`. Listing them
+// twice causes a "Duplicate export" error on raw Node ESM (vitest tolerates it).
 export {
-  SEARCH_QUERIES, TARGET_BOTTLES, CANARY_NAMES, CANARY_BY_RETAILER, isCanaryFor, RETAILERS, FETCH_HEADERS,
-  normalizeText, parseSize, parsePrice, matchesBottle, EXCLUDE_TERMS, MIN_BOTTLE_PRICE, MAX_BOTTLE_PRICE, filterMiniatures, dedupFound, getGreasedBrand, shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
+  RETAILERS,
+  shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
-  formatBottleLine, buildOOSList, truncateDescription, truncateTitle, DISCORD_DESC_LIMIT, DISCORD_TITLE_LIMIT, buildStoreEmbeds, buildSummaryEmbed, ULTRA_RARE_BOTTLES, IGNORED_BOTTLES, BOTTLE_INTEREST_TIERS, bottleInterestTier, rerunCadenceFor,
+  formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed, rerunCadenceFor,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   METRICS_FILE, appendMetrics, loadRecentMetrics, pruneMetrics, computeMetricsTrend, computePeakHours, detectHealthDegradation,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
-  IS_MAC, CHROME_VERSION, CHROME_PATH, launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, isBlockedPage, solveHumanChallenge, fetchRetry, scraperFetch, scraperFetchRetry,
+  launchBrowser, closeBrowser, closeRetailerBrowsers, newPage, loadBrowserState, saveBrowserState, scraperFetch, scraperFetchRetry,
   createProxyAgent, refreshProxySession, rotateRetailerProxy, getRetailerProxyUrl, isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
   PRIORITY_QUERIES, getQueriesForScan, shuffleKeepCanaryFirst, parsePollIntervalMs, getMTTime, isActiveHour, isBoostPeriod,
   shouldSkipRetailer, recordRetailerOutcome, prioritizeStores, loadKnownProducts, SEED_PRODUCT_URLS, checkWalmartKnownUrls, checkCostcoKnownUrls, checkCostcoKnownUrlsViaBrowser, checkTotalWineKnownUrls, navigateCategory, CATEGORY_URLS,
-  FETCH_BLOCKED_PATTERNS, isFetchBlocked, isCostcoBlocked,
   matchCostcoProductPage, matchCostcoTiles, scrapeCostcoViaFetch, scrapeCostcoOnce, scrapeCostcoStore,
   matchTotalWineInitialState, parseTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,

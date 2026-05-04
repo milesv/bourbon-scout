@@ -9,6 +9,9 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 11 ret
 - **`scripts/install-daemon.sh`** / **`scripts/uninstall-daemon.sh`** — Install/remove the launchd daemon.
 - **`browser-profiles/`** — Per-retailer persistent Chrome profile directories (auto-created). Contains HTTP cache, service workers, IndexedDB, visited history. Gitignored.
 - **`lib/bottles.js`** — Phase 1 of modularization. Pure data + pure functions: `SEARCH_QUERIES`, `TARGET_BOTTLES`, `CANARY_NAMES`, `CANARY_BY_RETAILER`, `isCanaryFor`, `BOTTLE_INTEREST_TIERS`, `ULTRA_RARE_BOTTLES`, `IGNORED_BOTTLES`, `bottleInterestTier`. Designed to be importable from any future per-retailer module without circular-import risk (no env-var reads, no network, no module state). `scraper.js` imports and re-exports these for backward compatibility with tests.
+- **`lib/blocked.js`** — Phase 2 of modularization. Bot-detection / block-page heuristics + PerimeterX challenge solver: `isBlockedPage`, `isFetchBlocked`, `isCostcoBlocked` (alias), `FETCH_BLOCKED_PATTERNS`, `solveHumanChallenge`. Inlines its own jittered `sleep` to stay dependency-free.
+- **`lib/match.js`** — Phase 2 of modularization. Bottle matching + price/size parsing + Discord title truncation: `normalizeText`, `EXCLUDE_TERMS`, `matchesBottle`, `parsePrice`, `dedupFound`, `parseSize`, `truncateTitle`, `DISCORD_TITLE_LIMIT`, `filterMiniatures`, `MIN_BOTTLE_PRICE`, `MAX_BOTTLE_PRICE`. Pure functions / pure constants.
+- **`lib/http.js`** — Phase 2 of modularization. HTTP fingerprint helpers: `IS_MAC`, `CHROME_VERSION` (auto-detected from system Chrome), `CHROME_PATH`, `getGreasedBrand`, `FETCH_HEADERS`, `fetchRetry`. `scraperFetch` / `scraperFetchRetry` stay in `scraper.js` because they're tightly coupled to the proxy-exhaustion state machine — future per-retailer modules import `FETCH_HEADERS` from here and call `scraperFetch` from scraper.js.
 - **`lib/geo.js`** — Zip-to-coordinates (`zipToCoords`) via zippopotam.us API and `haversine` distance calculation. No dependencies.
 - **`lib/discover-stores.js`** — Auto-discovers nearby stores for all retailers given a zip code and radius. Caches results to `stores.json` with a 7-day TTL. Uses vanilla `playwright-core` with `--disable-blink-features=AutomationControlled` for browser-based store locators and Kroger REST API for Kroger.
 - **`lib/fallback-stores.js`** — Static hardcoded store data for the 85283 area. `FALLBACK_STORES` used when browser-based store locators fail (e.g., CI datacenter IPs get blocked). `EXTRA_STORES` contains user-specified stores outside the discovery radius (e.g., Costco Scottsdale #427, Costco Paradise Valley #1058) — always merged after discovery, deduped by storeId.
@@ -243,15 +246,17 @@ When a retailer's store locator stops finding stores (selectors broke):
 
 `lib/bottles.js` extracts pure data + pure functions: `SEARCH_QUERIES`, `TARGET_BOTTLES`, `CANARY_NAMES`, `CANARY_BY_RETAILER`, `isCanaryFor`, `BOTTLE_INTEREST_TIERS`, `ULTRA_RARE_BOTTLES`, `IGNORED_BOTTLES`, `bottleInterestTier`. `scraper.js` imports + re-exports for backward-compat. Zero test changes; 907/907 green.
 
-### Phase 2 — shared HTTP + matching layer (planned)
+### Phase 2 — shared HTTP + matching layer — done ✅
 
-Extract three more pure-ish modules before touching any retailer:
+Three more pure-ish modules extracted, no behavior changes:
 
-1. **`lib/match.js`** — `matchesBottle`, `EXCLUDE_TERMS`, `normalizeText`, `dedupFound`, `parseSize`, `truncateTitle`, `filterMiniatures`, `MIN_BOTTLE_PRICE`, `MAX_BOTTLE_PRICE`. All pure functions or pure constants — same circular-import-safe profile as Phase 1.
-2. **`lib/http.js`** — `scraperFetch`, `scraperFetchRetry`, `fetchRetry`, `FETCH_HEADERS`, `getGreasedBrand`, `CHROME_VERSION`, `IS_MAC`. Reads env (proxy URL) but only at call time, not at import time. Exports a `getRetailerProxy(key)` getter rather than a frozen agent.
-3. **`lib/blocked.js`** — `isBlockedPage`, `isFetchBlocked`, `isCostcoBlocked`, plus `solveHumanChallenge`. Body-text heuristics — no env, no state.
+1. **`lib/blocked.js`** — `isBlockedPage`, `isFetchBlocked`, `isCostcoBlocked` (alias), `FETCH_BLOCKED_PATTERNS`, `solveHumanChallenge`. Body-text heuristics — no env, no state. Inlines its own jittered `sleep` to stay dependency-free.
+2. **`lib/match.js`** — `normalizeText`, `EXCLUDE_TERMS`, `matchesBottle`, `parsePrice`, `dedupFound`, `parseSize`, `truncateTitle`, `DISCORD_TITLE_LIMIT`, `filterMiniatures`, `MIN_BOTTLE_PRICE`, `MAX_BOTTLE_PRICE`. All pure functions or pure constants.
+3. **`lib/http.js`** — `IS_MAC`, `CHROME_VERSION` (auto-detected from system Chrome at import time, <50ms execFileSync), `CHROME_PATH`, `getGreasedBrand`, `FETCH_HEADERS`, `fetchRetry`. **Decision**: `scraperFetch` / `scraperFetchRetry` stayed in `scraper.js` rather than moving here because they're tightly coupled to the proxy-exhaustion state machine (`primaryProxyExhausted`, `failoverToBackupProxy`, `trackBandwidth`). Pulling that into a shared module would balloon the regression surface — future per-retailer modules import `FETCH_HEADERS` from here and call `scraperFetch` from scraper.js, which keeps proxy state in one place.
 
-After Phase 2, the per-retailer modules in Phase 3 will only need to import `lib/bottles.js`, `lib/match.js`, `lib/http.js`, `lib/blocked.js` + a small set of orchestration helpers (`trackHealth`, `acquireRetailerLock`, `getCachedCookies`, `cacheRetailerCookies`).
+After Phase 2, per-retailer modules in Phase 3 only need to import `lib/bottles.js`, `lib/match.js`, `lib/http.js`, `lib/blocked.js` + a small set of orchestration helpers (`trackHealth`, `acquireRetailerLock`, `getCachedCookies`, `cacheRetailerCookies`, plus `scraperFetch` itself).
+
+**Discovered + fixed during Phase 2**: the bottom test-export block in scraper.js (`export { ... }` at end of file) duplicated names already re-exported at the top via `export { ... } from "./lib/X.js"`. Vitest tolerates duplicate exports (esbuild dedups silently); raw Node ESM rejects with `Duplicate export of 'X'`. Phase 1 had quietly shipped with this bug — daemon hadn't restarted since the push. The Phase 2 commit fixes both phases by removing all moved names from the bottom export block.
 
 ### Phase 3 — per-retailer modules (planned)
 
