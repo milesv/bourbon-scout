@@ -166,7 +166,8 @@ Three diagnostic scripts in `scripts/` for ongoing health checks:
 
 | Script | When to run | What it does |
 |--------|-------------|--------------|
-| `node scripts/probe-waf.js [retailer]` | Weekly, or after a health-degradation alert | Probes each retailer's homepage and reports detected WAF cookies (Akamai `_abck`, Incapsula `incap_ses_*`, PerimeterX `_px*`). Surfaces WAF migrations BEFORE they cause weeks of silent failures. |
+| `node scripts/probe-waf.js [retailer]` | Weekly (or daily cron) | Probes each retailer's homepage and reports detected WAF cookies (Akamai `_abck`, Incapsula `incap_ses_*`, PerimeterX `_px*`). Persists state to `waf-state.json` and flags rotations between runs — surfaces WAF migrations the same day they happen. |
+| `node scripts/error-budget.js [--days=7]` | Weekly | Per-retailer 24h-vs-baseline success rate comparison. Flags retailers degrading >15pp from their week average with dominant failure-reason hints. |
 | `node scripts/analyze-drops.js [--days=14] [--retailer=kroger]` | Monthly | Mines `metrics.jsonl` for day-of-week × hour drop patterns. Top hit slots, per-retailer canary timeline, bottle first-appearance log. Used to validate boost-schedule tuning. |
 | `node scripts/audit-state.js [--fix] [--days=30]` | Quarterly | Audits `state.json` for stale entries, broken URLs, missing prices, orphaned stores, expired Reddit-spawned watch list entries. Read-only by default; `--fix` prunes stale watchlist entries. |
 | `node scripts/seasonal-patterns.js [--bottle=X]` | Quarterly / before drop seasons | Bottle × month heatmap from `metrics.jsonl`. Identifies BTAC/Pappy/EHT seasonal patterns from your own scan history; predicts likely drops in current and next month. |
@@ -180,7 +181,7 @@ The daemon also fires automatic Discord pings:
 
 ## Tests
 
-1682 tests across 5 files using [Vitest](https://vitest.dev/) (91.4% line coverage, 81.8% branch):
+895 tests across 5 files using [Vitest](https://vitest.dev/) (91.7% line coverage, 82.4% branch):
 
 ```sh
 npm test                # Run all tests

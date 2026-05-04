@@ -102,7 +102,9 @@ Allocated bourbon inventory scraper with Discord webhook alerts. Monitors 11 ret
 - **Graceful shutdown** — SIGTERM/SIGINT handler waits up to 60s for the current poll to finish before exiting. Prevents lost Discord alerts on `launchctl stop`. `shuttingDown` flag + interval check on `polling` state.
 - **Discord retry hardening** — `postDiscordWebhook` retries 5x on 429 rate limits, 5xx server errors, AND network errors (DNS, timeout, connection reset). A Pappy alert can't be lost to a transient Discord outage.
 - **Startup env validation** — `validateEnv()` checks `process.env` at startup and warns about missing DISCORD_WEBHOOK_URL, ZIP_CODE, Kroger/Safeway credentials, and proxy on non-Mac.
-- **Per-poll time budget** — 15-minute budget. If the main scan exceeds 12 min (< 3 min remaining), canary retries are skipped to prevent cascading delays into the next poll.
+- **Per-poll time budget** — 25-minute budget. The main scan is wrapped in `withTimeout(runWithConcurrency(tasks, 8), 25 * 60 * 1000, "POLL_TIMED_OUT")` — a hard kill that prevents browser-context cascades from producing 6+ hour scans (observed in May 2026 metrics: latest poll ran 21,295s before this fix). If the main scan exceeds 22 min (< 3 min remaining), canary retries are skipped to prevent cascading delays into the next poll. On hard timeout, partial data is preserved and a loud warning fires with granular reason counts so degradation alerts surface next scan.
+- **Page-closed bail-out in browser scrapers** — When `withTimeout` fires on a per-store scraper, the underlying loop kept calling `page.goto()` on a dead page, producing 30+ "Target page closed" errors per timeout. Each browser scraper (Sam's Club / Albertsons / Safeway) now checks `page.isClosed?.()` at the top of each iteration and breaks early. Defensive optional-chaining handles test mocks that don't implement `isClosed()`.
+- **TotalWine `parseTotalWineInitialState` helper** — Extracts the inline JS object from product page HTML. Two real-world wrinkles handled: (1) `</script>` inside JSON string values (brace-counting state machine), (2) JS literal `undefined` embedded in object values (regex `:\\s*undefined\\s*([,}\\]])` → `:null$1` before `JSON.parse`). Total Wine started doing #2 in 2026, silently breaking every known-URL re-check that used `JSON.parse` directly. Returns null on any failure rather than throwing.
 - **Watch list (human intelligence)** — `WATCH_LIST` array in scraper.js for rumored drops at specific stores. Each entry triggers a one-time @here Discord notification (gold embed) with store addresses and bottle list. `bottle` field is optional — omit for "Allocated Bourbon" which lists all tracked bottles at that retailer (respects per-retailer restrictions). Notification state persisted in `state.json._watchList`.
 - **Reddit intel scraper** — Monitors r/ArizonaWhiskey and r/arizonabourbon via Reddit's public JSON API (no auth, no proxy needed). Polls every scan for posts less than 2 hours old matching target bottle names, store names, and drop keywords (kok, btac, pappy, allocated, drop, etc). Sends @here gold Discord embed with post title, text, author, score, and matched keywords. Deduplicates via `state._redditSeen` (pruned to 7 days). Facebook's Arizona Bourbon Society group is private — requires manual relay via WATCH_LIST.
 
@@ -149,7 +151,7 @@ Blanton's (Original, Gold, SFTB, Special Reserve), Weller (Special Reserve, Anti
 
 ## Tests
 
-1682 tests across 5 files using Vitest (91.4% line coverage, 81.8% branch):
+895 tests across 5 files using Vitest (91.7% line coverage, 82.4% branch):
 
 | File | Tests | Focus |
 |------|-------|-------|
@@ -226,7 +228,8 @@ When a retailer's store locator stops finding stores (selectors broke):
 
 ## Auxiliary scripts
 
-- **`scripts/probe-waf.js [retailer]`** — Probes each retailer's homepage and inspects which WAF cookies get issued (Akamai `_abck`, Incapsula `incap_ses_*`, PerimeterX `_px*`). Detects WAF migrations BEFORE they cause weeks of silent canary-zero metrics. Run weekly or after a degradation alert.
+- **`scripts/probe-waf.js [retailer]`** — Probes each retailer's homepage and inspects which WAF cookies get issued (Akamai `_abck`, Incapsula `incap_ses_*`, PerimeterX `_px*`). Detects WAF migrations BEFORE they cause weeks of silent canary-zero metrics. Run weekly or after a degradation alert. Persists detected state to `waf-state.json` (gitignored) and flags rotations on every subsequent run — daily cron candidate.
+- **`scripts/error-budget.js [--days=7]`** — Per-retailer 24h-vs-baseline success rate. Flags retailers degrading >15pp from week average + dominant failure-reason hint (`waf` / `proxy` / `contract_drift` / etc.). Complements the acute health-degradation Discord alert with weekly-trend visibility.
 - **`scripts/analyze-drops.js [--days=14] [--retailer=kroger]`** — Reads `metrics.jsonl` and surfaces day-of-week × hour patterns where allocated bottles actually appear in stock. Top-15 drop-time slots ranked by hit rate; per-retailer canary health timeline; first-find timestamps per bottle. Used to validate boost-schedule tuning.
 - **`scripts/audit-state.js [--fix] [--days=30]`** — Audits `state.json` for stale entries, missing prices, broken URLs, orphaned stores, expired Reddit-spawned watch list entries. Read-only by default; `--fix` applies automatic repairs (currently: prune stale watch list entries).
 - **`scripts/seasonal-patterns.js [--bottle=X] [--days=365]`** — Bottle × month heatmap from `metrics.jsonl`. Surfaces drop windows for specific bottles (BTAC in Oct, KoK quarterly, etc.). Top-3 peak months per bottle + boost-window predictions for current/next month. Useful for tuning advance hunting strategy.
