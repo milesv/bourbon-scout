@@ -1227,6 +1227,12 @@ function updateStoreState(state, retailerKey, storeId, currentFound) {
 
 function pruneState(state, activeStores) {
   for (const retailerKey of Object.keys(state)) {
+    // Reserved top-level keys are non-retailer tracking data that must survive
+    // pruning (Reddit dedup, watchlist, Walgreens FP detection, etc.). Established
+    // convention: anything starting with `_` is a tracking key, not a retailer.
+    // Without this guard, _redditSeen / _watchList / _redditMentions get nuked
+    // every poll and only survive because they're re-populated immediately.
+    if (retailerKey.startsWith("_")) continue;
     if (!activeStores[retailerKey]) {
       delete state[retailerKey];
       continue;
@@ -3490,19 +3496,27 @@ async function scrapeWalgreensViaBrowser(page) {
   await navigateCategory(page, "walgreens");
   console.log(`[walgreens] Pre-warm done (${wgElapsed()}), starting queries...`);
 
+  // #1 — Tightened primary selector (drop [data-testid*='product']). The broad
+  // pattern matched related-product carousels and "customers also viewed"
+  // recommendations as if they were search results, which leaked catalog ghosts
+  // (e.g. Weller Antique 107) as in-stock at AZ stores that don't carry liquor.
+  // Restricted to the search-result card classes Walgreens has used since 2023.
+  const STRICT_SELECTOR = ".card__product, [class*='card__product']";
+  const BROAD_SELECTOR = ".card__product, [class*='card__product'], [data-testid*='product']";
+
   let wgConsecutiveBlocks = 0;
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
     if (wgConsecutiveBlocks >= 4) { trackHealth("walgreens", "blocked"); continue; }
     const url = `https://www.walgreens.com/search/results.jsp?Ntt=${encodeURIComponent(query)}`;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
-      await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 8000 }).catch(() => {});
+      await page.waitForSelector(STRICT_SELECTOR, { timeout: 8000 }).catch(() => {});
 
       if (await isBlockedPage(page)) {
         const solved = await solveHumanChallenge(page);
         if (solved) {
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-          await page.waitForSelector(".card__product, [class*='card__product'], [data-testid*='product']", { timeout: 8000 }).catch(() => {});
+          await page.waitForSelector(STRICT_SELECTOR, { timeout: 8000 }).catch(() => {});
         }
         if (!solved || (await isBlockedPage(page))) {
           console.warn(`[walgreens] Bot detection page for query "${query}" — skipping`);
@@ -3512,25 +3526,52 @@ async function scrapeWalgreensViaBrowser(page) {
         }
       }
 
+      // Divergence telemetry: count cards under both selectors. If broad >> strict
+      // for a sustained period, Walgreens may have redesigned and we need to widen
+      // STRICT_SELECTOR. Logged but non-blocking.
+      try {
+        const counts = await page.$$eval(BROAD_SELECTOR, (cards, strictSel) => {
+          const broad = cards.length;
+          const strict = cards.filter((el) => el.matches(strictSel)).length;
+          return { broad, strict };
+        }, STRICT_SELECTOR).catch(() => null);
+        if (counts && counts.broad > counts.strict + 2) {
+          console.warn(`[walgreens] Selector divergence on "${query}": strict=${counts.strict} broad=${counts.broad} — possible UI redesign?`);
+        }
+      } catch { /* telemetry only */ }
+
       const products = await page.$$eval(
-        ".card__product, [class*='card__product'], [data-testid*='product']",
+        STRICT_SELECTOR,
         /* v8 ignore start -- browser-only DOM callback */
         (cards) =>
           cards.map((el) => {
             const text = (el.textContent || "").toLowerCase();
+            // #2 — Positive in-stock evidence. Real product cards on a stocked
+            // item have a fulfillment cue (Pickup / Add to cart / Same-day);
+            // catalog-ghost or carousel cards have NONE. Flipping the logic from
+            // "absent OOS text → assume in-stock" to "must show explicit pickup
+            // / cart cue" eliminates the carousel-leak class of false positive.
+            const hasPositiveSignal =
+              text.includes("pickup") ||
+              text.includes("add to cart") ||
+              text.includes("buy now") ||
+              text.includes("same-day") ||
+              text.includes("in stock") ||
+              el.querySelector('[data-availability="in_stock"]') !== null ||
+              el.querySelector('button[class*="add-to-cart"]:not([disabled])') !== null ||
+              el.querySelector('button[class*="bopis"]:not([disabled])') !== null;
             return {
               title: (el.querySelector(".product__title, [class*='product__title'], [class*='productTitle']") || {}).textContent?.trim() || "",
               price: (el.querySelector(".product__price-contain, [class*='product__price'], [class*='productPrice']") || {}).textContent?.trim() || "",
               url: (el.querySelector('a[href*="ID="], a[href*="/store/product/"]') || {}).href || "",
               // Match multiple OOS/unconfirmed text variants to survive copy changes.
-              // "price available in store" = catalog listing with no confirmed stock
-              // (calling stores revealed they don't even carry liquor).
               outOfStock: text.includes("not sold at your store") ||
                           text.includes("not available at this store") ||
                           text.includes("out of stock") ||
                           text.includes("unavailable") ||
                           text.includes("price available in store") ||
                           text.includes("check your local store"),
+              hasPositiveSignal,
             };
           })
         /* v8 ignore stop */
@@ -3542,6 +3583,12 @@ async function scrapeWalgreensViaBrowser(page) {
         // means Walgreens can't confirm stock online. Reduces false positives.
         const priceText = (p.price || "").toLowerCase();
         if (!priceText || priceText.includes("available in store") || priceText.includes("check your")) continue;
+        // #2 — Require positive in-stock evidence. Tests that mock the products
+        // array without setting hasPositiveSignal default to true (back-compat).
+        if (p.hasPositiveSignal === false) {
+          console.log(`[walgreens] Skipping "${(p.title || "").slice(0, 60)}" — no positive in-stock signal (likely catalog ghost)`);
+          continue;
+        }
         for (const bottle of TARGET_BOTTLES) {
           if (matchesBottle(p.title, bottle, "walgreens")) {
             const idMatch = p.url.match(/ID=(\w+)/);
@@ -3566,6 +3613,77 @@ async function scrapeWalgreensViaBrowser(page) {
     await sleep(2000 + Math.random() * 2000);
   }
   return dedupFound(found);
+}
+
+// #5 — PDP fallback verification. After search-results matching, navigate to each
+// candidate's product detail page and read the in-store availability widget.
+// Three outcomes:
+//   negative-only  → suppress (PDP explicitly says "not sold in stores")
+//   ambiguous      → demote to lead (no clear positive cue, but no clear negative)
+//   positive       → keep (confirmed in-store available)
+//   page error     → keep with original confidence (don't suppress on errors;
+//                     we'd rather false-positive than miss a real find)
+//
+// Bounded by per-find sleep + outer withTimeout so it can't run away. Walgreens
+// historically produces 0-1 candidates per scan, so the budget impact is small.
+const WG_PDP_NEGATIVE = [
+  "not sold in stores",
+  "not sold at this store",
+  "not available in stores",
+  "online only",
+  "ships to home only",
+  "shipping only",
+  "this item is not currently available",
+];
+const WG_PDP_POSITIVE = [
+  "pickup available",
+  "available at this store",
+  "available for pickup",
+  "available for same-day pickup",
+  "in stock at",
+  "ready in",
+];
+
+async function verifyWalgreensFindsViaPDP(page, finds) {
+  if (!finds || finds.length === 0) return finds;
+  // Only verify non-canary, URL-bearing finds; pass everything else through.
+  const verified = [];
+  for (const find of finds) {
+    if (!find.url || isCanaryFor("walgreens", find.name)) {
+      verified.push(find);
+      continue;
+    }
+    try {
+      await page.goto(find.url, { waitUntil: "domcontentloaded", timeout: 12000 });
+      await page.waitForSelector("body", { timeout: 5000 }).catch(() => {});
+      if (await isBlockedPage(page)) {
+        console.log(`[walgreens-pdp] ${find.name}: blocked, keeping original`);
+        verified.push(find);
+        continue;
+      }
+      const bodyText = String(
+        await page.evaluate(() => document.body?.innerText?.slice(0, 8000) || "").catch(() => ""),
+      ).toLowerCase();
+      const hasNegative = WG_PDP_NEGATIVE.some((s) => bodyText.includes(s));
+      const hasPositive = WG_PDP_POSITIVE.some((s) => bodyText.includes(s));
+      if (hasNegative && !hasPositive) {
+        console.log(`[walgreens-pdp] ${find.name}: PDP says not sold in stores → suppressing`);
+        continue; // suppress entirely
+      }
+      if (hasPositive) {
+        console.log(`[walgreens-pdp] ${find.name}: PDP confirms in-store availability`);
+        verified.push({ ...find, _pdpVerified: "confirmed" });
+      } else {
+        console.log(`[walgreens-pdp] ${find.name}: PDP ambiguous → demoting to lead`);
+        verified.push({ ...find, confidence: "lead", _pdpVerified: "ambiguous" });
+      }
+    } catch (err) {
+      console.warn(`[walgreens-pdp] ${find.name}: verification failed (${err.message}) — keeping original`);
+      verified.push(find);
+    }
+    await sleep(1500 + Math.random() * 1500);
+  }
+  return verified;
 }
 
 // Wrapper: browser-only (no fetch-first — Akamai blocks direct HTTP).
@@ -3611,6 +3729,17 @@ async function scrapeWalgreensStore() {
       if (wgHealth && wgHealth.blocked > 0 && wgHealth.blocked >= wgHealth.queries / 2 && attempt === 0) {
         console.warn(`[walgreens] ${wgHealth.blocked}/${wgHealth.queries} queries blocked — retrying`);
         continue; // finally{} closes page
+      }
+      // #5 — PDP verification. Only when finds exist; bounded so it can't run
+      // away (60s outer cap; per-find timeouts inside the helper). Returns the
+      // original find list on hard timeout to preserve "fail open" behavior.
+      if (result && result.length > 0) {
+        const verified = await withTimeout(
+          verifyWalgreensFindsViaPDP(page, result),
+          60000,
+          result,
+        );
+        return verified;
       }
       return result;
     } finally {
@@ -4019,6 +4148,77 @@ function classifyKrogerFind(product, item) {
     facings: facings || null,
     dataAgeDays: ageDays,
   };
+}
+
+// ─── Walgreens False-Positive Defense ────────────────────────────────────────
+// Empirically, Walgreens has produced ZERO real allocated bottle finds in the
+// daemon's lifetime — only false positives, almost all "Weller Antique 107"
+// catalog ghosts repeating across the same 4 stores. The DOM-level fixes
+// (#1 selector tightening, #2 positive in-stock evidence) cut the obvious
+// leak; these state-aware checks downgrade the residual risk to LEAD instead
+// of @here-pinging the user to call stores that don't carry liquor.
+//
+// Two demotion criteria, EITHER triggers lead:
+//   #3 repeat-find: this bottle has been "newly found" at Walgreens 3+ times in
+//      the last 30 days. Real allocated drops don't recur — the canonical
+//      catalog ghost cycles in/out of state.json as the page rendering varies.
+//   #6 cross-bottle freshness: Walgreens has had no non-canary find in 14+ days.
+//      Treats a sudden "first non-canary find in 2 weeks" as suspicious; the
+//      retailer either carries nothing rare (default) or the scraper is hitting
+//      a transient DOM artifact.
+//
+// Both checks use top-level `state._walgreensFpTracking` (survives pruneState
+// via the `_`-prefix guard added in pruneState).
+const WG_FP_WINDOW_MS = 30 * 86400000;  // 30 days — repeat-find lookback
+const WG_FP_THRESHOLD = 3;              // 3+ events → demote
+const WG_FRESHNESS_WINDOW_MS = 14 * 86400000; // 14 days — non-canary drought
+const WG_FP_HISTORY_CAP = 50;           // Cap per-bottle history to avoid bloat
+
+function applyWalgreensConfidenceDemotion(finds, state) {
+  if (!finds || finds.length === 0) return finds;
+  const tracking = state._walgreensFpTracking || {};
+  const fpHistory = tracking.fpHistory || {};
+  const lastNonCanaryTs = tracking.lastNonCanaryFind
+    ? new Date(tracking.lastNonCanaryFind).getTime()
+    : 0;
+  const now = Date.now();
+  const noRecentNonCanary = lastNonCanaryTs === 0 || (now - lastNonCanaryTs) > WG_FRESHNESS_WINDOW_MS;
+
+  return finds.map((find) => {
+    if (isCanaryFor("walgreens", find.name)) return find;
+    const events = (fpHistory[find.name] || []).filter(
+      (ts) => now - new Date(ts).getTime() < WG_FP_WINDOW_MS,
+    );
+    const repeatGhost = events.length >= WG_FP_THRESHOLD;
+    if (repeatGhost || noRecentNonCanary) {
+      const reason = repeatGhost
+        ? `repeat-find suspect (${events.length}× in 30d)`
+        : `first non-canary find in ${Math.floor((now - lastNonCanaryTs) / 86400000)}+ days`;
+      console.log(`[walgreens] Demoting "${find.name}" to lead — ${reason}`);
+      return { ...find, confidence: "lead", _wgDemotionReason: reason };
+    }
+    return find;
+  });
+}
+
+// Update the FP-tracking ledger for Walgreens. Append a timestamp for each
+// non-canary find and refresh the lastNonCanaryFind cursor. Capped per-bottle
+// to avoid unbounded growth in state.json.
+function recordWalgreensFpEvent(state, finds) {
+  if (!finds || finds.length === 0) return;
+  const nonCanaryFinds = finds.filter((b) => !isCanaryFor("walgreens", b.name));
+  if (nonCanaryFinds.length === 0) return;
+
+  if (!state._walgreensFpTracking) state._walgreensFpTracking = {};
+  if (!state._walgreensFpTracking.fpHistory) state._walgreensFpTracking.fpHistory = {};
+  const now = new Date().toISOString();
+  for (const b of nonCanaryFinds) {
+    const list = state._walgreensFpTracking.fpHistory[b.name] || [];
+    list.push(now);
+    if (list.length > WG_FP_HISTORY_CAP) list.splice(0, list.length - WG_FP_HISTORY_CAP);
+    state._walgreensFpTracking.fpHistory[b.name] = list;
+  }
+  state._walgreensFpTracking.lastNonCanaryFind = now;
 }
 
 // Build a Kroger product URL from the API's `productPageURI` (slug-based, e.g.
@@ -5241,7 +5441,16 @@ async function poll() {
       canaryResults[retailer.key] = true;
       console.log(`[${retailer.key}:${store.storeId}] 🐤 Canary found (${inStock.filter((b) => isCanaryFor(retailer.key, b.name)).map((b) => b.name).join(", ")})`);
     }
-    const realInStock = inStock.filter((b) => !isCanaryFor(retailer.key, b.name));
+    let realInStock = inStock.filter((b) => !isCanaryFor(retailer.key, b.name));
+
+    // Walgreens-specific FP defense (#3 + #6): demote chronic catalog ghosts
+    // and stale-retailer first-finds to lead so they fire quiet alerts instead
+    // of @here pings. Tracking ledger updated AFTER this scan's emission so the
+    // current scan's events influence the NEXT scan's confidence (correct
+    // ordering — otherwise every find would self-demote on its own emission).
+    if (retailer.key === "walgreens") {
+      realInStock = applyWalgreensConfidenceDemotion(realInStock, state);
+    }
 
     // Cross-source confirmation: if a Reddit post in the last 4 hours mentioned the
     // bottle, mark this find as "double-confirmed" (highest signal — both human
@@ -5258,6 +5467,13 @@ async function poll() {
     const previousStore = state[retailer.key]?.[store.storeId];
     const changes = computeChanges(previousStore, realInStock);
     updateStoreState(state, retailer.key, store.storeId, realInStock);
+
+    // Update Walgreens FP-tracking ledger (post-emission) so the NEXT scan can
+    // demote based on this scan's events. Ordering matters: applyWalgreens...
+    // must run BEFORE this update or every find self-demotes.
+    if (retailer.key === "walgreens" && changes.newFinds.length > 0) {
+      recordWalgreensFpEvent(state, changes.newFinds);
+    }
     storesScanned++;
     retailersSeen.add(retailer.key);
     scannedStores.push({ retailerName: retailer.name, storeName: store.name, storeId: store.storeId });
@@ -5598,7 +5814,7 @@ export {
   matchAlbertsonsProducts, scrapeAlbertsonsViaFetch, scrapeAlbertsonsViaBrowser, scrapeAlbertsonsStore, ALBERTSONS_KEY,
   matchCityHiveProducts, fetchCityHiveCategory, makeCityHiveScraper, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
   scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
-  scrapeWalgreensViaBrowser, scrapeWalgreensStore,
+  scrapeWalgreensViaBrowser, scrapeWalgreensStore, applyWalgreensConfidenceDemotion, recordWalgreensFpEvent, verifyWalgreensFindsViaPDP, WG_PDP_NEGATIVE, WG_PDP_POSITIVE,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   trackHealth, HEALTH_REASONS, trackBandwidth, retailerKeyForUrl,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,

@@ -88,7 +88,7 @@ import {
   matchAlbertsonsProducts, scrapeAlbertsonsStore, ALBERTSONS_KEY,
   matchCityHiveProducts, makeCityHiveScraper, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
   scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
-  scrapeWalgreensViaBrowser, scrapeWalgreensStore,
+  scrapeWalgreensViaBrowser, scrapeWalgreensStore, applyWalgreensConfidenceDemotion, recordWalgreensFpEvent, verifyWalgreensFindsViaPDP,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
   KROGER_PRODUCTS, checkKrogerKnownProducts, verifyKrogerCandidatesViaWebsite,
   trackHealth, HEALTH_REASONS, trackBandwidth, retailerKeyForUrl,
@@ -1813,6 +1813,22 @@ describe("pruneState", () => {
     pruneState(state, { costco: [{ storeId: "100" }] });
     expect(state).toEqual({});
   });
+
+  it("preserves _-prefixed top-level tracking keys (Reddit, watchlist, Walgreens FP)", () => {
+    const state = {
+      costco: { "100": { bottles: {}, lastScanned: "2024-01-01" } },
+      _redditMentions: { "Pappy Van Winkle 15 Year": "2024-01-01T00:00:00Z" },
+      _redditSeen: { "abc123": "2024-01-01" },
+      _watchList: { "kroger:Higley:Pappy 15": "2024-01-01" },
+      _walgreensFpTracking: { fpHistory: { "Weller Antique 107": ["t1", "t2"] }, lastNonCanaryFind: "t1" },
+    };
+    pruneState(state, { costco: [{ storeId: "100" }] });
+    expect(state.costco).toBeDefined();
+    expect(state._redditMentions).toBeDefined();
+    expect(state._redditSeen).toBeDefined();
+    expect(state._watchList).toBeDefined();
+    expect(state._walgreensFpTracking).toBeDefined();
+  });
 });
 
 describe("postDiscordWebhook", () => {
@@ -3466,6 +3482,236 @@ describe("scrapeWalgreensViaBrowser", () => {
     expect(result).toEqual([]);
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to resolve zip"));
     warnSpy.mockRestore();
+  });
+
+  it("(#2) skips products without positive in-stock signal (catalog ghost)", async () => {
+    const page = createWalgreensPage([
+      {
+        title: "Weller Antique 107 750ml",
+        price: "$45.99",
+        url: "https://www.walgreens.com/store/c/weller/ID=300463000-product",
+        outOfStock: false,
+        hasPositiveSignal: false, // catalog ghost: no pickup/cart cue
+      },
+    ]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const result = await runWithFakeTimers(() => scrapeWalgreensViaBrowser(page));
+    expect(result).toEqual([]);
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("no positive in-stock signal"),
+    );
+    logSpy.mockRestore();
+  });
+
+  it("(#2) keeps products with positive in-stock signal", async () => {
+    const page = createWalgreensPage([
+      {
+        title: "Weller Antique 107 750ml",
+        price: "$45.99",
+        url: "https://www.walgreens.com/store/c/weller/ID=300463000-product",
+        outOfStock: false,
+        hasPositiveSignal: true,
+      },
+    ]);
+    const result = await runWithFakeTimers(() => scrapeWalgreensViaBrowser(page));
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("Weller Antique 107");
+  });
+});
+
+describe("applyWalgreensConfidenceDemotion (#3 + #6)", () => {
+  it("returns finds unchanged when no tracking history exists", () => {
+    const finds = [{ name: "Pappy Van Winkle 15 Year", price: "$129", url: "x" }];
+    const state = {};
+    const result = applyWalgreensConfidenceDemotion(finds, state);
+    // No lastNonCanaryFind → freshness check fires → demoted to lead
+    // (this is correct: a Walgreens find with zero history is suspicious)
+    expect(result[0].confidence).toBe("lead");
+    expect(result[0]._wgDemotionReason).toMatch(/first non-canary find/);
+  });
+
+  it("(#6) demotes to lead when no non-canary find in 14+ days", () => {
+    const finds = [{ name: "Eagle Rare 17 Year", price: "$200", url: "x" }];
+    const oldTs = new Date(Date.now() - 20 * 86400000).toISOString();
+    const state = {
+      _walgreensFpTracking: { lastNonCanaryFind: oldTs, fpHistory: {} },
+    };
+    const result = applyWalgreensConfidenceDemotion(finds, state);
+    expect(result[0].confidence).toBe("lead");
+    expect(result[0]._wgDemotionReason).toMatch(/first non-canary find/);
+  });
+
+  it("(#6) keeps confirmed when last non-canary find is recent", () => {
+    const finds = [{ name: "Eagle Rare 17 Year", price: "$200", url: "x" }];
+    const recentTs = new Date(Date.now() - 2 * 86400000).toISOString();
+    const state = {
+      _walgreensFpTracking: { lastNonCanaryFind: recentTs, fpHistory: {} },
+    };
+    const result = applyWalgreensConfidenceDemotion(finds, state);
+    expect(result[0].confidence).toBeUndefined();
+    expect(result[0]._wgDemotionReason).toBeUndefined();
+  });
+
+  it("(#3) demotes to lead when 3+ events in 30d", () => {
+    const finds = [{ name: "Weller Antique 107", price: "$45", url: "x" }];
+    const recent = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const state = {
+      _walgreensFpTracking: {
+        lastNonCanaryFind: recent(1), // freshness OK
+        fpHistory: {
+          "Weller Antique 107": [recent(28), recent(14), recent(2)], // 3 in 30d
+        },
+      },
+    };
+    const result = applyWalgreensConfidenceDemotion(finds, state);
+    expect(result[0].confidence).toBe("lead");
+    expect(result[0]._wgDemotionReason).toMatch(/repeat-find/);
+  });
+
+  it("(#3) ignores events outside 30d window", () => {
+    const finds = [{ name: "Weller Antique 107", price: "$45", url: "x" }];
+    const old = (n) => new Date(Date.now() - n * 86400000).toISOString();
+    const state = {
+      _walgreensFpTracking: {
+        lastNonCanaryFind: old(1),
+        fpHistory: {
+          "Weller Antique 107": [old(45), old(40), old(35)], // all > 30d
+        },
+      },
+    };
+    const result = applyWalgreensConfidenceDemotion(finds, state);
+    expect(result[0].confidence).toBeUndefined();
+  });
+
+  it("never demotes canary bottles", () => {
+    const finds = [{ name: "Buffalo Trace", price: "$30", url: "x" }];
+    const state = {}; // no tracking → freshness would normally fire
+    const result = applyWalgreensConfidenceDemotion(finds, state);
+    expect(result[0].confidence).toBeUndefined(); // canary passes through
+  });
+
+  it("handles empty input", () => {
+    expect(applyWalgreensConfidenceDemotion([], {})).toEqual([]);
+    expect(applyWalgreensConfidenceDemotion(null, {})).toEqual(null);
+  });
+});
+
+describe("recordWalgreensFpEvent (#3 + #6 ledger)", () => {
+  it("initializes tracking on empty state", () => {
+    const state = {};
+    recordWalgreensFpEvent(state, [{ name: "Weller Antique 107" }]);
+    expect(state._walgreensFpTracking).toBeDefined();
+    expect(state._walgreensFpTracking.fpHistory["Weller Antique 107"]).toHaveLength(1);
+    expect(state._walgreensFpTracking.lastNonCanaryFind).toBeDefined();
+  });
+
+  it("appends timestamps for repeat finds of same bottle", () => {
+    const state = {};
+    recordWalgreensFpEvent(state, [{ name: "Weller Antique 107" }]);
+    recordWalgreensFpEvent(state, [{ name: "Weller Antique 107" }]);
+    recordWalgreensFpEvent(state, [{ name: "Weller Antique 107" }]);
+    expect(state._walgreensFpTracking.fpHistory["Weller Antique 107"]).toHaveLength(3);
+  });
+
+  it("skips canary bottles in ledger", () => {
+    const state = {};
+    recordWalgreensFpEvent(state, [{ name: "Buffalo Trace" }]);
+    expect(state._walgreensFpTracking).toBeUndefined();
+  });
+
+  it("caps per-bottle history at 50 entries", () => {
+    const state = {};
+    for (let i = 0; i < 60; i++) {
+      recordWalgreensFpEvent(state, [{ name: "Weller Antique 107" }]);
+    }
+    expect(state._walgreensFpTracking.fpHistory["Weller Antique 107"]).toHaveLength(50);
+  });
+
+  it("does nothing for empty/null finds", () => {
+    const state = {};
+    recordWalgreensFpEvent(state, []);
+    recordWalgreensFpEvent(state, null);
+    expect(state._walgreensFpTracking).toBeUndefined();
+  });
+});
+
+describe("verifyWalgreensFindsViaPDP (#5)", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  // Same pattern as scrapeWalgreensViaBrowser tests: kicks the verification
+  // forward through the fake-timer-backed sleep() between PDP loads.
+  async function runPdp(fn) {
+    const promise = fn();
+    promise.catch(() => {});
+    await vi.runAllTimersAsync();
+    return promise;
+  }
+
+  function createPdpPage(bodyText) {
+    const page = createMockPage();
+    page.title.mockResolvedValue("Walgreens");
+    page.evaluate.mockImplementation(async () => bodyText);
+    return page;
+  }
+
+  it("suppresses find when PDP says 'not sold in stores'", async () => {
+    const page = createPdpPage("This product is not sold in stores. Online only.");
+    const finds = [{ name: "Weller Antique 107", url: "https://w/p" }];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const result = await runPdp(() => verifyWalgreensFindsViaPDP(page, finds));
+    expect(result).toEqual([]);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("suppressing"));
+    logSpy.mockRestore();
+  });
+
+  it("keeps find with positive PDP signal", async () => {
+    const page = createPdpPage("Pickup available at your local Walgreens. Add to cart.");
+    const finds = [{ name: "Weller Antique 107", url: "https://w/p" }];
+    const result = await runPdp(() => verifyWalgreensFindsViaPDP(page, finds));
+    expect(result).toHaveLength(1);
+    expect(result[0]._pdpVerified).toBe("confirmed");
+  });
+
+  it("demotes to lead on ambiguous PDP signal", async () => {
+    const page = createPdpPage("Some product description with no clear stock signal.");
+    const finds = [{ name: "Weller Antique 107", url: "https://w/p" }];
+    const result = await runPdp(() => verifyWalgreensFindsViaPDP(page, finds));
+    expect(result).toHaveLength(1);
+    expect(result[0].confidence).toBe("lead");
+    expect(result[0]._pdpVerified).toBe("ambiguous");
+  });
+
+  it("keeps original on page error", async () => {
+    const page = createPdpPage("");
+    page.goto.mockRejectedValue(new Error("Navigation timeout"));
+    const finds = [{ name: "Weller Antique 107", url: "https://w/p" }];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await runPdp(() => verifyWalgreensFindsViaPDP(page, finds));
+    expect(result).toHaveLength(1);
+    expect(result[0]._pdpVerified).toBeUndefined();
+    warnSpy.mockRestore();
+  });
+
+  it("passes canary finds through unchanged", async () => {
+    const page = createPdpPage("not sold in stores"); // would normally suppress
+    const finds = [{ name: "Buffalo Trace", url: "https://w/p" }];
+    const result = await runPdp(() => verifyWalgreensFindsViaPDP(page, finds));
+    expect(result).toHaveLength(1); // canary survives despite negative PDP
+  });
+
+  it("passes URL-less finds through unchanged", async () => {
+    const page = createPdpPage("not sold in stores");
+    const finds = [{ name: "Weller Antique 107", url: "" }];
+    const result = await runPdp(() => verifyWalgreensFindsViaPDP(page, finds));
+    expect(result).toHaveLength(1);
+    expect(result[0]._pdpVerified).toBeUndefined();
+  });
+
+  it("returns empty/null inputs unchanged", async () => {
+    const page = createPdpPage("");
+    expect(await runPdp(() => verifyWalgreensFindsViaPDP(page, []))).toEqual([]);
+    expect(await runPdp(() => verifyWalgreensFindsViaPDP(page, null))).toEqual(null);
   });
 });
 
