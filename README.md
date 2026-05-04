@@ -84,6 +84,7 @@ SAFEWAY_API_KEY=
 | `BACKUP_PROXY_URL` | No | Backup proxy URL (e.g. IPRoyal). Used by retailers listed in `BACKUP_PROXY_RETAILERS` when primary proxy IPs are burned. |
 | `BACKUP_PROXY_RETAILERS` | No | Comma-separated retailer keys to route through backup proxy (e.g. `costco,totalwine`). |
 | `SECONDARY_ZIPS` | No | Additional zip codes for store discovery (e.g. `85054,85260`). Stores merged with primary, deduped by ID. |
+| `HEALTHCHECK_URL` | No | Liveness ping URL (e.g. healthchecks.io). Daemon GETs the URL after each successful poll; external service emails/notifies if pings stop. Catches daemon crashes within ~90 min. Free for 20 checks. |
 
 Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, all scrapers fall back to browser-only mode. With `PROXY_URL` set, each retailer gets its own sticky session IP and `got-scraping` fetch-first paths use Chrome TLS fingerprint impersonation for faster, lighter scraping. All browser fallbacks use clean Chrome (no stealth plugin — it's counterproductive) with `headless: false` on Mac. Queries use priority-based rotation — high-value bottles (BTAC, Pappy, Taylor, Michter's) are checked every scan while lower-priority queries alternate, with human-like pacing to reduce bot detection signals. Retailers that fail 3+ consecutive scans are automatically backed off for 30 minutes.
 
@@ -128,6 +129,17 @@ Four types of color-coded embeds with per-retailer SKU/item numbers and rich sto
 **🔵 Still Available** (blue, quiet)
 - Re-alert for bottles that remain in stock across multiple scans
 - Sent every N scans (configurable via `REALERT_EVERY_N_SCANS`, default 4)
+
+**💰 Price Change** (purple, quiet)
+- Triggered when a bottle's price moves ≥10% between scans
+- Shows drops with strikethrough (~~$80~~ → **$60**, -25%) — surfaces clearance events
+- Shows rises (+25%) — sometimes signals fresh-allocation spike pricing
+- Uses `priceHistory` we record per bottle per store
+
+**🎯 Also At — Multi-Store Consolidated** (green, quiet, end-of-scan)
+- When the same bottle is found at 2+ stores in one scan, the FIRST detection fires immediately as urgent @here.
+- Subsequent stores get buffered and ONE consolidated embed fires at end of poll listing all secondary store addresses + Maps links.
+- Cuts Discord noise during boost windows when allocations hit several Marketplace Fry's at once.
 
 **🟣 Scan Summary** (purple, quiet)
 - Posted after every scan with counts: new finds, still in stock, went OOS, nothing found
@@ -181,7 +193,7 @@ The daemon also fires automatic Discord pings:
 
 ## Tests
 
-895 tests across 5 files using [Vitest](https://vitest.dev/) (91.7% line coverage, 82.4% branch):
+907 tests across 5 files using [Vitest](https://vitest.dev/) (90.75% line coverage, 81.6% branch):
 
 ```sh
 npm test                # Run all tests
