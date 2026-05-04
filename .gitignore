@@ -8,6 +8,7 @@ browser-profiles/
 browser-state.json
 watchlist.json
 waf-state.json
+pending-alerts.jsonl
 coverage/
 preview-embeds.html
 .claude/

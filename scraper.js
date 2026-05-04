@@ -337,8 +337,29 @@ function initHealth(key) {
       // like contract drift (page schema changed) vs. soft blocks (Akamai degraded
       // response) vs. proxy auth (DataImpulse 407). Used by audit reports.
       reasons: { waf: 0, proxy: 0, soft_block: 0, contract_drift: 0, timeout: 0, network: 0 },
+      // Phase timing in milliseconds — splits a scraper's wall-clock budget into
+      // recognizable buckets. Critical when polls hit the 25-min cap: tells us
+      // whether pre-warm (sensor settling on Akamai/PerimeterX) is eating the
+      // budget vs. the actual query loop. `extra` catches known-URL checks, PDP
+      // verification, browser fallbacks — anything not pre-warm or the query loop.
+      phases: { prewarm: 0, queries: 0, extra: 0 },
     };
   }
+}
+
+// Record a phase duration in ms for a retailer. Additive (a single retailer
+// may run multiple stores, so phases are summed). `name` should be one of
+// "prewarm", "queries", or "extra" — anything else is silently dropped to
+// keep the schema small.
+const PHASE_NAMES = new Set(["prewarm", "queries", "extra"]);
+function recordPhase(key, name, durationMs) {
+  if (!PHASE_NAMES.has(name)) return;
+  if (typeof durationMs !== "number" || durationMs < 0 || !Number.isFinite(durationMs)) return;
+  initHealth(key);
+  if (!scraperHealth[key].phases) {
+    scraperHealth[key].phases = { prewarm: 0, queries: 0, extra: 0 };
+  }
+  scraperHealth[key].phases[name] += Math.round(durationMs);
 }
 
 // Recognized failure-mode reasons:
@@ -1248,8 +1269,94 @@ function pruneState(state, activeStores) {
 
 // ─── Discord Alerts ──────────────────────────────────────────────────────────
 
-// Post a Discord webhook payload with automatic 429 retry (up to 3 attempts).
-async function postDiscordWebhook(payload) {
+// #6 — Discord fail-open buffer. When Discord webhook delivery fails after the
+// 5-retry budget (network outage, Discord server issue, channel deleted, etc.),
+// the alert is appended to pending-alerts.jsonl instead of being lost. The next
+// successful Discord call replays the buffer in FIFO order, capping at
+// PENDING_REPLAY_LIMIT to avoid a thundering-herd if hundreds queued up.
+//
+// A Pappy 23 alert dropped to a transient Discord outage costs the user a real
+// bottle. The asymmetry is brutal: cost of replaying a stale alert ≈ 0; cost of
+// missing a real alert = bottle gone.
+const PENDING_ALERTS_FILE = new URL("./pending-alerts.jsonl", import.meta.url);
+const PENDING_REPLAY_LIMIT = 20;
+const PENDING_AGE_LIMIT_MS = 24 * 60 * 60 * 1000; // 24h — don't replay stale alerts
+
+async function bufferPendingAlert(payload) {
+  try {
+    const entry = JSON.stringify({ ts: new Date().toISOString(), payload }) + "\n";
+    await appendFile(PENDING_ALERTS_FILE, entry, "utf-8");
+    console.warn(`[discord] Buffered alert to pending-alerts.jsonl for later replay`);
+  } catch (err) {
+    console.error(`[discord] Failed to buffer pending alert: ${err.message}`);
+  }
+}
+
+async function replayPendingAlerts() {
+  let raw;
+  try {
+    raw = await readFile(PENDING_ALERTS_FILE, "utf-8");
+  } catch {
+    return; // no pending file = nothing to replay
+  }
+  const lines = raw.split("\n").filter((l) => l.trim());
+  if (lines.length === 0) return;
+  const now = Date.now();
+  const fresh = [];
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      const age = now - new Date(entry.ts).getTime();
+      if (age > PENDING_AGE_LIMIT_MS) continue; // drop stale (>24h)
+      fresh.push(entry);
+    } catch { /* skip malformed line */ }
+  }
+  if (fresh.length === 0) {
+    // Truncate the file — all entries were stale or malformed.
+    await writeFile(PENDING_ALERTS_FILE, "").catch(() => {});
+    return;
+  }
+  const toReplay = fresh.slice(0, PENDING_REPLAY_LIMIT);
+  const remaining = fresh.slice(PENDING_REPLAY_LIMIT);
+  console.log(`[discord] Replaying ${toReplay.length} buffered alert(s)${remaining.length ? ` (${remaining.length} deferred)` : ""}`);
+  for (const entry of toReplay) {
+    try {
+      // Add a leading [DELAYED — Xm ago] prefix so it's clear this isn't real-time.
+      const ageMin = Math.round((now - new Date(entry.ts).getTime()) / 60000);
+      const prefixed = { ...entry.payload };
+      if (Array.isArray(prefixed.embeds)) {
+        prefixed.embeds = prefixed.embeds.map((e, i) =>
+          i === 0 ? { ...e, title: `⏳ [+${ageMin}m] ${e.title || ""}`.slice(0, 256) } : e,
+        );
+      }
+      await postDiscordWebhookOnce(prefixed);
+      await sleep(500); // small pacing between replays
+    } catch (err) {
+      // If a replay fails, abort the rest and keep them buffered for next time.
+      console.warn(`[discord] Replay failed (${err.message}) — keeping remaining ${remaining.length} buffered`);
+      const stillPending = [entry, ...remaining];
+      await writeFile(
+        PENDING_ALERTS_FILE,
+        stillPending.map((e) => JSON.stringify(e)).join("\n") + "\n",
+      ).catch(() => {});
+      return;
+    }
+  }
+  // Persist whatever remained beyond PENDING_REPLAY_LIMIT for the next replay.
+  if (remaining.length > 0) {
+    await writeFile(
+      PENDING_ALERTS_FILE,
+      remaining.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    ).catch(() => {});
+  } else {
+    await writeFile(PENDING_ALERTS_FILE, "").catch(() => {});
+  }
+}
+
+// Internal helper: identical retry logic as postDiscordWebhook, but does NOT
+// buffer on terminal failure. Used by replayPendingAlerts to avoid an infinite
+// buffer-replay-buffer loop.
+async function postDiscordWebhookOnce(payload) {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const res = await fetch(DISCORD_WEBHOOK_URL, {
@@ -1280,8 +1387,19 @@ async function postDiscordWebhook(payload) {
       continue;
     }
   }
-  console.error("[discord] Webhook failed after 5 retries");
   throw new Error("Discord webhook failed after 5 retries");
+}
+
+// Post a Discord webhook payload with automatic 429 retry (up to 3 attempts).
+// Buffers to pending-alerts.jsonl on terminal failure (#6).
+async function postDiscordWebhook(payload) {
+  try {
+    return await postDiscordWebhookOnce(payload);
+  } catch (err) {
+    console.error(`[discord] Webhook failed after 5 retries — buffering for replay`);
+    await bufferPendingAlert(payload);
+    throw err; // preserve existing throw semantics so caller behavior is unchanged
+  }
 }
 
 async function sendDiscordAlert(embeds) {
@@ -1603,7 +1721,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
 const RETAILER_ORDER = ["costco", "totalwine", "walmart", "kroger", "safeway", "albertsons", "walgreens", "samsclub", "extramile", "liquorexpress", "chandlerliquors"];
 const RETAILER_LABELS = { costco: "Costco", totalwine: "Total Wine", walmart: "Walmart", kroger: "Kroger", safeway: "Safeway", albertsons: "Albertsons", walgreens: "Walgreens", samsclub: "Sam's Club", extramile: "ExtraMile", liquorexpress: "Liquor Express Tempe", chandlerliquors: "Chandler Liquors" };
 
-function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null, peakHours = null, totalConfirmed = 0, totalLeads = 0 }) {
+function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores = [], health = {}, canaryResults = {}, trend = null, peakHours = null, totalConfirmed = 0, totalLeads = 0, bandwidth = null }) {
   let desc = `🏬 **${storesScanned}** stores  │  🛍️ **${retailersScanned}** retailers  │  ⏱️ **${durationSec}s**\n\n`;
   // Tier breakdown when newFinds includes Kroger B+C-classified items. confirmed/leads
   // sum to totalNewFinds; show them split for at-a-glance signal quality assessment.
@@ -1653,6 +1771,39 @@ function buildSummaryEmbed({ storesScanned, retailersScanned, totalNewFinds, tot
       const canaryPct = r.scans > 0 ? Math.round((r.canaryHits / r.scans) * 100) : 0;
       const found = r.bottlesFound.length > 0 ? ` │ 🥃 ${[...new Set(r.bottlesFound)].join(", ")}` : "";
       desc += `\n> ${label}: ${pct}% ok, 🐤 ${canaryPct}%${found}`;
+    }
+  }
+
+  // #11 — Bandwidth cost projection. Surfaces actual GB used + projected
+  // 24h / monthly bill so we catch a runaway scraper before DataImpulse 407s.
+  // Only render when we have a non-trivial cost (>$0.01) so the summary doesn't
+  // get noisy on zero-traffic scans (e.g. all retailers on cooldown).
+  if (bandwidth && bandwidth.cost > 0.01) {
+    const fmtCost = (n) => `$${n.toFixed(2)}`;
+    const fmtGB = (n) => n >= 1 ? `${n.toFixed(2)} GB` : `${(n * 1024).toFixed(0)} MB`;
+    desc += `\n\n💸 **Bandwidth**: ${fmtGB(bandwidth.gb)} (${fmtCost(bandwidth.cost)})  │  ` +
+      `proj. ${fmtCost(bandwidth.projectedDaily)}/day  │  ${fmtCost(bandwidth.projectedMonthly)}/mo`;
+  }
+
+  // #2 — Phase timing breakdown. Only surfaces when scan duration > 10 min OR
+  // any retailer's prewarm exceeded its query phase (the canonical "pre-warm
+  // ate the budget" signal we want to catch). Format: "[retailer] prewarm/queries/extra (Ns)"
+  // sorted by total time descending. Helps diagnose 25-min timeout caps.
+  const phasesByRetailer = [];
+  for (const key of RETAILER_ORDER) {
+    const h = health[key];
+    if (!h || !h.phases) continue;
+    const total = (h.phases.prewarm || 0) + (h.phases.queries || 0) + (h.phases.extra || 0);
+    if (total < 1000) continue; // skip retailers that barely ran
+    phasesByRetailer.push({ key, ...h.phases, total });
+  }
+  if (phasesByRetailer.length > 0 && (durationSec > 600 || phasesByRetailer.some((p) => p.prewarm > p.queries && p.prewarm > 30000))) {
+    phasesByRetailer.sort((a, b) => b.total - a.total);
+    desc += "\n\n**Phase timing** (prewarm / queries / extra):";
+    for (const p of phasesByRetailer.slice(0, 5)) {
+      const label = RETAILER_LABELS[p.key] || p.key;
+      const fmt = (ms) => `${(ms / 1000).toFixed(0)}s`;
+      desc += `\n> ${label}: ${fmt(p.prewarm)} / ${fmt(p.queries)} / ${fmt(p.extra)} (total ${fmt(p.total)})`;
     }
   }
 
@@ -1718,6 +1869,30 @@ function trackBandwidth(retailerKey, byteSize) {
   if (!byteSize || byteSize < 0) return;
   bandwidthStats.totalBytes += byteSize;
   bandwidthStats.byRetailer[retailerKey || "unknown"] = (bandwidthStats.byRetailer[retailerKey || "unknown"] || 0) + byteSize;
+}
+
+// #11 — Bandwidth cost projection. DataImpulse charges per-GB; surface today's
+// projected bill in the scan summary so the user sees the proxy bill trending
+// before DataImpulse 407s start firing. Default $1/GB matches DataImpulse's
+// public rate. Override via env if billing rate changes (no daemon restart
+// required since it's read at format time).
+const PROXY_COST_PER_GB = parseFloat(process.env.PROXY_COST_PER_GB || "1.0");
+
+function formatBandwidthCost(bytes, sinceTs) {
+  if (!bytes || bytes <= 0) return null;
+  const gb = bytes / (1024 ** 3);
+  const cost = gb * PROXY_COST_PER_GB;
+  // Project to a 24h rate based on the elapsed wall-clock since startup.
+  const elapsedMs = Date.now() - sinceTs;
+  const dailyMultiplier = elapsedMs > 0 ? (24 * 60 * 60 * 1000) / elapsedMs : 1;
+  const projectedDaily = cost * dailyMultiplier;
+  return {
+    bytes,
+    gb,
+    cost,
+    projectedDaily,
+    projectedMonthly: projectedDaily * 30,
+  };
 }
 
 // Heuristic: derive retailer key from URL host. Used when we don't have explicit
@@ -2362,6 +2537,7 @@ async function scrapeCostcoViaFetch() {
 
 // Browser-based Costco scraper (fallback). Uses stable MUI data-testid attributes.
 async function scrapeCostcoOnce(page) {
+  const costcoT0 = Date.now();
   // Pre-warm: visit homepage to let Akamai sensor set _abck cookie.
   // Use networkidle + longer dwell so sensor scripts fully execute and phone home.
   await page.goto("https://www.costco.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
@@ -2371,6 +2547,8 @@ async function scrapeCostcoOnce(page) {
   // Category navigation adds browsing depth (homepage → category → search) which raises
   // behavioral scores with Akamai. Costs ~4-6s but makes the session look more human.
   await navigateCategory(page, "costco");
+  recordPhase("costco", "prewarm", Date.now() - costcoT0);
+  const costcoQueriesT0 = Date.now();
 
   const found = [];
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
@@ -2444,6 +2622,7 @@ async function scrapeCostcoOnce(page) {
     }
     await sleep(2000 + Math.random() * 2000);
   }
+  recordPhase("costco", "queries", Date.now() - costcoQueriesT0);
   return dedupFound(found);
 }
 
@@ -2601,10 +2780,12 @@ async function checkCostcoKnownUrlsViaBrowser() {
 // may pass the initial request before sensors detect it — worth trying for speed.
 async function scrapeCostcoStore() {
   // Check known product URLs first (less suspicious, supplements search results)
+  const knownT0 = Date.now();
   const knownFound = await checkCostcoKnownUrls().catch((err) => {
     console.warn(`[costco] Known URL check wrapper failed: ${err.message}`);
     return [];
   });
+  recordPhase("costco", "extra", Date.now() - knownT0);
 
   // Try fetch-first with got-scraping (Chrome TLS fingerprint)
   const fetchResult = await scrapeCostcoViaFetch();
@@ -2865,9 +3046,11 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
     // Warm contexts (subsequent stores) skip pre-warm entirely so this only runs once.
     await navigateCategory(page, "totalwine");
     console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
+    recordPhase("totalwine", "prewarm", Date.now() - t0);
   } else {
     console.log(`[totalwine:${store.storeId}] Skipping pre-warm (context already warm)`);
   }
+  const twQueriesT0 = Date.now();
 
   const found = [];
   const queries = shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES));
@@ -2970,6 +3153,7 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
     }
     await sleep(2000 + Math.random() * 2000);
   }
+  recordPhase("totalwine", "queries", Date.now() - twQueriesT0);
   return dedupFound(found);
 }
 
@@ -3011,10 +3195,12 @@ async function checkTotalWineKnownUrls(store) {
 // Direct residential IP browser (headed on Mac) is the only browser fallback.
 async function scrapeTotalWineStore(store) {
   // Check known product URLs first (less suspicious, supplements search results)
+  const twKnownT0 = Date.now();
   const knownFound = await checkTotalWineKnownUrls(store).catch((err) => {
     console.warn(`[totalwine:${store.storeId}] Known URL check wrapper failed: ${err.message}`);
     return [];
   });
+  recordPhase("totalwine", "extra", Date.now() - twKnownT0);
 
   // Fetch-first: try got-scraping with cached browser _px* cookies before launching browser.
   // Previously disabled (PerimeterX blocks fetch without JS sensor), but now the browser→fetch
@@ -3265,12 +3451,15 @@ async function scrapeWalmartViaFetch(store) {
 
 // Browser-based Walmart scraper (fallback). Accepts a shared page.
 async function scrapeWalmartViaBrowser(store, page) {
+  const wmT0 = Date.now();
   // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies
   await page.goto("https://www.walmart.com/", { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await sleep(3000 + Math.random() * 3000);
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "medium" });
   await navigateCategory(page, "walmart");
+  recordPhase("walmart", "prewarm", Date.now() - wmT0);
+  const wmQueriesT0 = Date.now();
 
   const found = [];
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
@@ -3341,6 +3530,7 @@ async function scrapeWalmartViaBrowser(store, page) {
     }
     await sleep(2000 + Math.random() * 2000);
   }
+  recordPhase("walmart", "queries", Date.now() - wmQueriesT0);
   return dedupFound(found);
 }
 
@@ -3390,10 +3580,12 @@ async function checkWalmartKnownUrls(store) {
 
 async function scrapeWalmartStore(store) {
   // Check known product URLs first (less suspicious, supplements search results)
+  const wmKnownT0 = Date.now();
   const knownFound = await checkWalmartKnownUrls(store).catch((err) => {
     console.warn(`[walmart:${store.storeId}] Known URL check wrapper failed: ${err.message}`);
     return [];
   });
+  recordPhase("walmart", "extra", Date.now() - wmKnownT0);
 
   // Skip fetch attempt on CI unless a proxy is configured (datacenter IPs are blocked)
   const isCI = process.env.CI === "true" || process.env.GITHUB_ACTIONS === "true";
@@ -3495,6 +3687,9 @@ async function scrapeWalgreensViaBrowser(page) {
   }
   await navigateCategory(page, "walgreens");
   console.log(`[walgreens] Pre-warm done (${wgElapsed()}), starting queries...`);
+  // Phase timing: wgT0 anchors the pre-warm phase; query phase starts now.
+  recordPhase("walgreens", "prewarm", Date.now() - wgT0);
+  const wgQueriesT0 = Date.now();
 
   // #1 — Tightened primary selector (drop [data-testid*='product']). The broad
   // pattern matched related-product carousels and "customers also viewed"
@@ -3612,6 +3807,7 @@ async function scrapeWalgreensViaBrowser(page) {
     }
     await sleep(2000 + Math.random() * 2000);
   }
+  recordPhase("walgreens", "queries", Date.now() - wgQueriesT0);
   return dedupFound(found);
 }
 
@@ -3734,11 +3930,13 @@ async function scrapeWalgreensStore() {
       // away (60s outer cap; per-find timeouts inside the helper). Returns the
       // original find list on hard timeout to preserve "fail open" behavior.
       if (result && result.length > 0) {
+        const pdpT0 = Date.now();
         const verified = await withTimeout(
           verifyWalgreensFindsViaPDP(page, result),
           60000,
           result,
         );
+        recordPhase("walgreens", "extra", Date.now() - pdpT0);
         return verified;
       }
       return result;
@@ -5374,6 +5572,14 @@ const RETAILERS = [
 // ─── Orchestrator ────────────────────────────────────────────────────────────
 
 let polling = false;
+
+// #4 — Poll watchdog. The 25-min POLL_TIMED_OUT path catches a single hung scan,
+// but if the SAME hang recurs every poll the daemon scans forever and finds nothing.
+// After 3 consecutive timed-out polls, force an exit so launchd restarts the daemon
+// with a fresh process: clears proxy state, closes orphaned browser contexts, drops
+// any stuck event-loop refs. Counter resets on the first successful poll.
+let consecutivePollTimeouts = 0;
+const POLL_TIMEOUT_RESTART_THRESHOLD = 3;
 let storeCache = null;
 let peakSlotsCache = null; // Populated by poll(), consumed by getNextPollDelayMs() for dynamic boost
 
@@ -5422,6 +5628,12 @@ async function poll() {
   scraperHealth = {};
   primaryProxyExhausted = false;
   backupProxyExhausted = false;
+
+  // #6 — Replay any Discord alerts that failed delivery in prior polls.
+  // Best-effort; if Discord is still down, the buffer just stays full for next time.
+  await replayPendingAlerts().catch((err) =>
+    console.warn(`[discord] Replay attempt failed: ${err.message}`),
+  );
   for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k];
   const canaryResults = {};
   let discordFailures = 0;
@@ -5620,11 +5832,33 @@ async function poll() {
     "POLL_TIMED_OUT"
   );
   if (concurrencyResult === "POLL_TIMED_OUT") {
-    console.warn(`[poll] 🛑 Hard timeout — scan exceeded ${POLL_BUDGET_MS / 60000}min budget. ` +
+    consecutivePollTimeouts++;
+    console.warn(`[poll] 🛑 Hard timeout — scan exceeded ${POLL_BUDGET_MS / 60000}min budget ` +
+      `(${consecutivePollTimeouts} consecutive). ` +
       `Hung scrapers will be abandoned; in-flight Discord posts may not complete. ` +
       `Granular reasons: ${JSON.stringify(Object.fromEntries(Object.entries(scraperHealth || {}).map(([k, v]) => [k, v?.reasons || {}])))}.`);
+    // #4 — Watchdog: 3 consecutive timeouts = systemic hang, restart the process.
+    // launchd KeepAlive=true brings us right back with a fresh event loop, fresh
+    // proxy state, no orphaned browser contexts. The same logic in-process can't
+    // recover from those failure modes once they accumulate.
+    if (consecutivePollTimeouts >= POLL_TIMEOUT_RESTART_THRESHOLD) {
+      console.error(`[poll] 💀 ${consecutivePollTimeouts} consecutive timeouts — exiting for launchd restart`);
+      // Fire-and-forget Discord notification before exit (best-effort, don't block).
+      try {
+        await sendDiscordAlert([{
+          title: "🛑 Bourbon Scout — auto-restart",
+          description: `Daemon hit ${consecutivePollTimeouts} consecutive 25-min poll timeouts. Exiting so launchd restarts the process with a clean event loop. Investigate if this fires repeatedly.`,
+          color: COLORS.oos,
+          timestamp: new Date().toISOString(),
+        }]);
+      } catch { /* best-effort */ }
+      process.exit(1);
+    }
     // Fall through — recordResult / Discord summary still runs with whatever
     // partial data was collected.
+  } else {
+    // Successful poll (didn't hit hard timeout) — reset the watchdog.
+    consecutivePollTimeouts = 0;
   }
 
   // Per-poll time budget: if the main scan took too long, skip canary retries
@@ -5708,6 +5942,11 @@ async function poll() {
       found: scanFinds[retailer.key] ? [...scanFinds[retailer.key]] : [],
       path: h.path || { fetch: 0, browser: 0 },
       queryStats: h.queryStats || {},
+      // #2 — Per-retailer phase timing (ms). prewarm = homepage + category +
+      // humanization; queries = the search loop; extra = known-URL fetches +
+      // PDP verification + known-URL browser fallback. Diagnoses where the
+      // scan budget is going when polls hit the 25-min cap.
+      phases: h.phases || { prewarm: 0, queries: 0, extra: 0 },
     };
   }
   const metricsEntry = {
@@ -5760,7 +5999,8 @@ async function poll() {
   }
 
   // Quiet summary at end of every poll
-  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalConfirmed, totalLeads, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend, peakHours });
+  const bandwidthCost = formatBandwidthCost(bandwidthStats.totalBytes, bandwidthStats.startTs);
+  const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalConfirmed, totalLeads, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend, peakHours, bandwidth: bandwidthCost });
   await sendDiscordAlert([summary]).catch((err) => console.error(`[poll] Summary send failed: ${err.message}`));
 
   // Health-degradation alert: if a retailer's canary has been 0% for 4+ consecutive
@@ -5816,7 +6056,9 @@ export {
   scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore, applyWalgreensConfidenceDemotion, recordWalgreensFpEvent, verifyWalgreensFindsViaPDP, WG_PDP_NEGATIVE, WG_PDP_POSITIVE,
   SAMSCLUB_PRODUCTS, PRIORITY_SAMSCLUB_PRODUCTS, matchSamsClubProduct, scrapeSamsClubViaFetch, scrapeSamsClubViaBrowser, scrapeSamsClubStore,
-  trackHealth, HEALTH_REASONS, trackBandwidth, retailerKeyForUrl,
+  trackHealth, HEALTH_REASONS, trackBandwidth, retailerKeyForUrl, recordPhase,
+  bufferPendingAlert, replayPendingAlerts, postDiscordWebhookOnce, PENDING_ALERTS_FILE, PENDING_REPLAY_LIMIT,
+  formatBandwidthCost, PROXY_COST_PER_GB,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel, inferRetailerFromText,
   validateEnv,
@@ -5832,6 +6074,9 @@ export function _resetBandwidthStats() {
   bandwidthStats.startTs = Date.now();
 }
 export function _resetPolling() { polling = false; }
+export function _resetConsecutivePollTimeouts() { consecutivePollTimeouts = 0; }
+export function _getConsecutivePollTimeouts() { return consecutivePollTimeouts; }
+export function _setConsecutivePollTimeouts(n) { consecutivePollTimeouts = n; }
 export function _resetKrogerToken() { krogerToken = null; krogerTokenPromise = null; }
 export function _resetBrowserStateCache() { browserStateCache = null; }
 export function _resetRetailerBrowserCache() { for (const k of Object.keys(retailerBrowserCache)) delete retailerBrowserCache[k]; }
