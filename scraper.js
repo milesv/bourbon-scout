@@ -5174,6 +5174,7 @@ async function verifyKrogerCandidatesViaWebsite(store, candidates) {
       const storeData = await page.evaluate(async (storeId) => {
         const res = await fetch(`/atlas/v1/stores/v2/locator?filter.locationIds=${storeId}&projections=full`, {
           headers: { "x-kroger-channel": "WEB", accept: "application/json" },
+          signal: AbortSignal.timeout(15000),
         });
         return { status: res.status, body: res.ok ? await res.json() : await res.text() };
       }, store.storeId);
@@ -5187,6 +5188,7 @@ async function verifyKrogerCandidatesViaWebsite(store, candidates) {
           const res = await fetch("/atlas/v1/modality/preferences?filter.restrictLafToFc=false", {
             method: "POST",
             headers: { "Content-Type": "application/json", "x-kroger-channel": "WEB" },
+            signal: AbortSignal.timeout(15000),
             body: JSON.stringify({
               modalityPreferences: {
                 capabilities: { DELIVERY: true, IN_STORE: true, PICKUP: true, SHIP: true },
@@ -5550,10 +5552,15 @@ async function scrapeSafewayViaBrowser(page, store, { skipPreWarm = false } = {}
       // Primary: call Safeway API from browser context — inherits _abck cookies
       const apiUrl = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
       /* v8 ignore start -- browser-only API call */
+      // 15s per-query timeout (was unbounded). Without this, Incapsula slow-rolling
+      // a single response could hang the whole 300s budget; queries pile up; outer
+      // withTimeout fires; cascading "Target page closed" errors. AbortSignal.timeout
+      // bounds each query so a slow response abandons that query and moves on.
       const data = await page.evaluate(async ({ url, apiKey }) => {
         try {
           const res = await fetch(url, {
             headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+            signal: AbortSignal.timeout(15000),
           });
           if (!res.ok) return null;
           return await res.json();
@@ -5575,7 +5582,10 @@ async function scrapeSafewayViaBrowser(page, store, { skipPreWarm = false } = {}
             /* v8 ignore start -- browser-only */
             const data2 = await page.evaluate(async ({ url, apiKey }) => {
               try {
-                const res = await fetch(url, { headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" } });
+                const res = await fetch(url, {
+                  headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+                  signal: AbortSignal.timeout(15000),
+                });
                 return res.ok ? await res.json() : null;
               } catch { return null; }
             }, { url: page2Url, apiKey: SAFEWAY_API_KEY });
@@ -5854,10 +5864,14 @@ async function scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm = false } =
     try {
       const apiUrl = `${baseUrl}?request-id=0&url=https://www.albertsons.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
       /* v8 ignore start -- browser-only API call */
+      // 15s per-query timeout (was unbounded). Without this, a hung Incapsula
+      // response could eat the whole 300s budget; this fix is exactly why every
+      // Albertsons store was hitting the 300s cap on both attempts.
       const data = await page.evaluate(async ({ url, apiKey }) => {
         try {
           const res = await fetch(url, {
             headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+            signal: AbortSignal.timeout(15000),
           });
           if (!res.ok) return null;
           return await res.json();
@@ -5878,7 +5892,10 @@ async function scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm = false } =
             /* v8 ignore start -- browser-only */
             const data2 = await page.evaluate(async ({ url, apiKey }) => {
               try {
-                const res = await fetch(url, { headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" } });
+                const res = await fetch(url, {
+                  headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+                  signal: AbortSignal.timeout(15000),
+                });
                 return res.ok ? await res.json() : null;
               } catch { return null; }
             }, { url: page2Url, apiKey: ALBERTSONS_KEY });
