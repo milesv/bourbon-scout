@@ -940,6 +940,128 @@ async function scrapeRedditIntel(state) {
   }
 }
 
+// ─── Distillery News Monitor (#17) ──────────────────────────────────────────
+// Quarterly distillery release announcements precede retailer drops by 1-2
+// weeks. Catching the announcement gives us a heads-up to set boost-mode at
+// affected retailers (e.g., Heritage Collection 22 announcement → boost
+// Total Wine + Costco for the next 14 days).
+//
+// All four sources are HTML article lists with no anti-bot per the
+// 2026-05-04 research. Defensive parsing: try a few selector strategies, fall
+// back to top-level h2/h3 anchors. Title-keyword matching prunes noise; URL
+// is the dedup key. Runs on its own timer (every 30-60 min) — same pattern
+// as Reddit intel but lower frequency since releases aren't real-time.
+const DISTILLERY_SOURCES = [
+  {
+    key: "heaven_hill",
+    name: "Heaven Hill",
+    url: "https://heavenhill.com/news-and-notes/",
+    keywords: ["heritage collection", "heaven hill heritage", "elijah craig 18", "elijah craig 23", "single barrel select"],
+  },
+  {
+    key: "sazerac",
+    name: "Sazerac (BTAC)",
+    url: "https://www.sazerac.com/our-company/news-and-media.html",
+    keywords: ["antique collection", "btac", "buffalo trace antique", "stagg", "eagle rare 17", "thomas h. handy", "william larue weller", "george t. stagg"],
+  },
+  {
+    key: "old_forester",
+    name: "Old Forester",
+    url: "https://www.oldforester.com/press-releases/",
+    keywords: ["birthday bourbon", "president's choice", "150th anniversary", "king ranch"],
+  },
+];
+
+async function fetchDistilleryNewsPage(source) {
+  const res = await scraperFetch(source.url, {
+    headers: FETCH_HEADERS,
+    timeout: 15000,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+  const $ = cheerio.load(html);
+  const articles = [];
+  // Defensive multi-selector strategy: try the most common WP/CMS patterns
+  // first, fall back to bare h2/h3 anchors. No source has been verified live
+  // with this code, so we cast a wide net and rely on keyword filtering to
+  // prune noise downstream.
+  const selectors = ["article", ".post", ".news-item", ".release", ".entry-content article", ".article"];
+  for (const sel of selectors) {
+    $(sel).each((_, el) => {
+      const $el = $(el);
+      const link = $el.find("a[href]").first();
+      const titleEl = $el.find("h1,h2,h3,h4").first();
+      const title = ((titleEl.text() || link.text()) || "").trim();
+      const href = link.attr("href") || "";
+      if (title && href && title.length < 250) articles.push({ title, href });
+    });
+    if (articles.length > 0) break;
+  }
+  if (articles.length === 0) {
+    $("h2 a[href], h3 a[href]").each((_, el) => {
+      const title = $(el).text().trim();
+      const href = $(el).attr("href") || "";
+      if (title && href && title.length < 250) articles.push({ title, href });
+    });
+  }
+  // Resolve relative URLs against the source page
+  const base = new URL(source.url);
+  return articles.map((a) => ({
+    title: a.title,
+    href: a.href.startsWith("http") ? a.href : new URL(a.href, base).toString(),
+  }));
+}
+
+const DISTILLERY_SEEN_PRUNE_MS = 60 * 86400000; // 60 days
+
+async function scrapeDistilleryNews(state) {
+  if (!state._distillerySeen) state._distillerySeen = {};
+  let newCount = 0;
+  for (const source of DISTILLERY_SOURCES) {
+    if (!state._distillerySeen[source.key]) state._distillerySeen[source.key] = {};
+    const seen = state._distillerySeen[source.key];
+    let articles = [];
+    try {
+      articles = await fetchDistilleryNewsPage(source);
+    } catch (err) {
+      console.warn(`[distillery] ${source.name} fetch failed: ${err.message}`);
+      continue;
+    }
+    for (const article of articles) {
+      const titleLc = article.title.toLowerCase();
+      const matched = source.keywords.some((kw) => titleLc.includes(kw));
+      if (!matched) continue;
+      // Dedup by full URL — stable across page reloads, survives CMS pagination
+      if (seen[article.href]) continue;
+      seen[article.href] = new Date().toISOString();
+      newCount++;
+      const embed = {
+        title: truncateTitle(`📣 ${source.name} — ${article.title}`),
+        description: truncateDescription(
+          `Distillery release announcement detected.\n\n[Read announcement](${article.href})\n\n_Allocated drops typically follow 1-2 weeks after announcement. Consider adding a watchlist entry or boost window for affected retailers._`,
+        ),
+        color: COLORS.rumor,
+        timestamp: new Date().toISOString(),
+        footer: { text: `Bourbon Scout 🥃 │ Distillery News` },
+      };
+      try { await sendDiscordAlert([embed]); }
+      catch (err) { console.error(`[distillery] Alert send failed: ${err.message}`); }
+      console.log(`[distillery] New from ${source.name}: "${article.title}"`);
+    }
+  }
+  // Prune entries older than 60 days so state.json doesn't grow unbounded.
+  const cutoff = Date.now() - DISTILLERY_SEEN_PRUNE_MS;
+  for (const sourceKey of Object.keys(state._distillerySeen)) {
+    for (const [id, ts] of Object.entries(state._distillerySeen[sourceKey])) {
+      if (new Date(ts).getTime() < cutoff) delete state._distillerySeen[sourceKey][id];
+    }
+  }
+  if (newCount > 0) {
+    await saveState(state).catch((err) => console.warn(`[distillery] saveState failed: ${err.message}`));
+  }
+  return newCount;
+}
+
 // ─── State Management ────────────────────────────────────────────────────────
 // State is nested by retailer key then store ID:
 // { "costco": { "0489": ["Weller 12 Year"] }, "walmart": { "2436": [] } }
@@ -1342,6 +1464,199 @@ function updateStoreState(state, retailerKey, storeId, currentFound) {
   state[retailerKey][storeId] = { bottles, lastScanned: now, oosHistory: trimmedOosHistory };
 }
 
+// ─── Observability tracking helpers (#8/#9/#10/#21) ─────────────────────────
+// Each function maintains a top-level `_`-prefixed tracking key in state. All
+// trackers are bounded (LRU eviction at the cap) so state.json doesn't grow
+// without bound on a long-running daemon. Surfaced in the daemon log at write
+// time and queryable via the auxiliary scripts in /scripts.
+
+const FIRST_FIND_LAG_WINDOW_MS = 7 * 86400000;  // record cross-retailer lag for 7d
+const FIRST_FIND_REARM_MS = 30 * 86400000;       // re-arm after 30d so the next drop can record again
+const SIGNAL_LAG_HISTORY_CAP = 100;              // last N events for #9
+const CROSS_RETAILER_LAG_CAP = 100;              // last N events for #8
+
+// #8 — Time-to-first-find. When a bottle goes from "absent everywhere" to
+// "in stock anywhere", record the timestamp + winning retailer. When it later
+// surfaces at a DIFFERENT retailer within 7 days, log the lag so we can
+// answer "which retailer surfaces drops earliest?" over weeks of data.
+function recordFirstFindEvent(state, retailerKey, storeId, bottleName) {
+  if (!state._firstFindByBottle) state._firstFindByBottle = {};
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const existing = state._firstFindByBottle[bottleName];
+
+  // Re-arm the slot if the previous "first find" is more than FIRST_FIND_REARM_MS
+  // old. Without re-arming, every quarterly Pappy drop would log against the
+  // first-ever find in 2024 — meaningless. With re-arming, the next drop's
+  // first-find timestamp resets and we can log fresh lag for each drop cycle.
+  if (!existing || now - new Date(existing.firstSeen).getTime() > FIRST_FIND_REARM_MS) {
+    state._firstFindByBottle[bottleName] = {
+      firstSeen: nowIso,
+      firstRetailer: retailerKey,
+      firstStoreId: storeId,
+      _crossLogged: false,
+    };
+    return;
+  }
+
+  // Subsequent retailer find within the lag window — log once for this drop.
+  if (existing.firstRetailer !== retailerKey
+      && !existing._crossLogged
+      && (now - new Date(existing.firstSeen).getTime()) < FIRST_FIND_LAG_WINDOW_MS) {
+    if (!state._crossRetailerLag) state._crossRetailerLag = [];
+    const lagMs = now - new Date(existing.firstSeen).getTime();
+    state._crossRetailerLag.push({
+      bottle: bottleName,
+      firstRetailer: existing.firstRetailer,
+      firstStoreId: existing.firstStoreId,
+      secondRetailer: retailerKey,
+      secondStoreId: storeId,
+      lagMs,
+      firstSeenAt: existing.firstSeen,
+      secondSeenAt: nowIso,
+    });
+    if (state._crossRetailerLag.length > CROSS_RETAILER_LAG_CAP) {
+      state._crossRetailerLag = state._crossRetailerLag.slice(-CROSS_RETAILER_LAG_CAP);
+    }
+    existing._crossLogged = true;
+    const lagH = (lagMs / 3600000).toFixed(1);
+    console.log(`[observability] ${existing.firstRetailer} beat ${retailerKey} by ${lagH}h on ${bottleName}`);
+  }
+}
+
+// #9 — Reddit-vs-scraper signal lag. When the scraper finds a bottle that
+// Reddit mentioned earlier, log the gap. Over weeks: "Reddit averages 2h
+// ahead of scraper at Kroger" tells us whether to trust scraper-first or
+// Reddit-first hunting strategy.
+function recordRedditLagEvent(state, retailerKey, storeId, bottleName, redditMentions) {
+  const redditTs = redditMentions?.[bottleName];
+  if (!redditTs) return;
+  const redditMs = new Date(redditTs).getTime();
+  const now = Date.now();
+  if (now <= redditMs) return; // Reddit hasn't reported yet (or clock skew)
+  const lagMs = now - redditMs;
+  if (!state._redditLag) state._redditLag = [];
+  state._redditLag.push({
+    bottle: bottleName,
+    retailer: retailerKey,
+    storeId,
+    redditTs,
+    scraperTs: new Date(now).toISOString(),
+    lagMs,
+  });
+  if (state._redditLag.length > SIGNAL_LAG_HISTORY_CAP) {
+    state._redditLag = state._redditLag.slice(-SIGNAL_LAG_HISTORY_CAP);
+  }
+  const lagH = (lagMs / 3600000).toFixed(1);
+  console.log(`[observability] Reddit beat scraper by ${lagH}h on ${bottleName} (${retailerKey})`);
+}
+
+// #10 — Per-bottle lead → confirmed FP rate. Track each "lead" find emitted
+// (currently Kroger weak-signal finds). On state transitions:
+//   pending → confirmed   the lead converted to real stock at the same store
+//   pending → false_positive   the bottle went OOS without ever being confirmed
+// Over weeks: "Pappy 15 at Marketplace stores converts 60% of the time;
+// Stagg Jr leads at standard Fry's are 90% false positives" lets us decide
+// which leads are worth chasing.
+const LEAD_HISTORY_CAP = 200;
+
+function leadHistoryKey(retailerKey, storeId, bottleName) {
+  return `${bottleName}:${retailerKey}:${storeId}`;
+}
+
+function recordLeadOrConfirmation(state, retailerKey, storeId, find) {
+  if (!state._leadHistory) state._leadHistory = {};
+  const key = leadHistoryKey(retailerKey, storeId, find.name);
+  const now = new Date().toISOString();
+  if (find.confidence === "lead") {
+    if (!state._leadHistory[key] || state._leadHistory[key].status !== "pending") {
+      state._leadHistory[key] = { leadEmittedAt: now, status: "pending", statusChangedAt: null };
+      // Cap by oldest entries (LRU on first emission)
+      const keys = Object.keys(state._leadHistory);
+      if (keys.length > LEAD_HISTORY_CAP) {
+        const sorted = keys
+          .map((k) => [k, new Date(state._leadHistory[k].leadEmittedAt).getTime()])
+          .sort((a, b) => a[1] - b[1]);
+        for (const [k] of sorted.slice(0, keys.length - LEAD_HISTORY_CAP)) {
+          delete state._leadHistory[k];
+        }
+      }
+    }
+  } else {
+    // Non-lead find (confirmed or no confidence set). If we previously emitted
+    // a pending lead for this same bottle/store, mark as converted (true positive).
+    const entry = state._leadHistory[key];
+    if (entry && entry.status === "pending") {
+      entry.status = "confirmed";
+      entry.statusChangedAt = now;
+      console.log(`[observability] Lead → CONFIRMED for ${find.name} at ${retailerKey}:${storeId}`);
+    }
+  }
+}
+
+// Mark pending leads as false-positives when their bottle goes OOS without
+// ever being upgraded to a confirmed find. Called on the goneOOS path.
+function markLeadsAsFalsePositive(state, retailerKey, storeId, goneOOSNames) {
+  if (!state._leadHistory || goneOOSNames.length === 0) return;
+  const now = new Date().toISOString();
+  for (const name of goneOOSNames) {
+    const key = leadHistoryKey(retailerKey, storeId, name);
+    const entry = state._leadHistory[key];
+    if (entry && entry.status === "pending") {
+      entry.status = "false_positive";
+      entry.statusChangedAt = now;
+      console.log(`[observability] Lead → FALSE_POSITIVE for ${name} at ${retailerKey}:${storeId}`);
+    }
+  }
+}
+
+// #21 — Watchlist effectiveness. Existing `state._watchList[key]` is a string
+// timestamp marking notification. Migrate-on-access to an object so we can
+// also track verification. When a scraper find matches a watchlist entry's
+// bottle+retailer+store, set verifiedAt. Daily/weekly audit can then flag
+// rumors that never panned out as low-quality intel sources.
+const WATCHLIST_VERIFICATION_WINDOW_MS = 7 * 86400000;
+
+function _ensureWatchListEntry(state, key) {
+  if (!state._watchList) state._watchList = {};
+  const v = state._watchList[key];
+  if (typeof v === "string") {
+    state._watchList[key] = { firedAt: v, verifiedAt: null };
+  } else if (!v) {
+    return null;
+  }
+  return state._watchList[key];
+}
+
+function markWatchListVerified(state, retailerKey, storeId, find) {
+  if (!state._watchList) return;
+  // A find verifies a watchlist entry if the entry's bottle (or "all bottles"
+  // when bottle is unspecified) matches and the storeId is in the entry's
+  // stores list. We don't have the original WATCH_LIST entry here, only the
+  // key — parse the storeId list out of the key (format: "Bottle:retailer:s1,s2").
+  const now = new Date().toISOString();
+  for (const [key, raw] of Object.entries(state._watchList)) {
+    const parts = key.split(":");
+    if (parts.length < 3) continue;
+    const [keyBottle, keyRetailer, storeIdsStr] = parts;
+    if (keyRetailer !== retailerKey) continue;
+    if (keyBottle !== "Allocated Bourbon" && keyBottle !== find.name) continue;
+    const storeIds = storeIdsStr.split(",");
+    if (!storeIds.includes(String(storeId))) continue;
+    const entry = _ensureWatchListEntry(state, key);
+    if (entry && !entry.verifiedAt) {
+      const fireMs = new Date(entry.firedAt).getTime();
+      // Only verify within 7 days of the original alert — late finds aren't the
+      // same drop. Without this, a quarterly Pappy drop could "verify" last
+      // year's rumor and inflate the rumor source's perceived accuracy.
+      if (Date.now() - fireMs < WATCHLIST_VERIFICATION_WINDOW_MS) {
+        entry.verifiedAt = now;
+        console.log(`[observability] Watchlist VERIFIED — ${find.name} at ${retailerKey}:${storeId} (${key})`);
+      }
+    }
+  }
+}
+
 function pruneState(state, activeStores) {
   for (const retailerKey of Object.keys(state)) {
     // Reserved top-level keys are non-retailer tracking data that must survive
@@ -1511,7 +1826,55 @@ async function sendDiscordAlert(embeds) {
   }
 }
 
-// Loud alert with @here for in-stock finds (pings online channel members only)
+// #22 — ntfy.sh push notification for apex finds. Free service, no auth, just
+// POST to a topic URL. Discord @here doesn't reliably wake phones; ntfy does
+// (especially with the iOS/Android apps in foreground).
+//
+// Setup: subscribe to your topic via the ntfy app, then set:
+//   NTFY_TOPIC="my-topic-name"   (uses ntfy.sh default server)
+//   NTFY_TOPIC="https://ntfy.example.com/my-topic"   (self-hosted)
+//
+// No-op when unset, so it's purely opt-in. Apex tier only (🦄 — Pappy 20/23,
+// Heaven Hill 22). Track-tier finds shouldn't wake the user at 3am.
+async function sendNtfyPush({ title, message, priority = "default", clickUrl = null }) {
+  const topic = process.env.NTFY_TOPIC;
+  if (!topic) return;
+  const url = topic.startsWith("http") ? topic : `https://ntfy.sh/${topic.replace(/^\//, "")}`;
+  const headers = {
+    "Title": title.slice(0, 250),
+    "Priority": priority,
+    "Tags": "whiskey_glass,fire",
+  };
+  if (clickUrl) headers["Click"] = clickUrl;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers,
+      body: message.slice(0, 4096), // ntfy.sh body limit
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (err) {
+    console.warn(`[ntfy] Push failed: ${err.message}`);
+  }
+}
+
+// Detect apex bottles in a batch of embeds. Returns the first matching bottle
+// name or null. Uses BOTTLE_APEX set so promotions/changes happen in one place.
+function detectApexEmbed(embeds) {
+  if (!Array.isArray(embeds)) return null;
+  for (const apex of BOTTLE_APEX) {
+    for (const e of embeds) {
+      if (typeof e?.description === "string" && e.description.includes(apex)) {
+        return apex;
+      }
+    }
+  }
+  return null;
+}
+
+// Loud alert with @here for in-stock finds (pings online channel members only).
+// Also fires an ntfy.sh push for apex bottles (#22) so the user's phone wakes
+// even when Discord notifications are silenced/buried.
 async function sendUrgentAlert(embeds) {
   /* v8 ignore next -- env guard */
   if (!DISCORD_WEBHOOK_URL) return;
@@ -1524,6 +1887,16 @@ async function sendUrgentAlert(embeds) {
       embeds: batch,
     });
     if (i + 4 < embeds.length) await sleep(1000);
+  }
+  // #22 — Apex push notification (best-effort, doesn't block urgent alert).
+  const apexBottle = detectApexEmbed(embeds);
+  if (apexBottle) {
+    const firstEmbed = embeds[0];
+    await sendNtfyPush({
+      title: `🦄 ${apexBottle}`,
+      message: (firstEmbed?.title || "Apex bottle spotted").replace(/[*_]/g, ""),
+      priority: "urgent",
+    });
   }
 }
 
@@ -5952,6 +6325,25 @@ async function poll() {
     if (retailer.key === "walgreens" && changes.newFinds.length > 0) {
       recordWalgreensFpEvent(state, changes.newFinds);
     }
+
+    // Observability tracking (#8/#9/#10/#21). All bounded; safe across retailers.
+    for (const find of changes.newFinds) {
+      recordFirstFindEvent(state, retailer.key, store.storeId, find.name);
+      recordRedditLagEvent(state, retailer.key, store.storeId, find.name, reddit);
+      recordLeadOrConfirmation(state, retailer.key, store.storeId, find);
+      markWatchListVerified(state, retailer.key, store.storeId, find);
+    }
+    // Confirmed reaffirmations of previously-pending leads (still-in-stock with
+    // confidence !== "lead" upgrades the ledger entry to "confirmed").
+    for (const find of changes.stillInStock) {
+      recordLeadOrConfirmation(state, retailer.key, store.storeId, find);
+    }
+    if (changes.goneOOS.length > 0) {
+      markLeadsAsFalsePositive(
+        state, retailer.key, store.storeId,
+        changes.goneOOS.map((b) => b.name),
+      );
+    }
     storesScanned++;
     retailersSeen.add(retailer.key);
     scannedStores.push({ retailerName: retailer.name, storeName: store.name, storeId: store.storeId });
@@ -6361,6 +6753,9 @@ export {
   formatBandwidthCost, PROXY_COST_PER_GB,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel, inferRetailerFromText,
+  DISTILLERY_SOURCES, fetchDistilleryNewsPage, scrapeDistilleryNews,
+  recordFirstFindEvent, recordRedditLagEvent, recordLeadOrConfirmation, markLeadsAsFalsePositive, markWatchListVerified, leadHistoryKey,
+  sendNtfyPush, detectApexEmbed,
   validateEnv,
   poll,
 };
@@ -6577,6 +6972,25 @@ async function main() {
     }
     scheduleNextRedditCheck();
     console.log("Reddit intel: monitoring r/ArizonaWhiskey + r/arizonabourbon + r/bourbon + r/whiskey + r/Costco_alcohol (every 5-10 min)");
+
+    // Distillery news (#17) — quarterly cadence, so check every 30 min ± 15 min
+    // jitter. No proxy / no anti-bot; lightweight HTTP.
+    const DISTILLERY_INTERVAL_MS = 30 * 60 * 1000;
+    function scheduleNextDistilleryCheck() {
+      const jitter = Math.random() * 15 * 60 * 1000;
+      /* v8 ignore next -- setTimeout scheduling */
+      setTimeout(async () => {
+        try {
+          const state = await loadState();
+          await scrapeDistilleryNews(state);
+        } catch (err) {
+          console.error("[distillery] Check failed:", err.message);
+        }
+        scheduleNextDistilleryCheck();
+      }, DISTILLERY_INTERVAL_MS + jitter);
+    }
+    scheduleNextDistilleryCheck();
+    console.log("Distillery news: monitoring Heaven Hill + Sazerac (BTAC) + Old Forester announcement pages (every 30-45 min)");
 
     /* v8 ignore next -- fire-and-forget initial poll */
     poll()

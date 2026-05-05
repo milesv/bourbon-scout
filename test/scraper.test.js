@@ -95,6 +95,8 @@ import {
   bufferPendingAlert, replayPendingAlerts, postDiscordWebhookOnce, formatBandwidthCost,
   WATCH_LIST, processWatchList, buildWatchListEmbed, watchListKey,
   REDDIT_INTEL_SUBREDDITS, REDDIT_NATIONAL_SUBREDDITS, REDDIT_AZ_FILTER, REDDIT_INTEL_KEYWORDS, scrapeRedditIntel, inferRetailerFromText,
+  recordFirstFindEvent, recordRedditLagEvent, recordLeadOrConfirmation, markLeadsAsFalsePositive, markWatchListVerified, leadHistoryKey,
+  sendNtfyPush, detectApexEmbed, DISTILLERY_SOURCES,
   shuffleKeepCanaryFirst,
   CANARY_BY_RETAILER, isCanaryFor,
   ULTRA_RARE_BOTTLES, rerunCadenceFor,
@@ -10019,5 +10021,346 @@ describe("Kroger pagination beyond page 2 (#20)", () => {
     expect(offset(2)).toBe(50);
     expect(offset(3)).toBe(100);
     expect(offset(4)).toBe(150);
+  });
+});
+
+// ─── #8: Time-to-first-find tracking ──────────────────────────────────────────
+
+describe("recordFirstFindEvent (#8)", () => {
+  it("records first-ever find on empty state", () => {
+    const state = {};
+    recordFirstFindEvent(state, "kroger", "111", "Pappy Van Winkle 15 Year");
+    expect(state._firstFindByBottle["Pappy Van Winkle 15 Year"]).toBeDefined();
+    expect(state._firstFindByBottle["Pappy Van Winkle 15 Year"].firstRetailer).toBe("kroger");
+    expect(state._firstFindByBottle["Pappy Van Winkle 15 Year"].firstStoreId).toBe("111");
+  });
+
+  it("logs cross-retailer lag when same bottle appears at a different retailer", () => {
+    const state = {};
+    recordFirstFindEvent(state, "kroger", "111", "Pappy Van Winkle 15 Year");
+    // Simulate later find at Total Wine
+    recordFirstFindEvent(state, "totalwine", "1010", "Pappy Van Winkle 15 Year");
+    expect(state._crossRetailerLag).toHaveLength(1);
+    expect(state._crossRetailerLag[0].firstRetailer).toBe("kroger");
+    expect(state._crossRetailerLag[0].secondRetailer).toBe("totalwine");
+  });
+
+  it("does NOT log cross-retailer lag for same retailer (different store)", () => {
+    const state = {};
+    recordFirstFindEvent(state, "kroger", "111", "Pappy Van Winkle 15 Year");
+    recordFirstFindEvent(state, "kroger", "222", "Pappy Van Winkle 15 Year");
+    expect(state._crossRetailerLag).toBeUndefined();
+  });
+
+  it("re-arms slot after FIRST_FIND_REARM_MS (30 days) so future drops re-record", () => {
+    const state = {
+      _firstFindByBottle: {
+        "Pappy Van Winkle 15 Year": {
+          firstSeen: new Date(Date.now() - 35 * 86400000).toISOString(), // 35d ago
+          firstRetailer: "totalwine",
+          firstStoreId: "1010",
+          _crossLogged: true,
+        },
+      },
+    };
+    recordFirstFindEvent(state, "kroger", "111", "Pappy Van Winkle 15 Year");
+    // Should be re-armed: new firstRetailer
+    expect(state._firstFindByBottle["Pappy Van Winkle 15 Year"].firstRetailer).toBe("kroger");
+    expect(state._firstFindByBottle["Pappy Van Winkle 15 Year"]._crossLogged).toBe(false);
+  });
+
+  it("only logs cross-retailer lag once per bottle per drop cycle", () => {
+    const state = {};
+    recordFirstFindEvent(state, "kroger", "111", "Pappy Van Winkle 15 Year");
+    recordFirstFindEvent(state, "totalwine", "1010", "Pappy Van Winkle 15 Year");
+    recordFirstFindEvent(state, "costco", "736", "Pappy Van Winkle 15 Year");
+    // Only the first cross-retailer hit logged
+    expect(state._crossRetailerLag).toHaveLength(1);
+  });
+
+  it("caps _crossRetailerLag at 100 entries", () => {
+    const state = { _crossRetailerLag: [] };
+    for (let i = 0; i < 105; i++) {
+      state._crossRetailerLag.push({ bottle: `b${i}`, lagMs: i });
+    }
+    // Simulate one more event triggering the cap
+    recordFirstFindEvent(state, "kroger", "111", "Cap Trigger Bottle");
+    recordFirstFindEvent(state, "totalwine", "1010", "Cap Trigger Bottle");
+    expect(state._crossRetailerLag.length).toBeLessThanOrEqual(100);
+  });
+});
+
+// ─── #9: Reddit-vs-scraper lag tracking ───────────────────────────────────────
+
+describe("recordRedditLagEvent (#9)", () => {
+  it("logs lag when Reddit reported earlier than scraper", () => {
+    const state = {};
+    const twoHoursAgo = new Date(Date.now() - 2 * 3600000).toISOString();
+    recordRedditLagEvent(state, "kroger", "111", "Pappy Van Winkle 15 Year", {
+      "Pappy Van Winkle 15 Year": twoHoursAgo,
+    });
+    expect(state._redditLag).toHaveLength(1);
+    expect(state._redditLag[0].lagMs).toBeGreaterThan(0);
+    expect(state._redditLag[0].lagMs).toBeLessThan(3 * 3600000); // ~2h
+  });
+
+  it("no-op when bottle has no Reddit mention", () => {
+    const state = {};
+    recordRedditLagEvent(state, "kroger", "111", "Pappy Van Winkle 15 Year", {});
+    expect(state._redditLag).toBeUndefined();
+  });
+
+  it("no-op when Reddit timestamp is in the future (clock skew)", () => {
+    const state = {};
+    const future = new Date(Date.now() + 60000).toISOString();
+    recordRedditLagEvent(state, "kroger", "111", "Pappy Van Winkle 15 Year", {
+      "Pappy Van Winkle 15 Year": future,
+    });
+    expect(state._redditLag).toBeUndefined();
+  });
+
+  it("caps _redditLag at SIGNAL_LAG_HISTORY_CAP (100 entries)", () => {
+    const state = { _redditLag: [] };
+    for (let i = 0; i < 105; i++) {
+      state._redditLag.push({ bottle: `b${i}`, lagMs: i });
+    }
+    const recentTs = new Date(Date.now() - 3600000).toISOString();
+    recordRedditLagEvent(state, "kroger", "111", "Trigger Bottle", { "Trigger Bottle": recentTs });
+    expect(state._redditLag.length).toBeLessThanOrEqual(100);
+  });
+});
+
+// ─── #10: Lead → confirmed FP rate ────────────────────────────────────────────
+
+describe("recordLeadOrConfirmation + markLeadsAsFalsePositive (#10)", () => {
+  it("records pending lead on first emission", () => {
+    const state = {};
+    recordLeadOrConfirmation(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year", confidence: "lead" });
+    const key = leadHistoryKey("kroger", "111", "Pappy Van Winkle 15 Year");
+    expect(state._leadHistory[key].status).toBe("pending");
+    expect(state._leadHistory[key].leadEmittedAt).toBeDefined();
+  });
+
+  it("upgrades pending lead to confirmed when same bottle appears with non-lead confidence", () => {
+    const state = {};
+    recordLeadOrConfirmation(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year", confidence: "lead" });
+    // Now bottle re-appears as confirmed (regular newFind)
+    recordLeadOrConfirmation(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year", confidence: "confirmed" });
+    const key = leadHistoryKey("kroger", "111", "Pappy Van Winkle 15 Year");
+    expect(state._leadHistory[key].status).toBe("confirmed");
+    expect(state._leadHistory[key].statusChangedAt).toBeDefined();
+  });
+
+  it("treats find without confidence as non-lead (back-compat)", () => {
+    const state = {};
+    recordLeadOrConfirmation(state, "costco", "100", { name: "Pappy Van Winkle 15 Year", confidence: "lead" });
+    recordLeadOrConfirmation(state, "costco", "100", { name: "Pappy Van Winkle 15 Year" /* no confidence */ });
+    const key = leadHistoryKey("costco", "100", "Pappy Van Winkle 15 Year");
+    expect(state._leadHistory[key].status).toBe("confirmed");
+  });
+
+  it("markLeadsAsFalsePositive flips pending leads to false_positive", () => {
+    const state = {};
+    recordLeadOrConfirmation(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year", confidence: "lead" });
+    markLeadsAsFalsePositive(state, "kroger", "111", ["Pappy Van Winkle 15 Year"]);
+    const key = leadHistoryKey("kroger", "111", "Pappy Van Winkle 15 Year");
+    expect(state._leadHistory[key].status).toBe("false_positive");
+  });
+
+  it("markLeadsAsFalsePositive does NOT flip already-confirmed leads", () => {
+    const state = {};
+    recordLeadOrConfirmation(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year", confidence: "lead" });
+    recordLeadOrConfirmation(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year", confidence: "confirmed" });
+    markLeadsAsFalsePositive(state, "kroger", "111", ["Pappy Van Winkle 15 Year"]);
+    const key = leadHistoryKey("kroger", "111", "Pappy Van Winkle 15 Year");
+    expect(state._leadHistory[key].status).toBe("confirmed"); // unchanged
+  });
+
+  it("caps lead history at LEAD_HISTORY_CAP (200) via LRU eviction", () => {
+    const state = { _leadHistory: {} };
+    // Pre-populate near cap with old entries
+    for (let i = 0; i < 199; i++) {
+      const key = leadHistoryKey("kroger", String(i), "Bottle");
+      state._leadHistory[key] = {
+        leadEmittedAt: new Date(Date.now() - (200 - i) * 60000).toISOString(),
+        status: "pending",
+        statusChangedAt: null,
+      };
+    }
+    // Add 5 more new entries to push past the cap
+    for (let i = 0; i < 5; i++) {
+      recordLeadOrConfirmation(state, "kroger", `new-${i}`, { name: `New Bottle ${i}`, confidence: "lead" });
+    }
+    expect(Object.keys(state._leadHistory).length).toBeLessThanOrEqual(200);
+  });
+});
+
+// ─── #21: Watchlist effectiveness ─────────────────────────────────────────────
+
+describe("markWatchListVerified (#21)", () => {
+  it("marks a watchlist entry as verified when find matches bottle+retailer+store", () => {
+    const watchKey = "Pappy Van Winkle 15 Year:kroger:111";
+    const state = {
+      _watchList: {
+        [watchKey]: { firedAt: new Date(Date.now() - 86400000).toISOString(), verifiedAt: null },
+      },
+    };
+    markWatchListVerified(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year" });
+    expect(state._watchList[watchKey].verifiedAt).toBeDefined();
+  });
+
+  it("migrates legacy string-format _watchList entries on verification", () => {
+    const watchKey = "Pappy Van Winkle 15 Year:kroger:111";
+    const state = {
+      _watchList: {
+        [watchKey]: new Date(Date.now() - 86400000).toISOString(), // legacy string
+      },
+    };
+    markWatchListVerified(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year" });
+    expect(typeof state._watchList[watchKey]).toBe("object");
+    expect(state._watchList[watchKey].verifiedAt).toBeDefined();
+    expect(state._watchList[watchKey].firedAt).toBeDefined();
+  });
+
+  it("does NOT verify entries older than 7 days (different drop cycle)", () => {
+    const watchKey = "Pappy Van Winkle 15 Year:kroger:111";
+    const state = {
+      _watchList: {
+        [watchKey]: { firedAt: new Date(Date.now() - 10 * 86400000).toISOString(), verifiedAt: null },
+      },
+    };
+    markWatchListVerified(state, "kroger", "111", { name: "Pappy Van Winkle 15 Year" });
+    expect(state._watchList[watchKey].verifiedAt).toBeNull();
+  });
+
+  it("verifies 'Allocated Bourbon' (any-bottle) entries when ANY bottle matches", () => {
+    const watchKey = "Allocated Bourbon:kroger:111";
+    const state = {
+      _watchList: {
+        [watchKey]: { firedAt: new Date(Date.now() - 86400000).toISOString(), verifiedAt: null },
+      },
+    };
+    markWatchListVerified(state, "kroger", "111", { name: "Eagle Rare 17 Year" });
+    expect(state._watchList[watchKey].verifiedAt).toBeDefined();
+  });
+
+  it("does NOT verify when storeId doesn't match", () => {
+    const watchKey = "Pappy Van Winkle 15 Year:kroger:111,222";
+    const state = {
+      _watchList: {
+        [watchKey]: { firedAt: new Date(Date.now() - 86400000).toISOString(), verifiedAt: null },
+      },
+    };
+    markWatchListVerified(state, "kroger", "999", { name: "Pappy Van Winkle 15 Year" });
+    expect(state._watchList[watchKey].verifiedAt).toBeNull();
+  });
+
+  it("matches when storeId is in comma-separated list", () => {
+    const watchKey = "Pappy Van Winkle 15 Year:kroger:111,222,333";
+    const state = {
+      _watchList: {
+        [watchKey]: { firedAt: new Date(Date.now() - 86400000).toISOString(), verifiedAt: null },
+      },
+    };
+    markWatchListVerified(state, "kroger", "222", { name: "Pappy Van Winkle 15 Year" });
+    expect(state._watchList[watchKey].verifiedAt).toBeDefined();
+  });
+});
+
+// ─── #22: ntfy.sh push notifications for apex finds ───────────────────────────
+
+describe("detectApexEmbed (#22)", () => {
+  it("returns the apex bottle name when an embed description mentions it", () => {
+    const embeds = [{ description: "🦄 Pappy Van Winkle 23 Year — $299 spotted" }];
+    expect(detectApexEmbed(embeds)).toBe("Pappy Van Winkle 23 Year");
+  });
+
+  it("returns null when no apex bottle is mentioned", () => {
+    const embeds = [{ description: "🟢 Eagle Rare 17 Year — $149" }];
+    expect(detectApexEmbed(embeds)).toBeNull();
+  });
+
+  it("returns null on empty/null inputs", () => {
+    expect(detectApexEmbed([])).toBeNull();
+    expect(detectApexEmbed(null)).toBeNull();
+  });
+
+  it("scans across multiple embeds in a batch", () => {
+    const embeds = [
+      { description: "🟢 Stagg Jr — $89" },
+      { description: "🦄 Heaven Hill Heritage Collection 22 Year — $499" },
+    ];
+    expect(detectApexEmbed(embeds)).toBe("Heaven Hill Heritage Collection 22 Year");
+  });
+});
+
+describe("sendNtfyPush (#22)", () => {
+  beforeEach(() => {
+    mocks.fetch.mockReset();
+    delete process.env.NTFY_TOPIC;
+  });
+
+  it("no-ops when NTFY_TOPIC env is unset", async () => {
+    await sendNtfyPush({ title: "Pappy 23", message: "spotted at Costco" });
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it("POSTs to ntfy.sh/<topic> when NTFY_TOPIC is a bare topic name", async () => {
+    process.env.NTFY_TOPIC = "my-bourbon-topic";
+    mocks.fetch.mockResolvedValue({ ok: true, status: 200 });
+    await sendNtfyPush({ title: "Pappy 23", message: "spotted at Costco", priority: "urgent" });
+    expect(mocks.fetch).toHaveBeenCalledWith(
+      "https://ntfy.sh/my-bourbon-topic",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Title: "Pappy 23", Priority: "urgent" }),
+      }),
+    );
+  });
+
+  it("uses full URL when NTFY_TOPIC is an absolute URL (self-hosted)", async () => {
+    process.env.NTFY_TOPIC = "https://ntfy.example.com/private";
+    mocks.fetch.mockResolvedValue({ ok: true, status: 200 });
+    await sendNtfyPush({ title: "x", message: "y" });
+    expect(mocks.fetch).toHaveBeenCalledWith(
+      "https://ntfy.example.com/private",
+      expect.any(Object),
+    );
+  });
+
+  it("swallows network errors silently", async () => {
+    process.env.NTFY_TOPIC = "test";
+    mocks.fetch.mockRejectedValue(new Error("ECONNRESET"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(sendNtfyPush({ title: "x", message: "y" })).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Push failed"));
+    warnSpy.mockRestore();
+  });
+
+  afterEach(() => { delete process.env.NTFY_TOPIC; });
+});
+
+// ─── #17: Distillery news monitor ─────────────────────────────────────────────
+
+describe("DISTILLERY_SOURCES (#17)", () => {
+  it("includes the three live sources from research findings", () => {
+    const keys = DISTILLERY_SOURCES.map((s) => s.key);
+    expect(keys).toEqual(expect.arrayContaining(["heaven_hill", "sazerac", "old_forester"]));
+  });
+
+  it("each source has url + keywords + name", () => {
+    for (const source of DISTILLERY_SOURCES) {
+      expect(source.url).toMatch(/^https?:\/\//);
+      expect(source.name).toBeTruthy();
+      expect(source.keywords.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("keywords are lowercase (matched against lowercased title)", () => {
+    for (const source of DISTILLERY_SOURCES) {
+      for (const kw of source.keywords) {
+        expect(kw).toBe(kw.toLowerCase());
+      }
+    }
   });
 });
