@@ -1618,8 +1618,31 @@ function timeAgo(isoStr) {
 
 // ─── Embed Builders ─────────────────────────────────────────────────────────
 
+// #14 — Visual rarity hierarchy. The previous embed treatment rendered Pappy 23
+// identically to Eagle Rare 17, even though hunting strategy is wildly different
+// (drop-everything vs. nice-to-have). Three tiers:
+//   🦄  apex — truly impossible (Pappy 20/23, Heaven Hill Heritage 22). Drop
+//       everything you're doing.
+//   ⭐  obsess — every other ULTRA_RARE_BOTTLES entry (BTAC, Pappy 10/12/15,
+//       King of Kentucky, Old Forester limiteds, EHT 18 Year). Worth the drive.
+//   (no marker)  track tier — Weller, EHT regulars, Blanton's, Stagg Jr,
+//       Elmer T. Lee, etc. Worth grabbing if convenient.
+const BOTTLE_APEX = new Set([
+  "Pappy Van Winkle 23 Year",
+  "Pappy Van Winkle 20 Year",
+  "Heaven Hill Heritage Collection 22 Year",
+]);
+
+function bottleRarityMarker(bottleName) {
+  if (BOTTLE_APEX.has(bottleName)) return "🦄 ";
+  if (ULTRA_RARE_BOTTLES.has(bottleName)) return "⭐ ";
+  return "";
+}
+
 function formatBottleLine(b, skuLabel, prefix = "🟢") {
-  let line = b.url ? `${prefix} [${b.name}](${b.url})` : `${prefix} ${b.name}`;
+  const rarity = bottleRarityMarker(b.name);
+  const displayName = `${rarity}${b.name}`;
+  let line = b.url ? `${prefix} [${displayName}](${b.url})` : `${prefix} ${displayName}`;
   const details = [];
   if (b.price) details.push(`💰 ${b.price}`);
   if (b.sku) details.push(`🏷️ ${skuLabel}${b.sku}`);
@@ -1729,7 +1752,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
       desc += `\n\n✅ **STILL IN STOCK (${changes.stillInStock.length})**\n`;
       desc += changes.stillInStock.map((b) => {
         const since = b.firstSeen ? ` (since ${timeAgo(b.firstSeen)})` : "";
-        return `🔵 ${b.name} — ${b.price || "N/A"} · 🏷️ ${info.skuLabel}${b.sku || "?"}${since}`;
+        return `🔵 ${bottleRarityMarker(b.name)}${b.name} — ${b.price || "N/A"} · 🏷️ ${info.skuLabel}${b.sku || "?"}${since}`;
       }).join("\n");
     }
 
@@ -1754,7 +1777,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
       desc += `\n\n✅ **STILL IN STOCK (${changes.stillInStock.length})**\n`;
       desc += changes.stillInStock.map((b) => {
         const since = b.firstSeen ? ` (since ${timeAgo(b.firstSeen)})` : "";
-        return `🔵 ${b.name} — ${b.price || "N/A"} · 🏷️ ${info.skuLabel}${b.sku || "?"}${since}`;
+        return `🔵 ${bottleRarityMarker(b.name)}${b.name} — ${b.price || "N/A"} · 🏷️ ${info.skuLabel}${b.sku || "?"}${since}`;
       }).join("\n");
     }
 
@@ -1791,7 +1814,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
     let desc = `${info.storeLine}\n${info.addressLine}\n\n📉 **NO LONGER AVAILABLE**\n`;
     desc += changes.goneOOS.map((b) => {
       const duration = b.firstSeen ? ` · was in stock for ${timeAgo(b.firstSeen).replace(" ago", "")}` : "";
-      return `🔴 ${b.name}${b.price ? ` (was ${b.price})` : ""}\n   🏷️ ${info.skuLabel}${b.sku || "?"}${duration}`;
+      return `🔴 ${bottleRarityMarker(b.name)}${b.name}${b.price ? ` (was ${b.price})` : ""}\n   🏷️ ${info.skuLabel}${b.sku || "?"}${duration}`;
     }).join("\n\n");
 
     const inStockNames = changes.stillInStock.map((b) => b.name);
@@ -3570,6 +3593,53 @@ async function scrapeWalmartViaFetch(store) {
       validPages++;
       trackHealth("walmart", "ok");
       found.push(...matchWalmartNextData(nextData));
+
+      // #19 — Walmart pagination. Walmart's typical page size is 40 items.
+      // If page 1 returned ≥ 35 items, broad queries like "buffalo trace" or
+      // "bourbon" likely have more results buried below "Sponsored" placements.
+      // Fetch page 2 only when the heuristic suggests it's worth it (cap at 1
+      // additional page to bound cost — page 3+ is diminishing returns and we
+      // already have priority-query retry as a safety net).
+      const stacks = nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks || [];
+      const itemCount = stacks.reduce((sum, s) => sum + (s?.items?.length || 0), 0);
+      if (itemCount >= 35) {
+        try {
+          await sleep(800 + Math.random() * 700); // jitter between page 1 and 2
+          const p2Url = `${url}&page=2`;
+          const p2Res = await scraperFetchRetry(p2Url, { headers, timeout: 15000, proxyUrl: getRetailerProxyUrl("walmart") });
+          if (p2Res.ok) {
+            const p2Html = await p2Res.text();
+            if (!isFetchBlocked(p2Html)) {
+              const p2Idx = p2Html.indexOf('id="__NEXT_DATA__"');
+              if (p2Idx !== -1) {
+                const p2BraceStart = p2Html.indexOf("{", p2Idx);
+                if (p2BraceStart !== -1) {
+                  let d = 0, s = false, e = false, p2End = -1;
+                  for (let j = p2BraceStart; j < p2Html.length; j++) {
+                    const ch = p2Html[j];
+                    if (e) { e = false; continue; }
+                    if (ch === "\\") { e = true; continue; }
+                    if (ch === '"') { s = !s; continue; }
+                    if (s) continue;
+                    if (ch === "{") d++;
+                    else if (ch === "}") { d--; if (d === 0) { p2End = j + 1; break; } }
+                  }
+                  if (p2End !== -1) {
+                    const p2Data = JSON.parse(p2Html.slice(p2BraceStart, p2End));
+                    if (p2Data?.props?.pageProps?.initialData?.searchResult != null) {
+                      const p2Found = matchWalmartNextData(p2Data);
+                      if (p2Found.length > 0) {
+                        console.log(`[walmart:${store.storeId}] page 2 of "${query}" added ${p2Found.length} match(es)`);
+                        found.push(...p2Found);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch { /* page 2 best-effort — don't fail the whole query */ }
+      }
     } catch {
       failures++;
       if (PRIORITY_QUERIES.has(query)) failedPriorityQueries.add(query);
@@ -4883,21 +4953,34 @@ async function scrapeKrogerStore(store) {
       const data = await res.json();
       matchKrogerProducts(data.data || []);
       trackHealth("kroger", "ok");
-      // Fetch page 2 if first page was full (may have more results).
-      // Isolated try/catch: page 2 failure shouldn't lose page 1 data or mark query as failed.
-      if (data.data?.length === 50) {
+      // #20 — Extended pagination. Marketplace Fry's during allocation events
+      // can return 100+ liquor results for broad queries like "bourbon" or
+      // "buffalo trace". Walk pages 2/3/4 until we get a non-full page or hit
+      // KROGER_MAX_PAGES. Each page failure is isolated — losing page 3 doesn't
+      // discard pages 1+2. Capped to avoid unbounded fetches if Kroger ever
+      // changes its server-side limit semantics.
+      const KROGER_MAX_PAGES = 4; // pages 1..4 = up to 200 products per query
+      let lastFullPage = data.data?.length === 50;
+      for (let pageNum = 2; pageNum <= KROGER_MAX_PAGES && lastFullPage; pageNum++) {
+        const offset = (pageNum - 1) * 50;
         try {
-          const res2 = await scraperFetchRetry(`${baseUrl}&filter.start=50`, {
+          const resN = await scraperFetchRetry(`${baseUrl}&filter.start=${offset}`, {
             headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
             timeout: 15000,
             proxyUrl: krogerProxy2 || undefined,
           });
-          if (res2.ok) {
-            const data2 = await res2.json();
-            matchKrogerProducts(data2.data || []);
+          if (!resN.ok) {
+            console.warn(`[kroger:${store.storeId}] Page ${pageNum} HTTP ${resN.status} for "${query}" — stopping pagination`);
+            break;
           }
-        } catch (p2Err) {
-          console.warn(`[kroger:${store.storeId}] Page 2 failed for "${query}": ${p2Err.message}`);
+          const dataN = await resN.json();
+          const items = dataN.data || [];
+          if (items.length === 0) break;
+          matchKrogerProducts(items);
+          lastFullPage = items.length === 50; // continue only if this page was also full
+        } catch (pErr) {
+          console.warn(`[kroger:${store.storeId}] Page ${pageNum} failed for "${query}": ${pErr.message} — stopping pagination`);
+          break;
         }
       }
     } catch (err) {
@@ -6181,6 +6264,39 @@ async function poll() {
     }
   }
 
+  // #15 — Drop-cluster detection. When ≥3 distinct allocated bottles surface
+  // at the same retailer in a single scan, that's a real allocation event,
+  // not coincidence. Fires a single quiet "🎯 ALLOCATION DROP DETECTED" embed
+  // *after* the per-store @here alerts so the user has both granular pings
+  // and a meta-summary saying "this is THE event, not 3 unrelated finds".
+  // Threshold of 3 is empirical — single-bottle drops are common; 3+ at once
+  // strongly suggests the retailer rotated allocated stock to that store/region.
+  const DROP_CLUSTER_THRESHOLD = 3;
+  const clusterEmbeds = [];
+  for (const [retailerKey, bottleSet] of Object.entries(scanFinds)) {
+    if (!(bottleSet instanceof Set) || bottleSet.size < DROP_CLUSTER_THRESHOLD) continue;
+    const retailerCfg = RETAILERS.find((r) => r.key === retailerKey);
+    if (!retailerCfg) continue;
+    const bottles = [...bottleSet];
+    const bottleLines = bottles
+      .map((name) => `${bottleRarityMarker(name)}**${name}**`)
+      .join("\n");
+    const desc = `🎯 **${bottles.length} allocated bottles surfaced at ${retailerCfg.name} this scan** — this is a real allocation event, not coincidence. Individual @here alerts already fired per store; the rollup below confirms the pattern.\n\n${bottleLines}`;
+    clusterEmbeds.push({
+      title: truncateTitle(`🎯 ALLOCATION DROP — ${retailerCfg.name} (${bottles.length} bottles)`),
+      description: truncateDescription(desc),
+      color: COLORS.restock, // pink/magenta — same urgency tier as restocks
+      footer: { text: `Bourbon Scout 🥃 │ ${retailerCfg.name} · drop cluster` },
+      timestamp: new Date().toISOString(),
+    });
+  }
+  if (clusterEmbeds.length > 0) {
+    console.log(`[poll] 🎯 Sending ${clusterEmbeds.length} drop-cluster embed(s)`);
+    await sendDiscordAlert(clusterEmbeds).catch((err) =>
+      console.error(`[poll] Drop-cluster alert failed: ${err.message}`)
+    );
+  }
+
   // Quiet summary at end of every poll
   const bandwidthCost = formatBandwidthCost(bandwidthStats.totalBytes, bandwidthStats.startTs);
   const summary = buildSummaryEmbed({ storesScanned, retailersScanned: retailersSeen.size, totalNewFinds, totalConfirmed, totalLeads, totalStillInStock, totalGoneOOS, nothingCount, durationSec, scannedStores, health: scraperHealth, canaryResults, trend, peakHours, bandwidth: bandwidthCost });
@@ -6222,6 +6338,7 @@ export {
   shuffle, withTimeout, runWithConcurrency, matchWalmartNextData,
   COLORS, SKU_LABELS, formatStoreInfo, parseCity, parseState, timeAgo,
   formatBottleLine, buildOOSList, truncateDescription, DISCORD_DESC_LIMIT, buildStoreEmbeds, buildSummaryEmbed, rerunCadenceFor,
+  bottleRarityMarker, BOTTLE_APEX,
   loadState, saveState, computeChanges, updateStoreState, pruneState,
   METRICS_FILE, appendMetrics, loadRecentMetrics, pruneMetrics, computeMetricsTrend, computePeakHours, detectHealthDegradation,
   postDiscordWebhook, sendDiscordAlert, sendUrgentAlert,
