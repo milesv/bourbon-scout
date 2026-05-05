@@ -3794,9 +3794,15 @@ async function scrapeTotalWineStore(store) {
 
   // Per-store scrapers do NOT use fail-fast — each store tries browser independently.
   // A fresh page load with different queries may succeed even if a prior store was blocked.
-  const skipPreWarm = !!retailerBrowserCache["totalwine"];
-  console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP${skipPreWarm ? ", warm" : ""})`);
+  console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP)`);
   const releaseLock = await acquireRetailerLock("totalwine");
+  // skipPreWarm computed AFTER lock acquisition — without this, concurrent stores
+  // all read an empty retailerBrowserCache before any of them populate it (race),
+  // and every store ends up doing full pre-warm. Inside the lock, only one store
+  // is here at a time, so the cache state reflects whether a prior store has
+  // already warmed the persistent context.
+  const skipPreWarm = !!retailerBrowserCache["totalwine"];
+  if (skipPreWarm) console.log(`[totalwine:${store.storeId}] Context warm — will skip pre-warm`);
   let page;
   try {
     ({ page } = await launchRetailerBrowser("totalwine", { clean: true }));
@@ -4225,12 +4231,14 @@ async function scrapeWalmartStore(store) {
     }
   }
   // Per-store scrapers do NOT use fail-fast — each store tries browser independently.
-  // Track warm context: subsequent stores in the same poll skip pre-warm since the
-  // persistent context still has WAF cookies (_abck, _px*) from store 1's solve.
-  // Saves ~80-150s per store across 5 Walmart stores = up to 10min off the budget.
-  const skipPreWarm = !!retailerBrowserCache["walmart"];
-  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser${skipPreWarm ? " (warm)" : ""}`);
+  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser`);
   const releaseLock = await acquireRetailerLock("walmart");
+  // skipPreWarm computed AFTER lock acquisition (race fix). Concurrent stores all
+  // read empty cache before any of them populate it; reading inside the lock is
+  // serialized so the value is correct. Save ~80-150s per store across 5 Walmart
+  // stores = up to 10min off the budget when this fires.
+  const skipPreWarm = !!retailerBrowserCache["walmart"];
+  if (skipPreWarm) console.log(`[walmart:${store.storeId}] Context warm — will skip pre-warm`);
   let page;
   try {
     ({ page } = await launchRetailerBrowser("walmart", { clean: true }));
@@ -5949,8 +5957,7 @@ async function scrapeAlbertsonsStore(store) {
 
   delete scraperHealth["albertsons"];
 
-  const skipPreWarm = !!retailerBrowserCache["albertsons"];
-  console.log(`[albertsons:${store.storeId}] Queuing browser${skipPreWarm ? " (warm)" : ""}`);
+  console.log(`[albertsons:${store.storeId}] Queuing browser`);
   const releaseLock = await acquireRetailerLock("albertsons");
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -5965,6 +5972,14 @@ async function scrapeAlbertsonsStore(store) {
         await sleep(3000 + Math.random() * 2000);
       }
       /* v8 ignore stop */
+      // skipPreWarm computed inside the lock + inside the retry loop. Two reasons:
+      //   (1) Race fix — outside the lock, concurrent stores all read empty cache
+      //       before any of them populate it, and all do full pre-warm.
+      //   (2) Retry handling — on attempt > 0, the retry block above just deleted
+      //       retailerBrowserCache["albertsons"], so skipPreWarm must re-evaluate
+      //       to false. Computing once at the top would skip pre-warm on retry.
+      const skipPreWarm = !!retailerBrowserCache["albertsons"];
+      if (skipPreWarm) console.log(`[albertsons:${store.storeId}] Context warm — will skip pre-warm`);
       console.log("[albertsons] Using clean browser");
       let page;
       try {
