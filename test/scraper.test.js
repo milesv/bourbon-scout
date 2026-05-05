@@ -85,7 +85,7 @@ import {
   matchTotalWineInitialState, parseTotalWineInitialState, scrapeTotalWineViaFetch, scrapeTotalWineViaBrowser, scrapeTotalWineStore,
   scrapeWalmartViaFetch, scrapeWalmartViaBrowser, scrapeWalmartStore,
   getKrogerToken, scrapeKrogerStore, matchSafewayProducts, scrapeSafewayStore,
-  matchAlbertsonsProducts, scrapeAlbertsonsStore, ALBERTSONS_KEY,
+  matchAlbertsonsProducts, scrapeAlbertsonsStore, scrapeAlbertsonsViaBrowser, ALBERTSONS_KEY,
   matchCityHiveProducts, makeCityHiveScraper, CITYHIVE_RETAILERS, CITYHIVE_API_KEY,
   scrapeExtraMileStore, scrapeLiquorExpressStore, scrapeChandlerLiquorsStore,
   scrapeWalgreensViaBrowser, scrapeWalgreensStore, applyWalgreensConfidenceDemotion, recordWalgreensFpEvent, verifyWalgreensFindsViaPDP,
@@ -10362,5 +10362,103 @@ describe("DISTILLERY_SOURCES (#17)", () => {
         expect(kw).toBe(kw.toLowerCase());
       }
     }
+  });
+});
+
+// ─── skipPreWarm extension to Walmart / Albertsons / Safeway ──────────────────
+// The pattern (shipped on Total Wine first) reuses persistent-context cookies
+// across stores in the same poll, saving ~80-150s of homepage + challenge solve
+// + humanize per store-2-onward. Each test confirms the homepage URL is
+// skipped when skipPreWarm=true, exercised through the inner viaBrowser.
+
+describe("skipPreWarm — Walmart inner", () => {
+  it("does NOT navigate to walmart.com homepage when skipPreWarm=true", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValue(null);
+    mockPage.$$eval.mockResolvedValue([]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runWithFakeTimers(() =>
+      scrapeWalmartViaBrowser(TEST_STORE, mockPage, { skipPreWarm: true }),
+    );
+    // No goto call should match the homepage URL exactly (we accept search URLs)
+    const homepageGotos = mockPage.goto.mock.calls.filter(
+      (c) => c[0] === "https://www.walmart.com/",
+    );
+    expect(homepageGotos).toHaveLength(0);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Skipping pre-warm"));
+    logSpy.mockRestore();
+  });
+
+  it("DOES navigate to walmart.com homepage when skipPreWarm omitted (default)", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValue(null);
+    mockPage.$$eval.mockResolvedValue([]);
+    await runWithFakeTimers(() => scrapeWalmartViaBrowser(TEST_STORE, mockPage));
+    const homepageGotos = mockPage.goto.mock.calls.filter(
+      (c) => c[0] === "https://www.walmart.com/",
+    );
+    expect(homepageGotos.length).toBeGreaterThan(0);
+  });
+});
+
+describe("skipPreWarm — Albertsons inner", () => {
+  const albertsonsStore = { storeId: "3067", name: "Albertsons Test", address: "x, Mesa, AZ 85202" };
+
+  it("does NOT navigate to albertsons.com homepage when skipPreWarm=true", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValue({ response: { docs: [] } }); // empty API response
+    mockPage.$$eval.mockResolvedValue([]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runWithFakeTimers(() =>
+      scrapeAlbertsonsViaBrowser(mockPage, albertsonsStore, { skipPreWarm: true }),
+    );
+    const homepageGotos = mockPage.goto.mock.calls.filter(
+      (c) => c[0] === "https://www.albertsons.com/",
+    );
+    expect(homepageGotos).toHaveLength(0);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Skipping pre-warm"));
+    logSpy.mockRestore();
+  });
+
+  it("DOES navigate to homepage by default", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValue({ response: { docs: [] } });
+    mockPage.$$eval.mockResolvedValue([]);
+    await runWithFakeTimers(() => scrapeAlbertsonsViaBrowser(mockPage, albertsonsStore));
+    const homepageGotos = mockPage.goto.mock.calls.filter(
+      (c) => c[0] === "https://www.albertsons.com/",
+    );
+    expect(homepageGotos.length).toBeGreaterThan(0);
+  });
+});
+
+describe("skipPreWarm — Safeway inner", () => {
+  const safewayStore = { storeId: "1515", name: "Safeway Test", address: "x, Tempe, AZ 85284" };
+
+  it("does NOT navigate to safeway.com homepage when skipPreWarm=true", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValue({ response: { docs: [] } });
+    mockPage.$$eval.mockResolvedValue([]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runWithFakeTimers(() =>
+      scrapeSafewayViaBrowser(mockPage, safewayStore, { skipPreWarm: true }),
+    );
+    const homepageGotos = mockPage.goto.mock.calls.filter(
+      (c) => c[0] === "https://www.safeway.com/",
+    );
+    expect(homepageGotos).toHaveLength(0);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Skipping pre-warm"));
+    logSpy.mockRestore();
+  });
+
+  it("DOES navigate to homepage by default", async () => {
+    const mockPage = createMockPage();
+    mockPage.evaluate.mockResolvedValue({ response: { docs: [] } });
+    mockPage.$$eval.mockResolvedValue([]);
+    await runWithFakeTimers(() => scrapeSafewayViaBrowser(mockPage, safewayStore));
+    const homepageGotos = mockPage.goto.mock.calls.filter(
+      (c) => c[0] === "https://www.safeway.com/",
+    );
+    expect(homepageGotos.length).toBeGreaterThan(0);
   });
 });

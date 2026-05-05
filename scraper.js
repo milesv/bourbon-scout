@@ -4068,18 +4068,25 @@ async function scrapeWalmartViaFetch(store) {
 }
 
 // Browser-based Walmart scraper (fallback). Accepts a shared page.
-async function scrapeWalmartViaBrowser(store, page) {
+async function scrapeWalmartViaBrowser(store, page, { skipPreWarm = false } = {}) {
   const wmT0 = Date.now();
-  // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies.
-  // #3 — domcontentloaded (not networkidle): Walmart runs both Akamai _abck AND
-  // PerimeterX _px* in parallel; both keep beaconing so networkidle never settles.
-  // Explicit 5-9s dwell covers cookie issuance for both.
-  await page.goto("https://www.walmart.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
-  await sleep(5000 + Math.random() * 4000);
-  await solveHumanChallenge(page);
-  await humanizePage(page, { pace: "medium" });
-  await navigateCategory(page, "walmart");
-  recordPhase("walmart", "prewarm", Date.now() - wmT0);
+  if (!skipPreWarm) {
+    // Pre-warm: visit homepage to let Akamai/PerimeterX sensor set cookies.
+    // #3 — domcontentloaded (not networkidle): Walmart runs both Akamai _abck AND
+    // PerimeterX _px* in parallel; both keep beaconing so networkidle never settles.
+    // Explicit 5-9s dwell covers cookie issuance for both.
+    await page.goto("https://www.walmart.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+    await sleep(5000 + Math.random() * 4000);
+    await solveHumanChallenge(page);
+    await humanizePage(page, { pace: "medium" });
+    await navigateCategory(page, "walmart");
+    recordPhase("walmart", "prewarm", Date.now() - wmT0);
+  } else {
+    // Subsequent stores in the same poll reuse the persistent context's cookies.
+    // Skipping pre-warm saves ~80-150s per store (homepage + sleep + solveChallenge
+    // + humanize + navigateCategory). Cookies survive in retailerBrowserCache.
+    console.log(`[walmart:${store.storeId}] Skipping pre-warm (context already warm)`);
+  }
   const wmQueriesT0 = Date.now();
 
   const found = [];
@@ -4218,7 +4225,11 @@ async function scrapeWalmartStore(store) {
     }
   }
   // Per-store scrapers do NOT use fail-fast — each store tries browser independently.
-  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser`);
+  // Track warm context: subsequent stores in the same poll skip pre-warm since the
+  // persistent context still has WAF cookies (_abck, _px*) from store 1's solve.
+  // Saves ~80-150s per store across 5 Walmart stores = up to 10min off the budget.
+  const skipPreWarm = !!retailerBrowserCache["walmart"];
+  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser${skipPreWarm ? " (warm)" : ""}`);
   const releaseLock = await acquireRetailerLock("walmart");
   let page;
   try {
@@ -4230,7 +4241,7 @@ async function scrapeWalmartStore(store) {
     return dedupFound(knownFound);
   }
   try {
-    const scraperPromise = scrapeWalmartViaBrowser(store, page);
+    const scraperPromise = scrapeWalmartViaBrowser(store, page, { skipPreWarm });
     scraperPromise.catch(() => {}); // Prevent unhandled rejection if timeout closes page
     const result = await withTimeout(scraperPromise, 300000, null);
     if (result === null) {
@@ -5490,25 +5501,32 @@ async function scrapeSafewayViaFetch(store) {
 // Browser-based Safeway scraper. Akamai WAF blocks all fetch-based approaches (API + got-scraping),
 // so we use a real browser to execute Akamai's JS sensor during pre-warm, then call the Safeway API
 // from within the browser context (inherits valid _abck cookies). Falls back to DOM extraction.
-async function scrapeSafewayViaBrowser(page, store) {
+async function scrapeSafewayViaBrowser(page, store, { skipPreWarm = false } = {}) {
   const found = [];
   const t0 = Date.now();
   const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 
-  // Pre-warm: visit homepage to let WAF sensor (Akamai _abck OR Incapsula incap_ses_*)
-  // execute. Use domcontentloaded — Safeway moved to Incapsula in 2026 and the page
-  // never reaches networkidle (sensor keeps beaconing). 20s on networkidle was eating
-  // the entire 300s budget before queries could run.
-  await page.goto("https://www.safeway.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
-  console.log(`[safeway:${store.storeId}] Homepage loaded (${elapsed()})`);
-  // Dwell to let WAF sensor JS run (both Akamai and Incapsula need ~5-8s for cookie issuance)
-  await sleep(6000 + Math.random() * 3000);
-  // solveHumanChallenge handles PerimeterX "Press & Hold" — no-op for Akamai/Incapsula
-  // (they use invisible JS challenges or full CAPTCHA we can't solve programmatically)
-  await solveHumanChallenge(page);
-  await humanizePage(page, { pace: "medium" });
-  // Skip navigateCategory — it adds another ~30-60s and isn't required for the API path
-  console.log(`[safeway:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
+  if (!skipPreWarm) {
+    // Pre-warm: visit homepage to let WAF sensor (Akamai _abck OR Incapsula incap_ses_*)
+    // execute. Use domcontentloaded — Safeway moved to Incapsula in 2026 and the page
+    // never reaches networkidle (sensor keeps beaconing). 20s on networkidle was eating
+    // the entire 300s budget before queries could run.
+    await page.goto("https://www.safeway.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+    console.log(`[safeway:${store.storeId}] Homepage loaded (${elapsed()})`);
+    // Dwell to let WAF sensor JS run (both Akamai and Incapsula need ~5-8s for cookie issuance)
+    await sleep(6000 + Math.random() * 3000);
+    // solveHumanChallenge handles PerimeterX "Press & Hold" — no-op for Akamai/Incapsula
+    // (they use invisible JS challenges or full CAPTCHA we can't solve programmatically)
+    await solveHumanChallenge(page);
+    await humanizePage(page, { pace: "medium" });
+    // Skip navigateCategory — it adds another ~30-60s and isn't required for the API path
+    console.log(`[safeway:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
+  } else {
+    // Future-proof for SECONDARY_ZIPS adding more Safeway stores. Today only one
+    // Safeway is in radius so this branch isn't exercised, but the wrapper threads
+    // skipPreWarm through so multi-store cost is bounded if discovery expands.
+    console.log(`[safeway:${store.storeId}] Skipping pre-warm (context already warm)`);
+  }
 
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
   let consecutiveBlocks = 0;
@@ -5641,7 +5659,11 @@ async function scrapeSafewayStore(store) {
       await sleep(3000 + Math.random() * 2000);
     }
     /* v8 ignore stop */
-    console.log("[safeway] Using clean browser");
+    // Track warm context: subsequent stores in the same poll skip pre-warm. Today
+    // Safeway has only 1 store in radius so this rarely fires, but threading it
+    // through means SECONDARY_ZIPS expansion gets the savings automatically.
+    const skipPreWarm = !!retailerBrowserCache["safeway"];
+    console.log(`[safeway] Using clean browser${skipPreWarm ? " (warm)" : ""}`);
     let page;
     try {
       ({ page } = await launchRetailerBrowser("safeway", { clean: true }));
@@ -5651,7 +5673,7 @@ async function scrapeSafewayStore(store) {
       return [];
     }
     try {
-      const scraperPromise = scrapeSafewayViaBrowser(page, store);
+      const scraperPromise = scrapeSafewayViaBrowser(page, store, { skipPreWarm });
       scraperPromise.catch(() => {});
       const result = await withTimeout(scraperPromise, 300000, null);
       /* v8 ignore start -- browser timeout/retry paths require real browser + sleep */
@@ -5785,21 +5807,28 @@ async function scrapeAlbertsonsViaFetch(store) {
 // Browser-based Albertsons scraper. Incapsula WAF blocks cold fetch requests,
 // so we use a real browser to earn Incapsula cookies, then call the API from
 // within the browser context. Same API as Safeway, different domain + WAF.
-async function scrapeAlbertsonsViaBrowser(page, store) {
+async function scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm = false } = {}) {
   const found = [];
   const t0 = Date.now();
   const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 
-  // #3 — domcontentloaded (not networkidle): Albertsons uses Incapsula (same as
-  // Safeway post-2026 migration). Incapsula sensor never goes idle. Explicit
-  // 6-9s dwell covers `incap_ses_*` issuance (matches Safeway's tuning).
-  await page.goto("https://www.albertsons.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
-  console.log(`[albertsons:${store.storeId}] Homepage loaded (${elapsed()})`);
-  await sleep(6000 + Math.random() * 3000);
-  await solveHumanChallenge(page);
-  await humanizePage(page, { pace: "slow" });
-  await navigateCategory(page, "albertsons");
-  console.log(`[albertsons:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
+  if (!skipPreWarm) {
+    // #3 — domcontentloaded (not networkidle): Albertsons uses Incapsula (same as
+    // Safeway post-2026 migration). Incapsula sensor never goes idle. Explicit
+    // 6-9s dwell covers `incap_ses_*` issuance (matches Safeway's tuning).
+    await page.goto("https://www.albertsons.com/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+    console.log(`[albertsons:${store.storeId}] Homepage loaded (${elapsed()})`);
+    await sleep(6000 + Math.random() * 3000);
+    await solveHumanChallenge(page);
+    await humanizePage(page, { pace: "slow" });
+    await navigateCategory(page, "albertsons");
+    console.log(`[albertsons:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
+  } else {
+    // Subsequent stores reuse `incap_ses_*` cookies from the persistent context.
+    // 3 Albertsons stores at 91-151s pre-warm each was eating 270-450s of budget;
+    // skipping for stores 2+ keeps total well under the 300s per-store cap.
+    console.log(`[albertsons:${store.storeId}] Skipping pre-warm (context already warm)`);
+  }
 
   const baseUrl = "https://www.albertsons.com/abs/pub/xapi/pgmsearch/v1/search/products";
   let consecutiveBlocks = 0;
@@ -5946,13 +5975,13 @@ async function scrapeAlbertsonsStore(store) {
         return [];
       }
       try {
-        const scraperPromise = scrapeAlbertsonsViaBrowser(page, store);
+        const scraperPromise = scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm });
         scraperPromise.catch(() => {});
         // 300s timeout — modern WAFs (Akamai/PerimeterX/Incapsula) keep the page chatty
         // so pre-warm alone takes 130-180s. Need headroom for queries after pre-warm.
-        // All browser scrapers use 300s for the same reason; bumped from 180s in 2026-04
-        // after metrics showed canary detection at 0% for Costco/Safeway/Sam's Club due
-        // to pre-warm consuming the entire budget before any queries could run.
+        // skipPreWarm (above) cuts that cost dramatically for stores 2+ in the same poll
+        // by reusing the persistent context's `incap_ses_*` cookies — without it the
+        // 3-store Albertsons sweep was eating 270-450s of pre-warm.
         const result = await withTimeout(scraperPromise, 300000, null);
         /* v8 ignore start -- browser timeout/retry paths */
         if (result === null) {
