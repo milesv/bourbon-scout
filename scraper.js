@@ -5552,21 +5552,38 @@ async function scrapeSafewayViaBrowser(page, store, { skipPreWarm = false } = {}
       // Primary: call Safeway API from browser context — inherits _abck cookies
       const apiUrl = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
       /* v8 ignore start -- browser-only API call */
-      // 15s per-query timeout (was unbounded). Without this, Incapsula slow-rolling
-      // a single response could hang the whole 300s budget; queries pile up; outer
-      // withTimeout fires; cascading "Target page closed" errors. AbortSignal.timeout
-      // bounds each query so a slow response abandons that query and moves on.
-      const data = await page.evaluate(async ({ url, apiKey }) => {
-        try {
-          const res = await fetch(url, {
-            headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
-            signal: AbortSignal.timeout(15000),
-          });
-          if (!res.ok) return null;
-          return await res.json();
-        } catch { return null; }
-      }, { url: apiUrl, apiKey: SAFEWAY_API_KEY });
+      // Two-layer bound (mirrors Albertsons fix):
+      //   A) page.evaluate returns { error: name } so Aborts/HTTP errors are
+      //      visible in logs (was: silent null).
+      //   B) Outer withTimeout(20s) catches the case where page.evaluate itself
+      //      hangs (browser context locked up) before the inner fetch starts.
+      const data = await withTimeout(
+        page.evaluate(async ({ url, apiKey }) => {
+          try {
+            const res = await fetch(url, {
+              headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+              signal: AbortSignal.timeout(15000),
+            });
+            if (!res.ok) return { error: `HTTP_${res.status}` };
+            return await res.json();
+          } catch (err) { return { error: err.name || "fetch_failed" }; }
+        }, { url: apiUrl, apiKey: SAFEWAY_API_KEY }),
+        20000,
+        { error: "WallClockTimeout" },
+      );
       /* v8 ignore stop */
+
+      if (data?.error) {
+        const isTimeout = data.error === "TimeoutError" || data.error === "AbortError" || data.error === "WallClockTimeout";
+        if (isTimeout) {
+          console.log(`[safeway:${store.storeId}] API "${query}" ${data.error} — skipping (context likely slow)`);
+          trackHealth("safeway", "fail", { reason: "timeout" });
+          consecutiveBlocks++;
+          continue;
+        }
+        // Non-timeout error: fall through to DOM fallback below.
+        console.log(`[safeway:${store.storeId}] API "${query}" ${data.error} — falling back to DOM`);
+      }
 
       if (data?.primaryProducts?.response?.docs) {
         const products = data.primaryProducts.response.docs;
@@ -5580,15 +5597,19 @@ async function scrapeSafewayViaBrowser(page, store, { skipPreWarm = false } = {}
           try {
             const page2Url = `${baseUrl}?request-id=0&url=https://www.safeway.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
             /* v8 ignore start -- browser-only */
-            const data2 = await page.evaluate(async ({ url, apiKey }) => {
-              try {
-                const res = await fetch(url, {
-                  headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
-                  signal: AbortSignal.timeout(15000),
-                });
-                return res.ok ? await res.json() : null;
-              } catch { return null; }
-            }, { url: page2Url, apiKey: SAFEWAY_API_KEY });
+            const data2 = await withTimeout(
+              page.evaluate(async ({ url, apiKey }) => {
+                try {
+                  const res = await fetch(url, {
+                    headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+                    signal: AbortSignal.timeout(15000),
+                  });
+                  return res.ok ? await res.json() : { error: `HTTP_${res.status}` };
+                } catch (err) { return { error: err.name || "fetch_failed" }; }
+              }, { url: page2Url, apiKey: SAFEWAY_API_KEY }),
+              20000,
+              { error: "WallClockTimeout" },
+            );
             /* v8 ignore stop */
             if (data2?.primaryProducts?.response?.docs) {
               found.push(...matchSafewayProducts(data2.primaryProducts.response.docs));
@@ -5597,9 +5618,21 @@ async function scrapeSafewayViaBrowser(page, store, { skipPreWarm = false } = {}
         }
       } else {
         /* v8 ignore start -- browser-only DOM fallback (API path tested via matchSafewayProducts) */
-        // API-via-browser failed — try DOM extraction as fallback
+        // API-via-browser failed — try DOM extraction as fallback.
+        // Outer 18s wall-clock cap on the goto (Playwright's `timeout` param
+        // isn't always honored when the page is mid-WAF-challenge).
         const searchUrl = `https://www.safeway.com/shop/search-results.html?q=${encodeURIComponent(query)}`;
-        await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+        const gotoOk = await withTimeout(
+          page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).then(() => true).catch(() => false),
+          18000,
+          false,
+        );
+        if (!gotoOk) {
+          console.warn(`[safeway:${store.storeId}] DOM fallback page.goto hung for "${query}" — skipping`);
+          trackHealth("safeway", "fail", { reason: "timeout" });
+          consecutiveBlocks++;
+          continue;
+        }
         await page.waitForSelector("[class*='product'], [data-testid*='product']", { timeout: 8000 }).catch(() => {});
 
         if (await isBlockedPage(page)) {
@@ -5864,20 +5897,46 @@ async function scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm = false } =
     try {
       const apiUrl = `${baseUrl}?request-id=0&url=https://www.albertsons.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=0&storeid=${store.storeId}`;
       /* v8 ignore start -- browser-only API call */
-      // 15s per-query timeout (was unbounded). Without this, a hung Incapsula
-      // response could eat the whole 300s budget; this fix is exactly why every
-      // Albertsons store was hitting the 300s cap on both attempts.
-      const data = await page.evaluate(async ({ url, apiKey }) => {
-        try {
-          const res = await fetch(url, {
-            headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
-            signal: AbortSignal.timeout(15000),
-          });
-          if (!res.ok) return null;
-          return await res.json();
-        } catch { return null; }
-      }, { url: apiUrl, apiKey: ALBERTSONS_KEY });
+      // Two-layer bound (fixes A + B):
+      //   A) page.evaluate now returns { error: name } so we can distinguish
+      //      AbortError (15s inner timeout fired), HTTP_NNN (server error),
+      //      and other fetch failures. Previously these all collapsed to null
+      //      and were invisible in logs.
+      //   B) Outer withTimeout(20s) bounds the whole page.evaluate call —
+      //      catches the case where page.evaluate ITSELF hangs (e.g., browser
+      //      context locked up before the inner fetch starts). Without this,
+      //      a stuck context could eat the full 300s budget per query.
+      const data = await withTimeout(
+        page.evaluate(async ({ url, apiKey }) => {
+          try {
+            const res = await fetch(url, {
+              headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+              signal: AbortSignal.timeout(15000),
+            });
+            if (!res.ok) return { error: `HTTP_${res.status}` };
+            return await res.json();
+          } catch (err) { return { error: err.name || "fetch_failed" }; }
+        }, { url: apiUrl, apiKey: ALBERTSONS_KEY }),
+        20000,
+        { error: "WallClockTimeout" },
+      );
       /* v8 ignore stop */
+
+      if (data?.error) {
+        const isTimeout = data.error === "TimeoutError" || data.error === "AbortError" || data.error === "WallClockTimeout";
+        if (isTimeout) {
+          console.log(`[albertsons:${store.storeId}] API "${query}" ${data.error} — skipping (context likely slow)`);
+          trackHealth("albertsons", "fail", { reason: "timeout" });
+        } else {
+          console.log(`[albertsons:${store.storeId}] API "${query}" ${data.error} — falling back to DOM`);
+        }
+        // On timeout, skip DOM fallback (it would just hang the same way).
+        // On non-timeout errors, fall through to DOM fallback.
+        if (isTimeout) {
+          consecutiveBlocks++;
+          continue;
+        }
+      }
 
       if (data?.primaryProducts?.response?.docs) {
         const products = data.primaryProducts.response.docs;
@@ -5890,15 +5949,19 @@ async function scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm = false } =
           try {
             const page2Url = `${baseUrl}?request-id=0&url=https://www.albertsons.com&pageurl=search&search-type=keyword&q=${encodeURIComponent(query)}&rows=50&start=50&storeid=${store.storeId}`;
             /* v8 ignore start -- browser-only */
-            const data2 = await page.evaluate(async ({ url, apiKey }) => {
-              try {
-                const res = await fetch(url, {
-                  headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
-                  signal: AbortSignal.timeout(15000),
-                });
-                return res.ok ? await res.json() : null;
-              } catch { return null; }
-            }, { url: page2Url, apiKey: ALBERTSONS_KEY });
+            const data2 = await withTimeout(
+              page.evaluate(async ({ url, apiKey }) => {
+                try {
+                  const res = await fetch(url, {
+                    headers: { "Ocp-Apim-Subscription-Key": apiKey, Accept: "application/json" },
+                    signal: AbortSignal.timeout(15000),
+                  });
+                  return res.ok ? await res.json() : { error: `HTTP_${res.status}` };
+                } catch (err) { return { error: err.name || "fetch_failed" }; }
+              }, { url: page2Url, apiKey: ALBERTSONS_KEY }),
+              20000,
+              { error: "WallClockTimeout" },
+            );
             /* v8 ignore stop */
             if (data2?.primaryProducts?.response?.docs) {
               found.push(...matchAlbertsonsProducts(data2.primaryProducts.response.docs));
@@ -5907,8 +5970,22 @@ async function scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm = false } =
         }
       } else {
         /* v8 ignore start -- browser-only DOM fallback */
+        // Bound the DOM fallback's page.goto with an outer wall-clock cap
+        // (the `timeout: 15000` parameter to page.goto isn't always honored
+        // by Playwright when the page is mid-WAF-challenge; the outer
+        // withTimeout guarantees the goto can't eat more than 18s).
         const searchUrl = `https://www.albertsons.com/shop/search-results.html?q=${encodeURIComponent(query)}`;
-        await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+        const gotoOk = await withTimeout(
+          page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).then(() => true).catch(() => false),
+          18000,
+          false,
+        );
+        if (!gotoOk) {
+          console.warn(`[albertsons:${store.storeId}] DOM fallback page.goto hung for "${query}" — skipping`);
+          trackHealth("albertsons", "fail", { reason: "timeout" });
+          consecutiveBlocks++;
+          continue;
+        }
         await page.waitForSelector("[class*='product'], [data-testid*='product']", { timeout: 8000 }).catch(() => {});
 
         if (await isBlockedPage(page)) {
