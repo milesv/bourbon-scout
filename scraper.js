@@ -23,7 +23,9 @@ import {
   BOTTLE_INTEREST_TIERS,
   ULTRA_RARE_BOTTLES,
   IGNORED_BOTTLES,
+  LEAD_SUPPRESSED_BOTTLES,
   bottleInterestTier,
+  isLeadSuppressed,
 } from "./lib/bottles.js";
 import {
   isBlockedPage,
@@ -65,7 +67,9 @@ export {
   BOTTLE_INTEREST_TIERS,
   ULTRA_RARE_BOTTLES,
   IGNORED_BOTTLES,
+  LEAD_SUPPRESSED_BOTTLES,
   bottleInterestTier,
+  isLeadSuppressed,
   isBlockedPage,
   isFetchBlocked,
   isCostcoBlocked,
@@ -2104,7 +2108,15 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
   const restockFinds = alertableFinds.filter((b) => b.restock === true);
   const nonRestockFinds = alertableFinds.filter((b) => b.restock !== true);
   const confirmedFinds = nonRestockFinds.filter((b) => b.confidence !== "lead");
-  const leadFinds = nonRestockFinds.filter((b) => b.confidence === "lead");
+  // Filter out `lead_suppress`-tier bottles from the lead embed (e.g., E.H.
+  // Taylor Small Batch — common enough that Kroger weak-signal lead alerts
+  // are more noise than value). Confirmed finds, restocks, and cross-source
+  // confirmations for these bottles still fire normally — only the yellow
+  // "🔍 LEAD" embed is silenced. State.json keeps tracking; query via
+  // scripts/find.js to see what was found.
+  const leadFinds = nonRestockFinds.filter(
+    (b) => b.confidence === "lead" && !isLeadSuppressed(b.name),
+  );
   const inStockNames = [...changes.newFinds, ...changes.stillInStock].map((b) => b.name);
 
   // #12 — Restock embed (pink/magenta, urgent — @here ping). Bottles appearing

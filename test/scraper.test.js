@@ -99,7 +99,7 @@ import {
   sendNtfyPush, detectApexEmbed, DISTILLERY_SOURCES,
   shuffleKeepCanaryFirst,
   CANARY_BY_RETAILER, isCanaryFor,
-  ULTRA_RARE_BOTTLES, rerunCadenceFor,
+  ULTRA_RARE_BOTTLES, LEAD_SUPPRESSED_BOTTLES, isLeadSuppressed, rerunCadenceFor,
   detectHealthDegradation,
   scrapeSafewayViaBrowser,
   handleShutdown, shuttingDown,
@@ -10460,5 +10460,102 @@ describe("skipPreWarm — Safeway inner", () => {
       (c) => c[0] === "https://www.safeway.com/",
     );
     expect(homepageGotos.length).toBeGreaterThan(0);
+  });
+});
+
+// ─── lead_suppress tier — leads silenced, other alerts unchanged ──────────────
+
+describe("lead_suppress tier", () => {
+  it("LEAD_SUPPRESSED_BOTTLES contains EHT Small Batch (initial config)", () => {
+    expect(LEAD_SUPPRESSED_BOTTLES.has("E.H. Taylor Small Batch")).toBe(true);
+  });
+
+  it("isLeadSuppressed() returns true for tier members, false otherwise", () => {
+    expect(isLeadSuppressed("E.H. Taylor Small Batch")).toBe(true);
+    expect(isLeadSuppressed("Pappy Van Winkle 23 Year")).toBe(false);
+    expect(isLeadSuppressed("Buffalo Trace")).toBe(false);
+    expect(isLeadSuppressed("Made-up Bottle")).toBe(false);
+  });
+
+  it("does NOT overlap with obsess tier (apex bottles should always alert)", () => {
+    for (const apex of ULTRA_RARE_BOTTLES) {
+      expect(isLeadSuppressed(apex)).toBe(false);
+    }
+  });
+
+  it("buildStoreEmbeds: filters out LEAD finds for lead_suppressed bottle", () => {
+    const changes = {
+      newFinds: [
+        { name: "E.H. Taylor Small Batch", price: "$45", url: "x", sku: "1", confidence: "lead" },
+      ],
+      stillInStock: [],
+      goneOOS: [],
+      priceChanges: [],
+    };
+    const embeds = buildStoreEmbeds("kroger", "Kroger", {
+      storeId: "111", name: "Fry's Test", address: "x, Tempe, AZ 85283",
+    }, changes);
+    const leadEmbed = embeds.find((e) => e.title?.includes("LEAD"));
+    expect(leadEmbed).toBeUndefined();
+  });
+
+  it("buildStoreEmbeds: still fires LEAD embed for non-suppressed bottles in same scan", () => {
+    const changes = {
+      newFinds: [
+        { name: "E.H. Taylor Small Batch", price: "$45", url: "x", sku: "1", confidence: "lead" },
+        { name: "Stagg Jr",                 price: "$60", url: "y", sku: "2", confidence: "lead" },
+      ],
+      stillInStock: [],
+      goneOOS: [],
+      priceChanges: [],
+    };
+    const embeds = buildStoreEmbeds("kroger", "Kroger", {
+      storeId: "111", name: "Fry's Test", address: "x, Tempe, AZ 85283",
+    }, changes);
+    const leadEmbed = embeds.find((e) => e.title?.includes("LEAD"));
+    expect(leadEmbed).toBeDefined();
+    expect(leadEmbed.description).toContain("Stagg Jr");
+    expect(leadEmbed.description).not.toContain("E.H. Taylor Small Batch");
+  });
+
+  it("buildStoreEmbeds: STILL fires CONFIRMED embed for lead_suppressed bottle", () => {
+    const changes = {
+      newFinds: [
+        { name: "E.H. Taylor Small Batch", price: "$45", url: "x", sku: "1", confidence: "confirmed" },
+      ],
+      stillInStock: [],
+      goneOOS: [],
+      priceChanges: [],
+    };
+    const embeds = buildStoreEmbeds("kroger", "Kroger", {
+      storeId: "111", name: "Fry's Test", address: "x, Tempe, AZ 85283",
+    }, changes);
+    const newFindEmbed = embeds.find((e) => e.title?.includes("NEW FIND"));
+    expect(newFindEmbed).toBeDefined();
+    expect(newFindEmbed.description).toContain("E.H. Taylor Small Batch");
+    expect(newFindEmbed._urgent).toBe(true); // still pings @here
+  });
+
+  it("buildStoreEmbeds: STILL fires RESTOCK embed for lead_suppressed bottle", () => {
+    const eightDaysAgo = new Date(Date.now() - 8 * 86400000).toISOString();
+    const changes = {
+      newFinds: [
+        {
+          name: "E.H. Taylor Small Batch", price: "$45", url: "x", sku: "1",
+          confidence: "lead", // even with lead confidence, restock should fire
+          restock: true, lastGoneOOS: eightDaysAgo, restockGapDays: 8,
+        },
+      ],
+      stillInStock: [],
+      goneOOS: [],
+      priceChanges: [],
+    };
+    const embeds = buildStoreEmbeds("kroger", "Kroger", {
+      storeId: "111", name: "Fry's Test", address: "x, Tempe, AZ 85283",
+    }, changes);
+    const restockEmbed = embeds.find((e) => e.title?.includes("RESTOCK"));
+    expect(restockEmbed).toBeDefined();
+    expect(restockEmbed.description).toContain("E.H. Taylor Small Batch");
+    expect(restockEmbed._urgent).toBe(true);
   });
 });
