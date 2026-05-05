@@ -5541,8 +5541,13 @@ async function scrapeSafewayViaBrowser(page, store, { skipPreWarm = false } = {}
   const baseUrl = "https://www.safeway.com/abs/pub/xapi/pgmsearch/v1/search/products";
   let consecutiveBlocks = 0;
 
+  // Threshold tightened from 4 → 2 (2026-05-05). Empirical signal from log
+  // analysis: when Incapsula is in slow-roll mode, ~all queries time out at
+  // 15s; 4 consecutive at 4×15s = 60s wasted per pathological scrape. With
+  // 2-threshold: 2×15s = 30s before bailing, freeing budget for retry/other
+  // stores. Also applies to non-timeout WAF blocks — same justification.
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
-    if (consecutiveBlocks >= 4) { trackHealth("safeway", "blocked"); continue; }
+    if (consecutiveBlocks >= 2) { trackHealth("safeway", "blocked"); continue; }
     if (page.isClosed?.()) {
       console.warn(`[safeway:${store.storeId}] Page closed mid-scan — bailing out of remaining queries`);
       break;
@@ -5884,8 +5889,10 @@ async function scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm = false } =
   const baseUrl = "https://www.albertsons.com/abs/pub/xapi/pgmsearch/v1/search/products";
   let consecutiveBlocks = 0;
 
+  // Threshold tightened from 4 → 2 (2026-05-05). See Safeway block for full
+  // rationale; same Incapsula slow-roll behavior, same fix justification.
   for (const query of shuffleKeepCanaryFirst(getQueriesForScan(SEARCH_QUERIES))) {
-    if (consecutiveBlocks >= 4) { trackHealth("albertsons", "blocked"); continue; }
+    if (consecutiveBlocks >= 2) { trackHealth("albertsons", "blocked"); continue; }
     // Page-closed bail-out: if the caller's withTimeout fired, page.evaluate would
     // error N times in a row. Detect early and bail to avoid cascading log spam
     // and wasted retries (this was contributing to multi-hour scan times).
