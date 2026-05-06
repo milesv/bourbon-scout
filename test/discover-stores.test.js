@@ -25,7 +25,7 @@ import {
   loadCache, saveCache, isCacheValid, cleanStoreEntries,
   locateCostco, locateTotalWine, locateWalmart,
   locateKroger, locateSafeway, locateAlbertsons, locateWalgreens, locateSamsClub, locateBevMo,
-  discoverStores,
+  discoverStores, formatPhoneFromDigits,
 } from "../lib/discover-stores.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -967,5 +967,37 @@ describe("discoverStores", () => {
     consoleSpy.mockRestore();
     vi.spyOn(console, "warn").mockRestore();
     vi.spyOn(console, "error").mockRestore();
+  });
+});
+
+describe("formatPhoneFromDigits", () => {
+  it("formats a 10-digit string into '(XXX) XXX-XXXX'", () => {
+    expect(formatPhoneFromDigits("4806001234")).toBe("(480) 600-1234");
+  });
+
+  it("strips leading '1' country code from 11-digit string", () => {
+    expect(formatPhoneFromDigits("14806001234")).toBe("(480) 600-1234");
+  });
+
+  it("ignores existing punctuation in input (digits-only extraction)", () => {
+    expect(formatPhoneFromDigits("(480) 600-1234")).toBe("(480) 600-1234");
+    expect(formatPhoneFromDigits("480.600.1234")).toBe("(480) 600-1234");
+    expect(formatPhoneFromDigits("480-600-1234")).toBe("(480) 600-1234");
+  });
+
+  it("returns undefined for null/undefined/empty inputs", () => {
+    expect(formatPhoneFromDigits(null)).toBeUndefined();
+    expect(formatPhoneFromDigits(undefined)).toBeUndefined();
+    expect(formatPhoneFromDigits("")).toBeUndefined();
+  });
+
+  it("returns undefined for inputs with wrong digit count (no formatting fallback)", () => {
+    expect(formatPhoneFromDigits("12345")).toBeUndefined();      // too short
+    expect(formatPhoneFromDigits("123456789012")).toBeUndefined(); // too long
+    expect(formatPhoneFromDigits("abc")).toBeUndefined();         // no digits
+  });
+
+  it("accepts numeric input (Kroger API may return number not string)", () => {
+    expect(formatPhoneFromDigits(4806001234)).toBe("(480) 600-1234");
   });
 });
