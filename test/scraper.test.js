@@ -1337,6 +1337,28 @@ describe("buildStoreEmbeds", () => {
     expect(embeds[0]._alertContent).toContain("CALL NOW");
   });
 
+  it("includes phone number in confirmed embed description AND _alertContent (CALL NOW actionable)", () => {
+    const storeWithPhone = { ...TEST_STORE, phone: "(480) 555-7890" };
+    const changes = { newFinds: [bottle("Weller 12")], stillInStock: [], goneOOS: [] };
+    const embeds = buildStoreEmbeds("costco", "Costco", storeWithPhone, changes);
+    // Phone in description as clickable tel: link (one-tap dial on mobile)
+    expect(embeds[0].description).toContain("(480) 555-7890");
+    expect(embeds[0].description).toContain("tel:4805557890");
+    // Raw phone in _alertContent so it shows in lock-screen push preview
+    expect(embeds[0]._alertContent).toContain("(480) 555-7890");
+    expect(embeds[0]._alertContent).toContain("CALL NOW");
+  });
+
+  it("omits phone gracefully when store.phone is missing (no rendering artifact)", () => {
+    const changes = { newFinds: [bottle("Weller 12")], stillInStock: [], goneOOS: [] };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes); // no phone
+    expect(embeds[0].description).not.toContain("📞");
+    expect(embeds[0].description).not.toContain("tel:");
+    // _alertContent should still have CALL NOW but no phone-section separator
+    expect(embeds[0]._alertContent).toContain("CALL NOW");
+    expect(embeds[0]._alertContent).not.toMatch(/·\s*\(/);  // no " · (" phone-section
+  });
+
   it("includes still-in-stock in new find embed", () => {
     const changes = {
       newFinds: [bottle("Weller 12")],

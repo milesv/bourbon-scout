@@ -2193,7 +2193,10 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
 
   // Confirmed embed (neon green, urgent — @here ping)
   if (confirmedFinds.length > 0) {
-    let desc = `${info.storeLine}\n${info.addressLine}\n\n🆕 **NEWLY SPOTTED**\n`;
+    // Phone line included in confirmed embeds so the "CALL NOW" content text
+    // has an actual number to tap. tel: link works on mobile (one tap dials).
+    const phoneInline = info.phoneLine ? `\n${info.phoneLine}` : "";
+    let desc = `${info.storeLine}\n${info.addressLine}${phoneInline}\n\n🆕 **NEWLY SPOTTED**\n`;
     desc += confirmedFinds.map((b) => formatBottleLine(b, info.skuLabel, "🟢")).join("\n\n");
 
     if (changes.stillInStock.length > 0) {
@@ -2212,19 +2215,25 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
     // app. New format puts the bottle name first; the storeId is dropped to save
     // space (still in the description). Rarity marker (🦄/⭐/🚨 fallback) leads.
     const storeShort = info.title.replace(/\s*\(#\w+\)/, ""); // strip "(#436)" from "Costco Tempe (#436) · 4.5 mi"
+    // Raw phone number for the @here content text. Goes in the push preview
+    // / lock-screen notification so the user can read the number BEFORE
+    // unlocking their phone. tel: links don't render in push previews,
+    // just the plain string — but most modern lock screens auto-detect
+    // phone-number patterns and offer tap-to-call directly.
+    const phoneRaw = store.phone ? ` · ${store.phone}` : "";
     let confirmedTitle, alertContent;
     if (confirmedFinds.length === 1) {
       const b = confirmedFinds[0];
       const marker = bottleRarityMarker(b.name).trim() || "🚨";
       confirmedTitle = `${marker} ${b.name.toUpperCase()} @ ${storeShort}`;
       // B — Specific @here content text (read by sendUrgentAlert). Shows in
-      // mobile push previews and lock-screen notifications. "CALL NOW" instead
-      // of "drive over" because allocated drops can sell out before arrival.
-      alertContent = `${marker} ${b.name} @ ${storeShort} — CALL NOW`;
+      // mobile push previews and lock-screen notifications. "CALL NOW" + raw
+      // phone number means the user can call before even unlocking.
+      alertContent = `${marker} ${b.name} @ ${storeShort}${phoneRaw} — CALL NOW`;
     } else {
       confirmedTitle = `🚨 ${confirmedFinds.length} BOTTLES @ ${storeShort}`;
       const bottleList = confirmedFinds.map((b) => b.name).join(", ");
-      alertContent = `🚨 ${confirmedFinds.length} bottles @ ${storeShort}: ${bottleList} — CALL NOW`;
+      alertContent = `🚨 ${confirmedFinds.length} bottles @ ${storeShort}${phoneRaw}: ${bottleList} — CALL NOW`;
     }
 
     // E — Per-retailer logo thumbnail (Google favicon proxy). Tiny ~80x80 image
