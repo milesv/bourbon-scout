@@ -3150,6 +3150,11 @@ async function scrapeCostcoOnce(page) {
   // Category navigation adds browsing depth (homepage → category → search) which raises
   // behavioral scores with Akamai. Costs ~4-6s but makes the session look more human.
   await navigateCategory(page, "costco");
+  // Zombie-work guard (see Albertsons). Avoid misleading metric on abandoned pre-warm.
+  if (page.isClosed?.()) {
+    console.warn(`[costco] Page closed during pre-warm — bailing`);
+    return [];
+  }
   recordPhase("costco", "prewarm", Date.now() - costcoT0);
   const costcoQueriesT0 = Date.now();
 
@@ -3652,6 +3657,12 @@ async function scrapeTotalWineViaBrowser(store, page, { skipPreWarm = false } = 
     // Category navigation adds browsing depth for PerimeterX behavioral scoring.
     // Warm contexts (subsequent stores) skip pre-warm entirely so this only runs once.
     await navigateCategory(page, "totalwine");
+    // Zombie-work guard (see Albertsons inline comment). If the page is closed,
+    // skip the misleading "Pre-warm done" log + the recordPhase metric.
+    if (page.isClosed?.()) {
+      console.warn(`[totalwine:${store.storeId}] Page closed during pre-warm (${elapsed()}) — bailing`);
+      return [];
+    }
     console.log(`[totalwine:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
     recordPhase("totalwine", "prewarm", Date.now() - t0);
   } else {
@@ -4129,6 +4140,12 @@ async function scrapeWalmartViaBrowser(store, page, { skipPreWarm = false } = {}
     await solveHumanChallenge(page);
     await humanizePage(page, { pace: "medium" });
     await navigateCategory(page, "walmart");
+    // Zombie-work guard (see Albertsons). Skip the recordPhase metric if pre-warm
+    // completed only because internal try/catches swallowed close errors.
+    if (page.isClosed?.()) {
+      console.warn(`[walmart:${store.storeId}] Page closed during pre-warm — bailing`);
+      return [];
+    }
     recordPhase("walmart", "prewarm", Date.now() - wmT0);
   } else {
     // Subsequent stores in the same poll reuse the persistent context's cookies.
@@ -4382,6 +4399,12 @@ async function scrapeWalgreensViaBrowser(page) {
     await sleep(300 + Math.random() * 300);
   }
   await navigateCategory(page, "walgreens");
+  // Zombie-work guard (see Albertsons). humanizePage's try/catch swallows close
+  // errors silently; isClosed gate prevents misleading "Pre-warm done" + bad metric.
+  if (page.isClosed?.()) {
+    console.warn(`[walgreens] Page closed during pre-warm (${wgElapsed()}) — bailing`);
+    return [];
+  }
   console.log(`[walgreens] Pre-warm done (${wgElapsed()}), starting queries...`);
   // Phase timing: wgT0 anchors the pre-warm phase; query phase starts now.
   recordPhase("walgreens", "prewarm", Date.now() - wgT0);
@@ -4829,6 +4852,12 @@ async function scrapeSamsClubViaBrowser(page) {
   await solveHumanChallenge(page);
   await humanizePage(page, { pace: "slow" });
   await navigateCategory(page, "samsclub");
+  // Zombie-work guard (see Albertsons). Bail if pre-warm completed only because
+  // internal try/catches swallowed close errors.
+  if (page.isClosed?.()) {
+    console.warn(`[samsclub] Page closed during pre-warm — bailing`);
+    return [];
+  }
 
   const found = [];
   const entries = shuffle(Object.entries(SAMSCLUB_PRODUCTS));
@@ -5586,6 +5615,13 @@ async function scrapeSafewayViaBrowser(page, store, { skipPreWarm = false } = {}
     await solveHumanChallenge(page);
     await humanizePage(page, { pace: "medium" });
     // Skip navigateCategory — it adds another ~30-60s and isn't required for the API path
+    // Zombie-work guard (see Albertsons). humanizePage's try/catch swallows close
+    // errors silently; isClosed check here avoids misleading "Pre-warm done" logs
+    // when the wrapper's 300s timeout already closed the page.
+    if (page.isClosed?.()) {
+      console.warn(`[safeway:${store.storeId}] Page closed during pre-warm (${elapsed()}) — bailing`);
+      return [];
+    }
     console.log(`[safeway:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
   } else {
     // Future-proof for SECONDARY_ZIPS adding more Safeway stores. Today only one
@@ -5955,6 +5991,18 @@ async function scrapeAlbertsonsViaBrowser(page, store, { skipPreWarm = false } =
     await solveHumanChallenge(page);
     await humanizePage(page, { pace: "slow" });
     await navigateCategory(page, "albertsons");
+    // Zombie-work guard: solveHumanChallenge / humanizePage / navigateCategory
+    // each have internal try/catch that swallow errors silently. If the wrapper's
+    // 300s timeout fired and closed the page mid-pre-warm, those swallowed errors
+    // mask the close — we'd reach this log line with `elapsed()` showing wall-clock
+    // far past the cap (1102s observed in production). Bailing on isClosed() avoids
+    // misleading logs + saves the rest of pre-warm work that has nothing to interact
+    // with anyway. Cancellation isn't truly cooperative but this is the cheapest
+    // honest-output fix without restructuring every await.
+    if (page.isClosed?.()) {
+      console.warn(`[albertsons:${store.storeId}] Page closed during pre-warm (${elapsed()}) — bailing`);
+      return [];
+    }
     console.log(`[albertsons:${store.storeId}] Pre-warm done (${elapsed()}), starting queries...`);
   } else {
     // Subsequent stores reuse `incap_ses_*` cookies from the persistent context.
