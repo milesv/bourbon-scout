@@ -85,6 +85,8 @@ SAFEWAY_API_KEY=
 | `BACKUP_PROXY_RETAILERS` | No | Comma-separated retailer keys to route through backup proxy (e.g. `costco,totalwine`). |
 | `SECONDARY_ZIPS` | No | Additional zip codes for store discovery (e.g. `85054,85260`). Stores merged with primary, deduped by ID. |
 | `HEALTHCHECK_URL` | No | Liveness ping URL (e.g. healthchecks.io). Daemon GETs the URL after each successful poll; external service emails/notifies if pings stop. Catches daemon crashes within ~90 min. Free for 20 checks. |
+| `NTFY_TOPIC` | No | ntfy.sh topic name (`bourbon-scout-mvxxx`) or full URL for self-hosted. When set, apex bottle finds (🦄 Pappy 20/23, Heaven Hill 22) trigger a `priority: urgent` ntfy push that wakes the phone via the ntfy iOS/Android app. Free, no auth, opt-in. |
+| `PROXY_COST_PER_GB` | No | Override default `$1/GB` rate for the bandwidth-cost projection in scan summaries. Set to your negotiated rate. |
 
 Kroger and Safeway scrapers are skipped if their API keys aren't provided. All other retailers work without credentials. Without `PROXY_URL`, all scrapers fall back to browser-only mode. With `PROXY_URL` set, each retailer gets its own sticky session IP and `got-scraping` fetch-first paths use Chrome TLS fingerprint impersonation for faster, lighter scraping. All browser fallbacks use clean Chrome (no stealth plugin — it's counterproductive) with `headless: false` on Mac. Queries use priority-based rotation — high-value bottles (BTAC, Pappy, Taylor, Michter's) are checked every scan while lower-priority queries alternate, with human-like pacing to reduce bot detection signals. Retailers that fail 3+ consecutive scans are automatically backed off for 30 minutes.
 
@@ -141,6 +143,30 @@ Four types of color-coded embeds with per-retailer SKU/item numbers and rich sto
 - Subsequent stores get buffered and ONE consolidated embed fires at end of poll listing all secondary store addresses + Maps links.
 - Cuts Discord noise during boost windows when allocations hit several Marketplace Fry's at once.
 
+**♻️ Restock** (pink/magenta, `@here` ping)
+- Triggered when a bottle re-appears at a store after ≥7 days OOS — strongest signal we have (verified shelving turnover, not first-time appearance from search-result hallucination)
+- Pre-empts the regular new-find embed for the same scan
+- Includes "last gone OOS X days ago" and clickable phone number when store data has it
+
+**🎯 Allocation Drop** (pink/magenta, quiet, end-of-scan)
+- Fires once per scan when ≥3 distinct allocated bottles surface at the same retailer simultaneously
+- Indicates a real allocation event (not coincidence) — useful meta-signal alongside the per-store @here pings
+
+**📣 Distillery News** (gold, quiet, independent timer)
+- Monitors Heaven Hill / Sazerac (BTAC) / Old Forester press-release pages every 30-45 min
+- Fires when a new article matches tracked-bottle keywords (Heritage Collection, BTAC, Birthday Bourbon, etc.) — gives 1-2 weeks of lead time before the actual retail drop
+
+**🦄/⭐ Bottle-Rarity Markers** (in all embeds)
+- 🦄 prepended to apex bottles (Pappy 20/23 + Heaven Hill Heritage 22) — drop-everything tier
+- ⭐ for the rest of `ULTRA_RARE_BOTTLES` (BTAC, Pappy 10/12/15, KoK, Old Forester limiteds, EHT 18 Year)
+- Lets you spot tier at a glance without parsing names
+
+**📞 Phone Numbers in Lead + Restock Embeds**
+- When `store.phone` is populated in `lib/fallback-stores.js`, lead and restock embeds include a clickable `tel:` link so "call ahead" guidance is actionable from mobile
+
+**🦄 ntfy.sh Push Notifications** (opt-in via `NTFY_TOPIC` env)
+- Apex bottle finds (🦄 Pappy 20/23 + Heaven Hill 22) trigger a `priority: urgent` ntfy push that wakes your phone via the ntfy mobile app — Discord @here doesn't always survive Do Not Disturb
+
 **🟣 Scan Summary** (purple, quiet)
 - Posted after every scan with counts: new finds, still in stock, went OOS, nothing found
 - Shows total stores, retailers, and scan duration
@@ -193,7 +219,7 @@ The daemon also fires automatic Discord pings:
 
 ## Tests
 
-907 tests across 5 files using [Vitest](https://vitest.dev/) (90.75% line coverage, 81.6% branch):
+~1030 unique tests across 5 files using [Vitest](https://vitest.dev/) (88% line coverage, 79% branch). Coverage is intentionally not pushed past 90% — the remaining gaps are in browser-only DOM paths (`page.evaluate` callbacks, `page.goto` retry chains) where mocking produces fragile tests that mostly verify mock setup rather than real behavior.
 
 ```sh
 npm test                # Run all tests
@@ -202,8 +228,8 @@ npm test -- --coverage  # With coverage report
 
 | File | Tests | Focus |
 |------|-------|-------|
-| `test/scraper.test.js` | 681 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling ($500), all 7 scrapers, Discord embeds (re-alert/OOS/health emoji/canary/trend), poll orchestration, error isolation, health tracking (incl. per-query/per-store/fetch-vs-browser attribution), scan metrics/trends, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management, browser mutex, proxy rotation, challenge solver, schedule-aware polling, known URL tracking (cookie-enhanced Costco fetch/matchCostcoProductPage/browser fallback), priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord 5xx/network retry, searchTerm coverage (Old Rip/Colonel/SFB), parseSize liter/litre, normalizeText unicode, truncateDescription OOS, dedupFound N/A, shuffle/withTimeout/runWithConcurrency edges, peak hour formatting, watch list (key generation/embed/processing), Reddit intel (keywords/subreddits/scraping/dedup), shuffleKeepCanaryFirst, proxy availability/failover, Safeway browser wrapper, handleShutdown, poll integration (store scanning/canary retry), Walmart/Sam's Club fetch paths, navigateCategory |
-| `test/proxy.test.js` | 35 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, rotateRetailerProxy (port change/isolation/dynamic URL) |
+| `test/scraper.test.js` | ~890 | Bottle matching, per-retailer filtering, EXCLUDE_TERMS, miniature filter, price ceiling, all 9 scrapers (Costco/TotalWine/Walmart/Kroger/Safeway/Albertsons/Walgreens/Sam's Club/CityHive), Discord embeds (re-alert/OOS/health emoji/canary/trend/restock/♻️/phone-line/bottle-rarity-marker/lead-suppress filter/drop-cluster threshold), poll orchestration, error isolation, health tracking (per-query/per-store/fetch-vs-browser attribution), scan metrics, retry mechanisms, bot detection (isFetchBlocked 8 patterns + 10K limit), state management (corruption recovery via `.bak`, `_`-prefix preservation), browser mutex, proxy rotation, PerimeterX challenge solver, schedule-aware polling, known URL tracking, priority-based query rotation, Chrome header order/GREASE brand, env validation, Discord retry + fail-open buffer, searchTerm coverage, unicode normalization, dedupFound, peak-hour formatting, watch list (key/embed/processing/effectiveness), Reddit intel (keywords/dedup/scoring), shuffleKeepCanaryFirst, proxy availability/failover, Walgreens 5-layer FP defense (selector tightening, positive in-stock evidence, repeat-find suppression, cross-bottle freshness, PDP fallback verification), restock detection (≥7d gap), `oosHistory` tracking, observability (cross-retailer lag, Reddit lag, lead→confirmed FP rate), distillery-news monitor config, ntfy.sh apex push detection, **skipPreWarm** (Walmart/Albertsons/Safeway homepage gating), **lead_suppress** (filter, restock-still-fires, confirmed-still-fires), **`recordStoreTimeout`** retailer-level fail-fast (counter increments, threshold sentinel, log-once-per-poll, retailer isolation, reset behavior) |
+| `test/proxy.test.js` | 35 | Proxy routing, SOCKS5/HTTP auto-detection, fetch-first paths, Costco blocked retry, `rotateRetailerProxy` (port change/isolation/dynamic URL) |
 | `test/discover-stores.test.js` | 69 | Store locator logic per retailer, store name sanitization |
-| `test/geo.test.js` | 9 | Zip-to-coords, haversine distance |
-| `test/fallback-stores.test.js` | 9 | Static fallback store data validation, EXTRA_STORES structure and dedup |
+| `test/geo.test.js` | 9 | Zip-to-coords, haversine distance, AbortSignal timeout |
+| `test/fallback-stores.test.js` | 9 | Static fallback store data validation, `EXTRA_STORES` structure + dedup |

@@ -6999,7 +6999,11 @@ export function _resetKnownProducts() { knownProducts = {}; }
 export function _getKnownProducts() { return knownProducts; }
 export function _setKnownProducts(v) { knownProducts = v; }
 export function _resetRetailerBrowserLocks() { for (const k of Object.keys(retailerBrowserLocks)) delete retailerBrowserLocks[k]; }
-export function _resetRetailerBrowserBlocked() { for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k]; }
+export function _resetRetailerBrowserBlocked() {
+  for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k];
+  for (const k of Object.keys(retailerStoreTimeouts)) delete retailerStoreTimeouts[k];
+}
+export { recordStoreTimeout, retailerBrowserBlocked, retailerStoreTimeouts, RETAILER_TIMEOUT_BAIL_THRESHOLD };
 export function _setProxyExhausted(v) { primaryProxyExhausted = v; backupProxyExhausted = v; }
 export function _getProxyExhausted() { return primaryProxyExhausted && (backupProxyExhausted || !BACKUP_PROXY_URL); }
 export function _setPrimaryProxyExhausted(v) { primaryProxyExhausted = v; }

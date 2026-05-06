@@ -111,6 +111,7 @@ import {
   _getScraperHealth, _resetScraperHealth, _setScanCounter, _getScanCounter, _resetRetailerBrowserCache,
   _resetRetailerFailures, _resetKnownProducts, _getKnownProducts, _setKnownProducts,
   acquireRetailerLock, _resetRetailerBrowserLocks, _resetRetailerBrowserBlocked,
+  recordStoreTimeout, retailerBrowserBlocked, retailerStoreTimeouts, RETAILER_TIMEOUT_BAIL_THRESHOLD,
   _setProxyExhausted, _getProxyExhausted, _setPrimaryProxyExhausted, _setBackupProxyExhausted,
   isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
 } from "../scraper.js";
@@ -10557,5 +10558,78 @@ describe("lead_suppress tier", () => {
     expect(restockEmbed).toBeDefined();
     expect(restockEmbed.description).toContain("E.H. Taylor Small Batch");
     expect(restockEmbed._urgent).toBe(true);
+  });
+});
+
+// ─── Retailer-level fail-fast (commit f876799) ────────────────────────────────
+
+describe("recordStoreTimeout + retailerBrowserBlocked", () => {
+  beforeEach(() => {
+    _resetRetailerBrowserBlocked();
+  });
+
+  it("threshold constant is 2 (sentinel — change here if poll arithmetic shifts)", () => {
+    expect(RETAILER_TIMEOUT_BAIL_THRESHOLD).toBe(2);
+  });
+
+  it("first call: counter=1, NOT yet blocked", () => {
+    const blocked = recordStoreTimeout("walmart");
+    expect(blocked).toBe(false);
+    expect(retailerStoreTimeouts.walmart).toBe(1);
+    expect(retailerBrowserBlocked.walmart).toBeUndefined();
+  });
+
+  it("second call: counter=2, retailer NOW blocked, helper returns true", () => {
+    recordStoreTimeout("walmart");
+    const blocked = recordStoreTimeout("walmart");
+    expect(blocked).toBe(true);
+    expect(retailerStoreTimeouts.walmart).toBe(2);
+    expect(retailerBrowserBlocked.walmart).toBe(true);
+  });
+
+  it("third call after blocked: still returns true, counter keeps climbing (visibility)", () => {
+    recordStoreTimeout("walmart");
+    recordStoreTimeout("walmart");
+    const blocked = recordStoreTimeout("walmart");
+    expect(blocked).toBe(true);
+    expect(retailerStoreTimeouts.walmart).toBe(3);
+  });
+
+  it("only logs the bail-out warning ONCE (not on every subsequent call)", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    recordStoreTimeout("walmart");
+    recordStoreTimeout("walmart"); // hits threshold, logs
+    recordStoreTimeout("walmart"); // already blocked, should NOT log again
+    recordStoreTimeout("walmart"); // already blocked, should NOT log again
+    const bailOutWarnings = warnSpy.mock.calls.filter((c) =>
+      typeof c[0] === "string" && c[0].includes("skipping remaining stores"),
+    );
+    expect(bailOutWarnings).toHaveLength(1);
+    warnSpy.mockRestore();
+  });
+
+  it("retailers tracked independently (walmart timeouts don't block albertsons)", () => {
+    recordStoreTimeout("walmart");
+    recordStoreTimeout("walmart"); // walmart blocked
+    recordStoreTimeout("albertsons"); // first albertsons timeout
+    expect(retailerBrowserBlocked.walmart).toBe(true);
+    expect(retailerBrowserBlocked.albertsons).toBeUndefined();
+    expect(retailerStoreTimeouts.albertsons).toBe(1);
+  });
+
+  it("_resetRetailerBrowserBlocked clears both flag map AND counter map", () => {
+    recordStoreTimeout("walmart");
+    recordStoreTimeout("walmart");
+    expect(retailerBrowserBlocked.walmart).toBe(true);
+    expect(retailerStoreTimeouts.walmart).toBe(2);
+    _resetRetailerBrowserBlocked();
+    expect(retailerBrowserBlocked.walmart).toBeUndefined();
+    expect(retailerStoreTimeouts.walmart).toBeUndefined();
+  });
+
+  it("safety: missing/unknown retailer key still works (initializes counter)", () => {
+    const blocked = recordStoreTimeout("unknown-retailer");
+    expect(blocked).toBe(false);
+    expect(retailerStoreTimeouts["unknown-retailer"]).toBe(1);
   });
 });
