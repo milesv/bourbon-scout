@@ -1293,15 +1293,48 @@ describe("truncateDescription", () => {
 describe("buildStoreEmbeds", () => {
   const bottle = (name, extra = {}) => ({ name, url: `https://example.com/${name}`, price: "$29.99", sku: "123", size: "750ml", fulfillment: "", ...extra });
 
-  it("builds new find embed (green)", () => {
+  it("builds new find embed (green) with bottle-first title + alertContent + thumbnail", () => {
     const changes = { newFinds: [bottle("Weller 12")], stillInStock: [], goneOOS: [] };
     const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
     expect(embeds).toHaveLength(1);
-    expect(embeds[0].title).toContain("🚨 NEW FIND");
-    expect(embeds[0].title).toContain("Costco");
+    // A — bottle-first title: rarity marker (or 🚨 fallback) + UPPERCASE bottle + @ store
+    expect(embeds[0].title).toContain("WELLER 12"); // bottle name UPPERCASE
+    expect(embeds[0].title).toContain("@ Costco"); // "@ <store>"
+    expect(embeds[0].title).toContain("🚨"); // 🚨 fallback for non-rare bottles
     expect(embeds[0].description).toContain("NEWLY SPOTTED");
     expect(embeds[0].description).toContain("Weller 12");
     expect(embeds[0].color).toBe(COLORS.newFind);
+    // B — sidecar _alertContent for sendUrgentAlert to use as @here text
+    expect(embeds[0]._alertContent).toContain("Weller 12");
+    expect(embeds[0]._alertContent).toContain("CALL NOW");
+    // E — retailer logo thumbnail (Google favicon proxy)
+    expect(embeds[0].thumbnail?.url).toContain("costco.com");
+  });
+
+  it("uses 🦄 marker for apex bottles in title + alertContent", () => {
+    const changes = { newFinds: [bottle("Pappy Van Winkle 23 Year")], stillInStock: [], goneOOS: [] };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds[0].title.startsWith("🦄")).toBe(true);
+    expect(embeds[0]._alertContent.startsWith("🦄")).toBe(true);
+  });
+
+  it("uses ⭐ marker for obsess-tier bottles in title", () => {
+    const changes = { newFinds: [bottle("George T. Stagg")], stillInStock: [], goneOOS: [] };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds[0].title.startsWith("⭐")).toBe(true);
+  });
+
+  it("multi-bottle find uses 'N BOTTLES @ store' title format", () => {
+    const changes = {
+      newFinds: [bottle("Weller 12"), bottle("Stagg Jr")],
+      stillInStock: [],
+      goneOOS: [],
+    };
+    const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
+    expect(embeds[0].title).toContain("2 BOTTLES");
+    expect(embeds[0].title).toContain("@ Costco");
+    expect(embeds[0]._alertContent).toContain("2 bottles");
+    expect(embeds[0]._alertContent).toContain("CALL NOW");
   });
 
   it("includes still-in-stock in new find embed", () => {
@@ -1334,7 +1367,9 @@ describe("buildStoreEmbeds", () => {
     };
     const embeds = buildStoreEmbeds("costco", "Costco", TEST_STORE, changes);
     expect(embeds).toHaveLength(1);
-    expect(embeds[0].title).toContain("NEW FIND");
+    // Bottle-first title format (post-A): contains bottle name, not "NEW FIND" header
+    expect(embeds[0].title).toContain("STAGG JR");
+    expect(embeds[0].title).toContain("@ Costco");
   });
 
   it("builds re-alert embed when scanCount divisible by N", () => {
@@ -1904,6 +1939,24 @@ describe("sendUrgentAlert", () => {
     await runWithFakeTimers(() => sendUrgentAlert(embeds));
     // Should make 2 calls: batch of 4 + batch of 2
     expect(mocks.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses _alertContent sidecar for specific @here text (B — bottle/store/CALL NOW)", async () => {
+    mocks.fetch.mockResolvedValueOnce({ ok: true });
+    await sendUrgentAlert([
+      { title: "🦄 PAPPY VAN WINKLE 23 YEAR @ Costco Tempe", _alertContent: "🦄 Pappy Van Winkle 23 Year @ Costco Tempe — CALL NOW" },
+    ]);
+    const body = JSON.parse(mocks.fetch.mock.calls[0][1].body);
+    expect(body.content).toBe("@here 🦄 Pappy Van Winkle 23 Year @ Costco Tempe — CALL NOW");
+    // _alertContent stripped from embed before sending — Discord rejects unknown fields
+    expect(body.embeds[0]).not.toHaveProperty("_alertContent");
+  });
+
+  it("falls back to generic content when _alertContent absent", async () => {
+    mocks.fetch.mockResolvedValueOnce({ ok: true });
+    await sendUrgentAlert([{ title: "x" }]);
+    const body = JSON.parse(mocks.fetch.mock.calls[0][1].body);
+    expect(body.content).toBe("@here 🚨 **ALLOCATED BOURBON SPOTTED!**");
   });
 });
 
@@ -4940,9 +4993,10 @@ describe("buildStoreEmbeds — confirmed vs lead tier split", () => {
     expect(embeds.length).toBe(2);
     const urgent = embeds.find((e) => e._urgent === true);
     const quiet = embeds.find((e) => e._urgent === false);
-    expect(urgent.color).toBe(0x2ecc71);  // green
-    expect(urgent.title).toContain("NEW FIND");
-    expect(quiet.color).toBe(0xf1c40f);  // yellow
+    expect(urgent.color).toBe(COLORS.newFind);  // neon green (was 0x2ecc71, now 0x00ff00)
+    // Bottle-first title format (post-A): contains the bottle name, not "NEW FIND" header
+    expect(urgent.title).toContain("BUFFALO TRACE");
+    expect(quiet.color).toBe(COLORS.lead);  // yellow
     expect(quiet.title).toContain("LEAD");
   });
 
@@ -4954,7 +5008,7 @@ describe("buildStoreEmbeds — confirmed vs lead tier split", () => {
     const embeds = buildStoreEmbeds("totalwine", "Total Wine", store, changes);
     expect(embeds.length).toBe(1);
     expect(embeds[0]._urgent).toBe(true);
-    expect(embeds[0].color).toBe(0x2ecc71);
+    expect(embeds[0].color).toBe(COLORS.newFind);
   });
 
   it("only emits lead embed when ALL newFinds are leads", () => {
@@ -10532,7 +10586,8 @@ describe("lead_suppress tier", () => {
     const embeds = buildStoreEmbeds("kroger", "Kroger", {
       storeId: "111", name: "Fry's Test", address: "x, Tempe, AZ 85283",
     }, changes);
-    const newFindEmbed = embeds.find((e) => e.title?.includes("NEW FIND"));
+    // Post-A title format: bottle-first ("E.H. TAYLOR SMALL BATCH @ <store>")
+    const newFindEmbed = embeds.find((e) => e._urgent === true && e.title?.includes("E.H. TAYLOR"));
     expect(newFindEmbed).toBeDefined();
     expect(newFindEmbed.description).toContain("E.H. Taylor Small Batch");
     expect(newFindEmbed._urgent).toBe(true); // still pings @here

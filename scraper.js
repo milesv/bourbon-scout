@@ -1879,16 +1879,31 @@ function detectApexEmbed(embeds) {
 // Loud alert with @here for in-stock finds (pings online channel members only).
 // Also fires an ntfy.sh push for apex bottles (#22) so the user's phone wakes
 // even when Discord notifications are silenced/buried.
+//
+// Each embed may carry a sidecar `_alertContent` (set by buildStoreEmbeds for
+// confirmed finds) — a specific bottle-and-store string used as the @here
+// content text. Specific text shows in mobile push previews and lock-screen
+// notifications, where generic "ALLOCATED BOURBON SPOTTED!" tells the user
+// nothing actionable. Falls back to the generic banner when the sidecar is
+// absent (e.g., consolidated multi-store embeds).
 async function sendUrgentAlert(embeds) {
   /* v8 ignore next -- env guard */
   if (!DISCORD_WEBHOOK_URL) return;
   for (let i = 0; i < embeds.length; i += 4) {
     const batch = embeds.slice(i, i + 4);
+    // Use the first batched embed's _alertContent (each store's confirmed
+    // embed sets its own; batches of 4 are rare in practice).
+    const specific = batch[0]?._alertContent;
+    const content = specific
+      ? `@here ${specific}`
+      : "@here 🚨 **ALLOCATED BOURBON SPOTTED!**";
+    // Strip _alertContent before sending — Discord rejects unknown embed fields.
+    const cleanBatch = batch.map(({ _alertContent, ...rest }) => rest);
     await postDiscordWebhook({
       username: "Bourbon Scout 🥃",
-      content: "@here 🚨 **ALLOCATED BOURBON SPOTTED!**",
+      content,
       allowed_mentions: { parse: ["everyone"] },
-      embeds: batch,
+      embeds: cleanBatch,
     });
     if (i + 4 < embeds.length) await sleep(1000);
   }
@@ -1907,7 +1922,7 @@ async function sendUrgentAlert(embeds) {
 // ─── Embed Colors ────────────────────────────────────────────────────────────
 
 const COLORS = {
-  newFind:  0x2ecc71,  // green — new confirmed find (drive over)
+  newFind:  0x00ff00,  // pure neon green — new confirmed find (drive over) — visually unmissable in busy channels
   lead:     0xf1c40f,  // yellow — newly spotted but signal weak (call first)
   stillIn:  0x3498db,  // blue — still in stock re-alert
   goneOOS:  0xe67e22,  // orange — went out of stock
@@ -1922,6 +1937,29 @@ const COLORS = {
 const SKU_LABELS = {
   costco: "Item #", totalwine: "Item #", walmart: "Item #",
   kroger: "SKU", safeway: "UPC", albertsons: "UPC", samsclub: "Item #", extramile: "Item #", liquorexpress: "Item #", chandlerliquors: "Item #",
+};
+
+// Per-retailer logo URLs for Discord embed thumbnails. Sourced via Google's
+// public favicon proxy — one URL pattern per domain, stable contract, served
+// from Google's CDN (Discord caches the result, so the daemon never fetches).
+// If Google's service ever 404s, Discord renders the embed without the thumbnail
+// — no error, no regression. Used in confirmed @here alerts (the highest-signal
+// embeds) so users can scan a busy Discord channel and instantly recognize
+// which retailer's bottle was found.
+const RETAILER_LOGOS = {
+  costco:          "https://www.google.com/s2/favicons?domain=costco.com&sz=128",
+  totalwine:       "https://www.google.com/s2/favicons?domain=totalwine.com&sz=128",
+  walmart:         "https://www.google.com/s2/favicons?domain=walmart.com&sz=128",
+  // Fry's is Kroger's AZ banner — use frysfood.com so the thumbnail matches the
+  // actual store branding the user sees in alerts.
+  kroger:          "https://www.google.com/s2/favicons?domain=frysfood.com&sz=128",
+  safeway:         "https://www.google.com/s2/favicons?domain=safeway.com&sz=128",
+  albertsons:      "https://www.google.com/s2/favicons?domain=albertsons.com&sz=128",
+  walgreens:       "https://www.google.com/s2/favicons?domain=walgreens.com&sz=128",
+  samsclub:        "https://www.google.com/s2/favicons?domain=samsclub.com&sz=128",
+  extramile:       "https://www.google.com/s2/favicons?domain=chevronextramile.com&sz=128",
+  liquorexpress:   "https://www.google.com/s2/favicons?domain=liquorexpresstempe.com&sz=128",
+  chandlerliquors: "https://www.google.com/s2/favicons?domain=chandlerliquorsaz.com&sz=128",
 };
 
 const STORE_TYPE_LABELS = {
@@ -2153,7 +2191,7 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
     });
   }
 
-  // Confirmed embed (green, urgent — @here ping)
+  // Confirmed embed (neon green, urgent — @here ping)
   if (confirmedFinds.length > 0) {
     let desc = `${info.storeLine}\n${info.addressLine}\n\n🆕 **NEWLY SPOTTED**\n`;
     desc += confirmedFinds.map((b) => formatBottleLine(b, info.skuLabel, "🟢")).join("\n\n");
@@ -2168,13 +2206,41 @@ function buildStoreEmbeds(retailerKey, retailerName, store, changes) {
 
     desc += buildOOSList(allNames, inStockNames);
 
+    // A — Bottle-first title format. The previous "🚨 NEW FIND — Costco Tempe (#436) · 4.5 mi"
+    // told you which store but not which bottle — mobile lock-screen previews
+    // truncate at ~40 chars, so the bottle name was hidden until you opened the
+    // app. New format puts the bottle name first; the storeId is dropped to save
+    // space (still in the description). Rarity marker (🦄/⭐/🚨 fallback) leads.
+    const storeShort = info.title.replace(/\s*\(#\w+\)/, ""); // strip "(#436)" from "Costco Tempe (#436) · 4.5 mi"
+    let confirmedTitle, alertContent;
+    if (confirmedFinds.length === 1) {
+      const b = confirmedFinds[0];
+      const marker = bottleRarityMarker(b.name).trim() || "🚨";
+      confirmedTitle = `${marker} ${b.name.toUpperCase()} @ ${storeShort}`;
+      // B — Specific @here content text (read by sendUrgentAlert). Shows in
+      // mobile push previews and lock-screen notifications. "CALL NOW" instead
+      // of "drive over" because allocated drops can sell out before arrival.
+      alertContent = `${marker} ${b.name} @ ${storeShort} — CALL NOW`;
+    } else {
+      confirmedTitle = `🚨 ${confirmedFinds.length} BOTTLES @ ${storeShort}`;
+      const bottleList = confirmedFinds.map((b) => b.name).join(", ");
+      alertContent = `🚨 ${confirmedFinds.length} bottles @ ${storeShort}: ${bottleList} — CALL NOW`;
+    }
+
+    // E — Per-retailer logo thumbnail (Google favicon proxy). Tiny ~80x80 image
+    // top-right of the embed. Discord caches the URL, so even on a slow first
+    // fetch it's instant on subsequent renders. If the URL ever 404s, Discord
+    // renders the embed without the thumbnail — no error, no regression.
+    const thumbUrl = RETAILER_LOGOS[retailerKey];
     embeds.push({
-      title: truncateTitle(`🚨 NEW FIND — ${info.title}`),
+      title: truncateTitle(confirmedTitle),
       description: truncateDescription(desc),
       color: COLORS.newFind,
+      ...(thumbUrl ? { thumbnail: { url: thumbUrl } } : {}),
       footer: { text: `Bourbon Scout 🥃 │ ${retailerName}` },
       timestamp: new Date().toISOString(),
       _urgent: true,
+      _alertContent: alertContent,
     });
   }
 
