@@ -3834,7 +3834,9 @@ async function scrapeTotalWineStore(store) {
     trackHealth("totalwine", "fail", { reason: "timeout" });
     return dedupFound(knownFound);
   }
-  console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP)`);
+  // "(~warm)" is speculative; authoritative check is post-lock. See Walmart wrapper.
+  const speculativeWarm = !!retailerBrowserCache["totalwine"];
+  console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP${speculativeWarm ? ", ~warm" : ""})`);
   const releaseLock = await acquireRetailerLock("totalwine");
   // skipPreWarm computed AFTER lock acquisition — without this, concurrent stores
   // all read an empty retailerBrowserCache before any of them populate it (race),
@@ -4279,7 +4281,12 @@ async function scrapeWalmartStore(store) {
     trackHealth("walmart", "fail", { reason: "timeout" });
     return dedupFound(knownFound);
   }
-  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser`);
+  // "(~warm)" is a *speculative* pre-lock read of the cache state — race-prone
+  // (concurrent stores may all see the same pre-populated state from a prior
+  // poll's leftover, or all see empty before store 1 populates) so it's just a
+  // grep convenience. Authoritative skipPreWarm decision is made post-lock.
+  const speculativeWarm = !!retailerBrowserCache["walmart"];
+  console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser${speculativeWarm ? " (~warm)" : ""}`);
   const releaseLock = await acquireRetailerLock("walmart");
   // skipPreWarm computed AFTER lock acquisition (race fix). Concurrent stores all
   // read empty cache before any of them populate it; reading inside the lock is
@@ -5759,14 +5766,23 @@ async function scrapeSafewayStore(store) {
   // Reset health from failed fetch before browser attempt
   delete scraperHealth["safeway"];
 
+  // See Albertsons for full rationale: track retry trigger so timeout-induced
+  // retries preserve the persistent context's cookies (avoid wasted full
+  // pre-warm), while WAF-block retries correctly nuke the burned context.
+  let lastRetryReason = null;
+
   for (let attempt = 0; attempt < 2; attempt++) {
     /* v8 ignore start -- browser retry loop internals (launch failure tested separately) */
     if (attempt > 0) {
-      console.log("[safeway] Retrying with fresh browser after blocks");
       delete scraperHealth["safeway"];
-      if (retailerBrowserCache["safeway"]) {
-        await retailerBrowserCache["safeway"].context.close().catch(() => {});
-        delete retailerBrowserCache["safeway"];
+      if (lastRetryReason === "blocked") {
+        console.log("[safeway] Retrying with fresh browser after WAF blocks");
+        if (retailerBrowserCache["safeway"]) {
+          await retailerBrowserCache["safeway"].context.close().catch(() => {});
+          delete retailerBrowserCache["safeway"];
+        }
+      } else {
+        console.log("[safeway] Retrying — preserving cache for warm next-store");
       }
       await sleep(3000 + Math.random() * 2000);
     }
@@ -5793,13 +5809,17 @@ async function scrapeSafewayStore(store) {
         console.warn("[safeway] Browser scraper timed out (300s)");
         trackHealth("safeway", "fail");
         if (attempt === 1) recordStoreTimeout("safeway");
-        if (attempt === 0) continue;
+        if (attempt === 0) {
+          lastRetryReason = "timeout"; // preserve cookies on retry
+          continue;
+        }
         return [];
       }
       await cacheRetailerCookies("safeway");
       const sfHealth = scraperHealth["safeway"];
       if (sfHealth && sfHealth.blocked > 0 && sfHealth.blocked >= sfHealth.queries / 2 && attempt === 0) {
         console.warn(`[safeway] ${sfHealth.blocked}/${sfHealth.queries} queries blocked — retrying`);
+        lastRetryReason = "blocked"; // nuke cookies on retry
         continue;
       }
       /* v8 ignore stop */
@@ -6123,17 +6143,34 @@ async function scrapeAlbertsonsStore(store) {
     return [];
   }
 
-  console.log(`[albertsons:${store.storeId}] Queuing browser`);
+  // "(~warm)" is speculative; authoritative check is post-lock + per-attempt.
+  const speculativeWarm = !!retailerBrowserCache["albertsons"];
+  console.log(`[albertsons:${store.storeId}] Queuing browser${speculativeWarm ? " (~warm)" : ""}`);
   const releaseLock = await acquireRetailerLock("albertsons");
+  // Track WHY we're retrying so we can decide whether to nuke the persistent
+  // context. WAF blocks → fresh context (the IP/fingerprint is burned). Timeout
+  // → preserve context (cookies are healthy; the slowness is the network, not
+  // our session). Without this discrimination, every retry burns the cache and
+  // subsequent stores in this poll lose their `skipPreWarm` benefit (~80-150s
+  // each). Only set on retry-trigger paths (not on success) so stale state
+  // can't accidentally suppress a future retry.
+  let lastRetryReason = null;
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       /* v8 ignore start -- browser retry loop internals */
       if (attempt > 0) {
-        console.log("[albertsons] Retrying with fresh browser after blocks");
         delete scraperHealth["albertsons"];
-        if (retailerBrowserCache["albertsons"]) {
-          await retailerBrowserCache["albertsons"].context.close().catch(() => {});
-          delete retailerBrowserCache["albertsons"];
+        if (lastRetryReason === "blocked") {
+          console.log("[albertsons] Retrying with fresh browser after WAF blocks");
+          if (retailerBrowserCache["albertsons"]) {
+            await retailerBrowserCache["albertsons"].context.close().catch(() => {});
+            delete retailerBrowserCache["albertsons"];
+          }
+        } else {
+          // Timeout-induced retry. Cookies are presumably still valid; nuking
+          // them would force the same store + every subsequent store to pay
+          // full pre-warm, when the actual issue is just network slowness.
+          console.log("[albertsons] Retrying — preserving cache for warm next-store");
         }
         await sleep(3000 + Math.random() * 2000);
       }
@@ -6141,9 +6178,10 @@ async function scrapeAlbertsonsStore(store) {
       // skipPreWarm computed inside the lock + inside the retry loop. Two reasons:
       //   (1) Race fix — outside the lock, concurrent stores all read empty cache
       //       before any of them populate it, and all do full pre-warm.
-      //   (2) Retry handling — on attempt > 0, the retry block above just deleted
-      //       retailerBrowserCache["albertsons"], so skipPreWarm must re-evaluate
-      //       to false. Computing once at the top would skip pre-warm on retry.
+      //   (2) Retry handling — when retry is "blocked"-triggered, the block above
+      //       deleted retailerBrowserCache["albertsons"], so skipPreWarm correctly
+      //       re-evaluates to false. When retry is "timeout"-triggered, cache is
+      //       preserved and skipPreWarm correctly re-evaluates to true.
       const skipPreWarm = !!retailerBrowserCache["albertsons"];
       if (skipPreWarm) console.log(`[albertsons:${store.storeId}] Context warm — will skip pre-warm`);
       console.log("[albertsons] Using clean browser");
@@ -6171,13 +6209,17 @@ async function scrapeAlbertsonsStore(store) {
           // Both attempts of one store count as one timeout for fail-fast,
           // because the underlying cause (slow Incapsula / bad IP) is shared.
           if (attempt === 1) recordStoreTimeout("albertsons");
-          if (attempt === 0) continue;
+          if (attempt === 0) {
+            lastRetryReason = "timeout"; // preserve cookies on retry
+            continue;
+          }
           return [];
         }
         await cacheRetailerCookies("albertsons");
         const abHealth = scraperHealth["albertsons"];
         if (abHealth && abHealth.blocked > 0 && abHealth.blocked >= abHealth.queries / 2 && attempt === 0) {
           console.warn(`[albertsons] ${abHealth.blocked}/${abHealth.queries} queries blocked — retrying`);
+          lastRetryReason = "blocked"; // nuke cookies on retry
           continue;
         }
         /* v8 ignore stop */
@@ -7267,14 +7309,28 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   // We DON'T swallow all uncaughtException — some (e.g., logic bugs, syntax
   // errors at runtime) genuinely warrant a crash so launchd respawns clean.
   // Whitelist only the proxy/socket category.
+  // Known socket / network error codes that bubble up from got-scraping /
+  // node-fetch / Playwright when proxy connections die mid-stream. These are
+  // network-instability symptoms, not logic bugs — log + continue rather than
+  // crash. List comes from observed daemon failures + Node.js libuv error
+  // taxonomy (https://nodejs.org/api/errors.html#common-system-errors).
+  // NOTE: this runs even during `discoverStores()` at startup. If a network
+  // error fires before main()'s poll loop is up, we'll log + continue with
+  // possibly-incomplete discovery — that's still better than crashing the
+  // daemon before it can stabilize.
   const SAFE_TO_LOG_ERROR_CODES = new Set([
-    "ECONNRESET",   // peer reset (proxy or remote endpoint)
-    "ECONNREFUSED", // proxy refused connection
-    "ENOTFOUND",    // DNS lookup failed
-    "ETIMEDOUT",    // socket-level timeout
-    "EHOSTUNREACH", // proxy unreachable
+    "ECONNRESET",       // peer reset (proxy or remote endpoint)
+    "ECONNREFUSED",     // proxy refused connection
+    "ENOTFOUND",        // DNS lookup failed
+    "ETIMEDOUT",        // socket-level timeout (Node)
+    "ESOCKETTIMEDOUT",  // socket-level timeout (got)
+    "EHOSTUNREACH",     // proxy unreachable
     "ENETUNREACH",
-    "EPIPE",        // peer closed during write
+    "ENETDOWN",         // local network down (e.g., daemon Mac wakes from sleep)
+    "EPIPE",            // peer closed during write
+    "EPROTO",           // TLS / HTTP/2 protocol error mid-stream
+    "EAI_AGAIN",        // transient DNS failure
+    "ECONNABORTED",     // local end aborted (rare, but recoverable)
   ]);
   process.on("uncaughtException", (err) => {
     if (err && SAFE_TO_LOG_ERROR_CODES.has(err.code)) {
