@@ -219,7 +219,7 @@ The daemon also fires automatic Discord pings:
 
 ## Tests
 
-~1030 unique tests across 5 files using [Vitest](https://vitest.dev/) (88% line coverage, 79% branch). Coverage is intentionally not pushed past 90% — the remaining gaps are in browser-only DOM paths (`page.evaluate` callbacks, `page.goto` retry chains) where mocking produces fragile tests that mostly verify mock setup rather than real behavior.
+~1035 unique tests across 5 files using [Vitest](https://vitest.dev/) (88% line coverage, 79% branch). Coverage is intentionally not pushed past 90% — the remaining gaps are in browser-only DOM paths (`page.evaluate` callbacks, `page.goto` retry chains) where mocking produces fragile tests that mostly verify mock setup rather than real behavior.
 
 ```sh
 npm test                # Run all tests

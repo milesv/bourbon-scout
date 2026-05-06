@@ -7292,46 +7292,49 @@ function handleShutdown(signal) {
 /* v8 ignore stop */
 export { shuttingDown, handleShutdown };
 
+// Catch unhandled socket errors that bubble up from got-scraping / node-fetch
+// when proxy connections die mid-stream. Without these handlers, an
+// ECONNRESET emitted by a TCP socket whose 'error' listener never registered
+// (rare race in got's retry pipeline) crashes the entire daemon.
+// launchd KeepAlive=true would auto-restart, but each restart loses the
+// current poll's in-flight Discord posts and forces a fresh discovery sweep.
+// Logging + continuing is much cheaper.
+//
+// We DON'T swallow all uncaughtException — some (e.g., logic bugs, syntax
+// errors at runtime) genuinely warrant a crash so launchd respawns clean.
+// Whitelist only the proxy/socket category.
+//
+// Known socket / network error codes that bubble up from got-scraping /
+// node-fetch / Playwright when proxy connections die mid-stream. These are
+// network-instability symptoms, not logic bugs — log + continue rather than
+// crash. List comes from observed daemon failures + Node.js libuv error
+// taxonomy (https://nodejs.org/api/errors.html#common-system-errors).
+// NOTE: the handler that uses this Set runs even during `discoverStores()`
+// at startup. If a network error fires before main()'s poll loop is up,
+// we'll log + continue with possibly-incomplete discovery — that's still
+// better than crashing the daemon before it can stabilize.
+//
+// Pulled out of the entry-point guard so tests can import + assert membership.
+export const SAFE_TO_LOG_ERROR_CODES = new Set([
+  "ECONNRESET",       // peer reset (proxy or remote endpoint)
+  "ECONNREFUSED",     // proxy refused connection
+  "ENOTFOUND",        // DNS lookup failed
+  "ETIMEDOUT",        // socket-level timeout (Node)
+  "ESOCKETTIMEDOUT",  // socket-level timeout (got)
+  "EHOSTUNREACH",     // proxy unreachable
+  "ENETUNREACH",
+  "ENETDOWN",         // local network down (e.g., daemon Mac wakes from sleep)
+  "EPIPE",            // peer closed during write
+  "EPROTO",           // TLS / HTTP/2 protocol error mid-stream
+  "EAI_AGAIN",        // transient DNS failure
+  "ECONNABORTED",     // local end aborted (rare, but recoverable)
+]);
+
 // Only run when executed directly (not imported by tests)
 /* v8 ignore start -- entry point guard */
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   process.on("SIGTERM", () => handleShutdown("SIGTERM"));
   process.on("SIGINT", () => handleShutdown("SIGINT"));
-
-  // Catch unhandled socket errors that bubble up from got-scraping / node-fetch
-  // when proxy connections die mid-stream. Without these handlers, an
-  // ECONNRESET emitted by a TCP socket whose 'error' listener never registered
-  // (rare race in got's retry pipeline) crashes the entire daemon.
-  // launchd KeepAlive=true would auto-restart, but each restart loses the
-  // current poll's in-flight Discord posts and forces a fresh discovery sweep.
-  // Logging + continuing is much cheaper.
-  //
-  // We DON'T swallow all uncaughtException — some (e.g., logic bugs, syntax
-  // errors at runtime) genuinely warrant a crash so launchd respawns clean.
-  // Whitelist only the proxy/socket category.
-  // Known socket / network error codes that bubble up from got-scraping /
-  // node-fetch / Playwright when proxy connections die mid-stream. These are
-  // network-instability symptoms, not logic bugs — log + continue rather than
-  // crash. List comes from observed daemon failures + Node.js libuv error
-  // taxonomy (https://nodejs.org/api/errors.html#common-system-errors).
-  // NOTE: this runs even during `discoverStores()` at startup. If a network
-  // error fires before main()'s poll loop is up, we'll log + continue with
-  // possibly-incomplete discovery — that's still better than crashing the
-  // daemon before it can stabilize.
-  const SAFE_TO_LOG_ERROR_CODES = new Set([
-    "ECONNRESET",       // peer reset (proxy or remote endpoint)
-    "ECONNREFUSED",     // proxy refused connection
-    "ENOTFOUND",        // DNS lookup failed
-    "ETIMEDOUT",        // socket-level timeout (Node)
-    "ESOCKETTIMEDOUT",  // socket-level timeout (got)
-    "EHOSTUNREACH",     // proxy unreachable
-    "ENETUNREACH",
-    "ENETDOWN",         // local network down (e.g., daemon Mac wakes from sleep)
-    "EPIPE",            // peer closed during write
-    "EPROTO",           // TLS / HTTP/2 protocol error mid-stream
-    "EAI_AGAIN",        // transient DNS failure
-    "ECONNABORTED",     // local end aborted (rare, but recoverable)
-  ]);
   process.on("uncaughtException", (err) => {
     if (err && SAFE_TO_LOG_ERROR_CODES.has(err.code)) {
       console.warn(`[uncaught] Socket-level ${err.code} swallowed (proxy/network instability): ${err.message}`);

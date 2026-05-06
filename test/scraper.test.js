@@ -112,6 +112,7 @@ import {
   _resetRetailerFailures, _resetKnownProducts, _getKnownProducts, _setKnownProducts,
   acquireRetailerLock, _resetRetailerBrowserLocks, _resetRetailerBrowserBlocked,
   recordStoreTimeout, retailerBrowserBlocked, retailerStoreTimeouts, RETAILER_TIMEOUT_BAIL_THRESHOLD,
+  SAFE_TO_LOG_ERROR_CODES,
   _setProxyExhausted, _getProxyExhausted, _setPrimaryProxyExhausted, _setBackupProxyExhausted,
   isProxyAvailable, failoverToBackupProxy, getCachedCookies, cacheRetailerCookies, COOKIE_CACHE_TTL_MS,
 } from "../scraper.js";
@@ -10631,5 +10632,43 @@ describe("recordStoreTimeout + retailerBrowserBlocked", () => {
     const blocked = recordStoreTimeout("unknown-retailer");
     expect(blocked).toBe(false);
     expect(retailerStoreTimeouts["unknown-retailer"]).toBe(1);
+  });
+});
+
+// ─── uncaughtException whitelist (commit 28aaeca) ─────────────────────────────
+
+describe("SAFE_TO_LOG_ERROR_CODES whitelist", () => {
+  it("contains the original 7 socket-error codes from commit f876799", () => {
+    // Sentinel: removing any of these from the Set silently regresses the
+    // ECONNRESET / proxy-instability handler. Each entry is a real Node libuv
+    // error code seen in production daemon crash traces.
+    const original = ["ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE"];
+    for (const code of original) {
+      expect(SAFE_TO_LOG_ERROR_CODES.has(code)).toBe(true);
+    }
+  });
+
+  it("contains the 5 codes added in commit 28aaeca (whitelist expansion)", () => {
+    const expansion = ["ESOCKETTIMEDOUT", "ENETDOWN", "EPROTO", "EAI_AGAIN", "ECONNABORTED"];
+    for (const code of expansion) {
+      expect(SAFE_TO_LOG_ERROR_CODES.has(code)).toBe(true);
+    }
+  });
+
+  it("does NOT include codes that should crash (logic-bug indicators)", () => {
+    // These would mask real bugs if accidentally added. Sentinel against
+    // someone reaching for a quick "catch everything" fix.
+    const SHOULD_CRASH = ["TypeError", "ReferenceError", "RangeError", "SyntaxError", "URIError"];
+    for (const code of SHOULD_CRASH) {
+      expect(SAFE_TO_LOG_ERROR_CODES.has(code)).toBe(false);
+    }
+  });
+
+  it("entries are deterministic strings (no objects, no nulls, no numbers)", () => {
+    for (const code of SAFE_TO_LOG_ERROR_CODES) {
+      expect(typeof code).toBe("string");
+      expect(code.length).toBeGreaterThan(2);
+      expect(code).toMatch(/^[A-Z_]+$/); // standard libuv naming
+    }
   });
 });
