@@ -2650,10 +2650,34 @@ function getCachedCookies(retailerKey) {
   return entry.cookies;
 }
 
-// Per-retailer browser-blocked flag: set when a browser scrape fails (blocked/timeout).
-// Remaining stores skip browser fallback for this poll — if one store is blocked,
-// the rest will be too (same IP, same profile, same PerimeterX fingerprint).
+// Per-retailer browser-blocked flag: set when 2+ stores time out at the 300s
+// per-store cap in the same poll. Remaining stores for that retailer skip
+// browser scraping entirely — same IP / proxy / fingerprint means they'd all
+// time out the same way, just costing 5 stores × 300s = 1500s of waste before
+// the poll-level 25min cap fires. Reset at start of each poll.
 const retailerBrowserBlocked = {};
+
+// Per-retailer 300s-timeout counter for the current poll. Increments inside
+// each store's wrapper after `withTimeout(scraperPromise, 300000, null)` returns
+// null. Threshold of 2 mirrors Albertsons' `consecutiveBlocks >= 2`: by the
+// time TWO stores have timed out, the retailer is clearly broken in this poll
+// and remaining stores should fail-fast. Reset at start of each poll.
+const RETAILER_TIMEOUT_BAIL_THRESHOLD = 2;
+const retailerStoreTimeouts = {};
+
+// Helper: retailer wrappers call this after a 300s store timeout. Returns true
+// if the threshold has been hit and the wrapper should skip remaining stores.
+function recordStoreTimeout(retailerKey) {
+  retailerStoreTimeouts[retailerKey] = (retailerStoreTimeouts[retailerKey] || 0) + 1;
+  if (retailerStoreTimeouts[retailerKey] >= RETAILER_TIMEOUT_BAIL_THRESHOLD) {
+    if (!retailerBrowserBlocked[retailerKey]) {
+      console.warn(`[${retailerKey}] ${retailerStoreTimeouts[retailerKey]} stores timed out at 300s — skipping remaining stores this poll`);
+      retailerBrowserBlocked[retailerKey] = true;
+    }
+    return true;
+  }
+  return false;
+}
 
 // Per-retailer mutex: serializes browser scraping so only one store at a time
 // uses a retailer's shared browser context. Without this, multiple stores open
@@ -3804,8 +3828,12 @@ async function scrapeTotalWineStore(store) {
     delete scraperHealth["totalwine"];
   }
 
-  // Per-store scrapers do NOT use fail-fast — each store tries browser independently.
-  // A fresh page load with different queries may succeed even if a prior store was blocked.
+  // Retailer-level fail-fast: 2+ Total Wine 300s timeouts → skip rest.
+  if (retailerBrowserBlocked["totalwine"]) {
+    console.log(`[totalwine:${store.storeId}] Retailer fail-fast active — skipping browser`);
+    trackHealth("totalwine", "fail", { reason: "timeout" });
+    return dedupFound(knownFound);
+  }
   console.log(`[totalwine:${store.storeId}] Queuing browser (direct IP)`);
   const releaseLock = await acquireRetailerLock("totalwine");
   // skipPreWarm computed AFTER lock acquisition — without this, concurrent stores
@@ -3831,6 +3859,7 @@ async function scrapeTotalWineStore(store) {
     if (result === null) {
       console.warn(`[totalwine:${store.storeId}] Browser timed out (300s)`);
       trackHealth("totalwine", "fail");
+      recordStoreTimeout("totalwine"); // contributes to fail-fast threshold
       return dedupFound(knownFound);
     }
     return dedupFound([...knownFound, ...result]);
@@ -4242,7 +4271,14 @@ async function scrapeWalmartStore(store) {
       return dedupFound([...knownFound, ...fetchResult]);
     }
   }
-  // Per-store scrapers do NOT use fail-fast — each store tries browser independently.
+  // Retailer-level fail-fast: if 2+ Walmart stores already timed out at 300s
+  // this poll, skip the browser path for this store too. Saves up to 5 × 300s
+  // = 1500s of compounding waste when Walmart's IP/PerimeterX state is bad.
+  if (retailerBrowserBlocked["walmart"]) {
+    console.log(`[walmart:${store.storeId}] Retailer fail-fast active — skipping browser`);
+    trackHealth("walmart", "fail", { reason: "timeout" });
+    return dedupFound(knownFound);
+  }
   console.log(`[walmart:${store.storeId}] ${isCI && !proxyAgent ? "CI mode, " : "Fetch blocked, "}queuing clean browser`);
   const releaseLock = await acquireRetailerLock("walmart");
   // skipPreWarm computed AFTER lock acquisition (race fix). Concurrent stores all
@@ -4267,6 +4303,7 @@ async function scrapeWalmartStore(store) {
     if (result === null) {
       console.warn(`[walmart:${store.storeId}] Browser scraper timed out (300s)`);
       trackHealth("walmart", "fail");
+      recordStoreTimeout("walmart"); // contributes to fail-fast threshold
       return dedupFound(knownFound);
     }
     await cacheRetailerCookies("walmart");
@@ -5712,6 +5749,13 @@ async function scrapeSafewayStore(store) {
   });
   if (fetchResult !== null) return fetchResult;
 
+  // Retailer-level fail-fast (relevant when SECONDARY_ZIPS adds more Safeway stores).
+  if (retailerBrowserBlocked["safeway"]) {
+    console.log(`[safeway:${store.storeId}] Retailer fail-fast active — skipping browser`);
+    trackHealth("safeway", "fail", { reason: "timeout" });
+    return [];
+  }
+
   // Reset health from failed fetch before browser attempt
   delete scraperHealth["safeway"];
 
@@ -5748,6 +5792,7 @@ async function scrapeSafewayStore(store) {
       if (result === null) {
         console.warn("[safeway] Browser scraper timed out (300s)");
         trackHealth("safeway", "fail");
+        if (attempt === 1) recordStoreTimeout("safeway");
         if (attempt === 0) continue;
         return [];
       }
@@ -6070,6 +6115,14 @@ async function scrapeAlbertsonsStore(store) {
 
   delete scraperHealth["albertsons"];
 
+  // Retailer-level fail-fast: if 2+ Albertsons stores already timed out at
+  // 300s this poll, skip remaining ones. Saves up to 3 × 300s = 900s.
+  if (retailerBrowserBlocked["albertsons"]) {
+    console.log(`[albertsons:${store.storeId}] Retailer fail-fast active — skipping browser`);
+    trackHealth("albertsons", "fail", { reason: "timeout" });
+    return [];
+  }
+
   console.log(`[albertsons:${store.storeId}] Queuing browser`);
   const releaseLock = await acquireRetailerLock("albertsons");
   try {
@@ -6115,6 +6168,9 @@ async function scrapeAlbertsonsStore(store) {
         if (result === null) {
           console.warn("[albertsons] Browser scraper timed out (300s)");
           trackHealth("albertsons", "fail");
+          // Both attempts of one store count as one timeout for fail-fast,
+          // because the underlying cause (slow Incapsula / bad IP) is shared.
+          if (attempt === 1) recordStoreTimeout("albertsons");
           if (attempt === 0) continue;
           return [];
         }
@@ -6431,6 +6487,7 @@ async function poll() {
     console.warn(`[discord] Replay attempt failed: ${err.message}`),
   );
   for (const k of Object.keys(retailerBrowserBlocked)) delete retailerBrowserBlocked[k];
+  for (const k of Object.keys(retailerStoreTimeouts)) delete retailerStoreTimeouts[k];
   const canaryResults = {};
   let discordFailures = 0;
   scanCounter++;
@@ -7194,6 +7251,46 @@ export { shuttingDown, handleShutdown };
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   process.on("SIGTERM", () => handleShutdown("SIGTERM"));
   process.on("SIGINT", () => handleShutdown("SIGINT"));
+
+  // Catch unhandled socket errors that bubble up from got-scraping / node-fetch
+  // when proxy connections die mid-stream. Without these handlers, an
+  // ECONNRESET emitted by a TCP socket whose 'error' listener never registered
+  // (rare race in got's retry pipeline) crashes the entire daemon.
+  // launchd KeepAlive=true would auto-restart, but each restart loses the
+  // current poll's in-flight Discord posts and forces a fresh discovery sweep.
+  // Logging + continuing is much cheaper.
+  //
+  // We DON'T swallow all uncaughtException — some (e.g., logic bugs, syntax
+  // errors at runtime) genuinely warrant a crash so launchd respawns clean.
+  // Whitelist only the proxy/socket category.
+  const SAFE_TO_LOG_ERROR_CODES = new Set([
+    "ECONNRESET",   // peer reset (proxy or remote endpoint)
+    "ECONNREFUSED", // proxy refused connection
+    "ENOTFOUND",    // DNS lookup failed
+    "ETIMEDOUT",    // socket-level timeout
+    "EHOSTUNREACH", // proxy unreachable
+    "ENETUNREACH",
+    "EPIPE",        // peer closed during write
+  ]);
+  process.on("uncaughtException", (err) => {
+    if (err && SAFE_TO_LOG_ERROR_CODES.has(err.code)) {
+      console.warn(`[uncaught] Socket-level ${err.code} swallowed (proxy/network instability): ${err.message}`);
+      return; // continue running
+    }
+    // Genuine crash — re-emit and let launchd restart
+    console.error(`[uncaught] Fatal: ${err?.stack || err}`);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    if (err.code && SAFE_TO_LOG_ERROR_CODES.has(err.code)) {
+      console.warn(`[unhandled] Promise rejected with ${err.code} swallowed: ${err.message}`);
+      return;
+    }
+    console.error(`[unhandled] Promise rejected: ${err?.stack || err}`);
+    // Don't exit — promise rejections aren't always fatal, but log loudly.
+  });
+
   main();
 }
 /* v8 ignore stop */
